@@ -19,6 +19,7 @@
 All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see [Benchmark](#benchmark-vs-lcu) for the method and full data. The LCU numbers come from the 0.4.2 round on the same machine (LCU 0.13.4). LCU does some things better than XYZLCU too, and those are listed in [Benchmark](#benchmark-vs-lcu) as well.
 
 - 🔌 **Supports Grok, Codex, ChatGPT, Claude, DeepSeek** and other major agents: anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node, and shell scripts; ChatGPT, Claude and DeepSeek use the same interface and are compatible (not yet tested first-hand). See [Supported agents](#supported-agents).
+- 🪟 **Window-locked background mode** (v0.6.1): `xyzlcu lock --app Safari` and the agent works inside that one window while you keep using the Mac: the pointer never moves and the app is never activated; clicks and typing go through Accessibility first and every result says which `route` it took. Measured on TextEdit, Finder and Safari, honest limits included. See [Background / window-locked mode](#background--window-locked-mode-v061).
 - ⚡ **Fast**: with the daemon running, `xyzlcu` is a tiny C program, about **3 ms** per call.
 
   | Operation | XYZLCU | LCU |
@@ -47,6 +48,7 @@ All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see 
 - 📸 **Screenshots**: a whole display, a single window (`--window`) or a region (`--region`), optional downscaling, `--fast` for a small JPEG in one flag; prints the point/pixel mapping
 - 🧠 **In-memory screenshots** (v0.4.2): `--base64` / `--stdout` produce the image in memory without writing a file; the daemon keeps capture streams on demand, so repeated captures of the same window take about 20 ms
 - 🚀 **Faster in v0.5.0**: a tiny C client (~3 ms per call), the main display stream pre-opened at daemon start (`--fast` ~9 ms), parallel PNG encoding (full-size PNG 171 → 31 ms), JPEG / HEIC, `--diff` returns only what changed, and an MCP `batch` tool
+- 🪟 **v0.6.1**: window-locked background mode (`lock` / `--background` / MCP `lock`): window-only screenshots, AX-first clicks, typing, keys and scrolling that never move the pointer or activate the app
 - ⚡ **v0.6.0**: the daemon keeps its own app table (`apps` 10 → 3 ms, `ax` 27 → 5 ms, `find` 21 → 8 ms), uncovered windows are cropped straight from the display stream (first window shot 114 → 25 ms), `ax --compact` + `click-el --ref` to save tokens, and a stale daemon restarts itself after an upgrade
 - 🖱 **Mouse**: click, right-click, double-click, move, drag, scroll
 - ⌨️ **Keyboard**: types Unicode text directly (Chinese, emoji; bypasses the input method), key combos like `cmd+shift+4`
@@ -256,6 +258,63 @@ xyzlcu value TextEdit --window "My notes"                                  # rea
 
 **Limits**: `events-pid`, `menu` and `paste` bypass taps on the HID stream; if the app's own main thread is stuck, no path helps. To really fix it, restart the hung process (the one with `blocking: true` in `xyzlcu taps`) or log out / reboot. XYZLCU never kills processes for you.
 
+## Background / window-locked mode (v0.6.1)
+
+Like a sandboxed agent window: lock **one** app window and every following command acts only on it. The **real mouse pointer never moves, the app is never activated, and you can keep using the Mac** with the keyboard and mouse at the same time.
+
+```bash
+xyzlcu lock --app Safari --window-title "Example"     # or --window-id N (see `xyzlcu windows`)
+xyzlcu screenshot --out shot.png                       # just that window, even when it is covered by other windows
+xyzlcu ax --compact                                    # its controls, content area first, window-relative centers
+xyzlcu click 841 33                                    # window-relative points (here: the address bar)
+xyzlcu type -- "https://example.com/"
+xyzlcu key return
+xyzlcu scroll 0 -5 --at 800,600
+xyzlcu lock --status
+xyzlcu unlock
+```
+
+- Turn it on with `lock` (state in `~/.xyzlcu/lock.json`, shared by the CLI, the daemon and MCP), or per command with `--background` / `XYZLCU_BACKGROUND=1` plus `--app App [--window-title T]`, or the MCP `lock` tool / `background: true` parameter. `--no-lock` makes one command ignore the lock.
+- **Coordinates are window-relative** (points from the window's top-left corner). `ax --compact` and `find` report them the same way.
+- **Every result carries `route`**, the path actually used, plus `cursorMoved` and `frontmostChanged` (both checked after the action):
+
+| Action | Routes, in order | Notes |
+|---|---|---|
+| `screenshot` | `sck-window` | ScreenCaptureKit captures the window by itself, so covered windows come out whole |
+| `click` | `ax-focus` / `ax-press` / `ax-select` / `ax-showmenu` (right click), then `pid-mouse` | Accessibility hit-test at the point, walking up to the nearest control; toolbar fields under a label are found with a small nearby search (`nearby: true`). `--via ax\|pid` forces one |
+| `type` | `ax-selected-text`, then `pid-keys` | AX inserts at the selection and is read back (`verified`) |
+| `key` | `ax-menu` for ⌘ combos with an enabled menu item; Esc / Return press the dialog's Cancel / default button (`ax-press-cancel` / `ax-press-default`); otherwise `pid-keys` | `--via pid\|menu` forces one |
+| `scroll` | `ax-scrollbar` (sets the scroll bar's value, ~40 pt per line), then `pid-scroll` | `--via ax\|pid` |
+| `drag`, `move`, `activate` … | refused (exit code 6) | they need the real pointer or the foreground; `--allow-foreground` activates the app and uses the normal path |
+
+Measured on an Apple Silicon Mac with the target window covered by another app (pointer stayed put and the frontmost app never changed in every case):
+
+| App | Action | Route | Time | Read back |
+|---|---|---|---:|---|
+| TextEdit | click the text area | `ax-focus` | 14 ms | focus moved |
+| TextEdit | type text | `ax-selected-text` | 10 ms | value contains the text |
+| TextEdit | `type --via pid` | `pid-keys` | 85 ms | value contains the text |
+| TextEdit | `key return` / `backspace` | `pid-keys` | 2–3 ms | value and screenshot |
+| TextEdit | Esc in the Open panel | `ax-press-cancel` | 232 ms | panel closed |
+| Finder | click the List view button | `ax-press` | 131 ms | button value 0 → 1 |
+| Finder | click Search, type a name | `ax-press`, `ax-selected-text` | 104 ms, 33 ms | result list shows the file |
+| Finder | window screenshot | `sck-window` | ~80 ms | full window |
+| Safari | click the address bar | `ax-focus` (`nearby`) | 171 ms | field focused |
+| Safari | type a URL, `key return` | `ax-selected-text`, `pid-keys` | 15 ms, 3 ms | page loaded |
+| Safari | click a link | `ax-press` | 7 ms | page navigated (after the network load) |
+| Safari | scroll | `ax-scrollbar` | 5 ms + 80 ms read-back | links moved by 200 pt for 5 lines |
+| Safari | window screenshot | `sck-window` | ~68 ms | full window |
+
+**Honest limits** (what does not work, or not reliably):
+
+- **Background apps can act late.** macOS throttles background apps (App Nap). A TextEdit ⌘S sent to the background was sometimes applied seconds later, or only after the next event. Verify the effect (read the file back, take a screenshot) instead of trusting `ok`, or use `--allow-foreground`.
+- **Menu items that act on the document are often disabled while the app is in the background** (e.g. Safari's Close Tab). `key` then falls back to `pid-keys`, which many apps ignore for ⌘ combos.
+- **Posted mouse events are often ignored.** Safari web content ignored `pid-mouse` clicks and `pid-scroll` wheel events in our tests; that is why the AX routes go first. `ax-focus` focuses a text field but does not move the caret to the clicked spot.
+- Esc in an open / save panel is done by pressing its Cancel button (found by title); keys posted to the panel's process are ignored while the app is in the background.
+- Hover-only controls (e.g. a tab's close button) and drag-and-drop are not reachable.
+- Minimized windows and windows on other Spaces are not supported. If the locked window closes, commands fail with exit code 4 until you `unlock`.
+- A permission prompt (TCC) or any system dialog is out of scope and never clicked.
+
 ## Record and replay
 
 ```bash
@@ -449,6 +508,7 @@ const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Bu
 
 - Read-only: `check`, `screenshot` (returns the image directly, JPEG by default), `apps`, `windows`, `cursor`, `ax`, `find`
 - Actions: `click_element`, `click`, `type_text`, `key`, `activate`
+- Background (v0.6.1): `lock` (`app`, `window_title`, `window_id`, `unlock`, `status`); `screenshot`, `ax`, `find`, `click_element`, `click`, `type_text` and `key` accept `background: true` (with `app`) for a one-off background action. While locked, `screenshot` defaults to scale 1 and `ax` accepts `focus` (`content` / `window` / `web`); `app` is optional for `ax` / `find`
 - Batch: `batch` (`steps` is an array of command strings, e.g. `["click-el TextEdit --title Save", "wait TextEdit --role AXSheet", "screenshot --diff"]`; one call runs them in order and returns each step's output and images; `continue_on_error` keeps going after a failure). Saves round trips and model turns; screenshot steps default to half-size JPEG
 - `screenshot` accepts `diff: true` to return only the changed area
 - Generic: `xyzlcu` (an `args` array, runs any subcommand except `mcp`, `serve`, `record`, `replay`, `batch` and `--stdout`)
@@ -764,6 +824,7 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 - `press` matches the title, description, value or identifier exactly (case-insensitive) and takes the first match; use `find` / `click-el` with `--role`, `--index` and `--window` to be more precise.
 - `type` bypasses the input method, so it doesn't suit cases that need IME suggestions.
 - No management of windows on other Spaces (desktops).
+- Background / window-locked mode: see the [limits](#background--window-locked-mode-v061) there (App Nap delays, menu items disabled in the background, ignored posted mouse events, no drag, no minimized windows).
 - The daemon's app table is refreshed at most every 10 s: a background process that becomes a regular app without being activated can take up to 10 s to show up in `apps` (looking an app up by name rescans immediately on a miss, so that is not affected).
 - A window shot cropped from the display stream shows the desktop outside the rounded corners instead of transparency. Covered windows, windows spanning displays, or displays without a running stream fall back to capturing the window on its own.
 
@@ -781,6 +842,12 @@ Then, in System Settings > Privacy & Security, turn off or remove any apps you n
 
 ## Changelog
 
+- **0.6.1**: window-locked background mode and fixes.
+  - **`lock` / `unlock` / `--background`**: lock one window; screenshots of that window only (ScreenCaptureKit, works when covered), clicks via Accessibility (focus / press / select / show menu) then posted to the process, typing via AX then process keys, ⌘ combos via the menu, Esc / Return via the dialog's Cancel / default button, scrolling via the scroll bar. Window-relative coordinates, a `route` field on every result, pointer and frontmost app checked after each action. `drag` / `move` / `activate` are refused unless `--allow-foreground`. MCP: new `lock` tool and a `background` parameter.
+  - `screenshot -o` is an alias for `--out`; an output path starting with `-` is rejected instead of creating a file named `-o`.
+  - `key` / `type --app` send to the open / save panel's process when a remote panel is showing.
+  - `ax --compact` lists the content area (web area, document, list) first and skips controls scrolled out of view (Finder 183 → 43 lines).
+  - Fixes: `record --duration` / `--no-moves` were taken as the output path; window lookup by id no longer reports a live window as closed.
 - **0.6.0**: faster daemon queries and a far smaller control listing for agents.
   - **App table**: the daemon keeps its own table of running apps (updated from launch / terminate / activate / hide notifications, fully refreshed at most every 10 s) instead of asking LaunchServices about every process on every call. `apps` 9.5 → 3.2 ms; `ax` / `find` / `click-el` / `press` / window screenshots each save 6–10 ms.
   - **Batched AX reads**: `ax` fetches all attributes of a control in one IPC (TextEdit window 27 → 5 ms, `ax Finder --menu` 52 → 23 ms).

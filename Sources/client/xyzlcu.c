@@ -16,10 +16,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.6.0"
+#define VERSION "0.6.1"
 // 和 main.swift 里的 forwardedEnv 保持一致
 static const char *FORWARDED_ENV[] = {"XYZLCU_EVENTS_HEALTH", "XYZLCU_TAP_THRESHOLD_MS", "XYZLCU_TYPE_VIA", "XYZLCU_KEY_VIA",
-                                      "XYZLCU_PROBE", "XYZLCU_PNG", "XYZLCU_PNG_LEVEL", NULL};
+                                      "XYZLCU_PROBE", "XYZLCU_PNG", "XYZLCU_PNG_LEVEL", "XYZLCU_BACKGROUND", NULL};
 
 static char **g_argv;
 

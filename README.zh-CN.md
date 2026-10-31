@@ -19,6 +19,7 @@
 下面的数字都是在同一台 Apple Silicon Mac（macOS 26+）上实测的中位数，测法和完整数据见[性能对比](#性能对比与-lcu)。LCU 的数字是 0.4.2 那一轮在同一台机器上测的（LCU 0.13.4）。LCU 也有比 XYZLCU 强的地方，同样写在[性能对比](#性能对比与-lcu)里。
 
 - 🔌 **支持 Grok、Codex、ChatGPT、Claude、DeepSeek** 等主流智能体：能跑 shell 命令就能用，只认 MCP 的客户端用内置的 `xyzlcu mcp`。已实测：Grok Bot、Codex CLI、OpenCode、MCP 客户端（完整握手）、Python / Node、shell 脚本；ChatGPT、Claude、DeepSeek 走同一接口，兼容（还没亲自实测）。见[支持的智能体](#支持的智能体)。
+- 🪟 **锁定窗口的后台模式**（v0.6.1）：`xyzlcu lock --app Safari` 之后，智能体只在这一个窗口里操作，你照常用电脑：鼠标不动、应用不被激活；点击和输入优先走辅助功能，每个结果都写明走的 `route`。在文本编辑、访达、Safari 上实测，限制也如实写了。见[后台 / 锁定窗口模式](#后台--锁定窗口模式v061)。
 - ⚡ **快**：开着守护进程时，`xyzlcu` 是一个很小的 C 程序，一次调用约 **3 毫秒**。
 
   | 操作 | XYZLCU | LCU |
@@ -47,6 +48,7 @@
 - 📸 **截屏**：截整块屏、单个窗口（`--window`）或一块区域（`--region`），可缩小；`--fast` 一键出小 JPEG；会输出点坐标与像素的换算关系
 - 🧠 **内存截图**（v0.4.2）：`--base64` / `--stdout` 直接在内存里出图，不写文件；守护进程按需保持截图流，重复截同一个窗口约 20 毫秒
 - 🚀 **v0.5.0 更快**：C 小客户端（空调用约 3 毫秒）、守护进程启动时预开主屏截图流（`--fast` 约 9 毫秒）、并行 PNG 编码（全尺寸 PNG 171 → 31 毫秒）、JPEG / HEIC、`--diff` 只返回变化的区域、MCP `batch` 一次多步
+- 🪟 **v0.6.1**：锁定窗口的后台模式（`lock` / `--background` / MCP `lock`）：只截这个窗口，点击、输入、按键、滚动优先走辅助功能，不动鼠标、不激活应用
 - ⚡ **v0.6.0**：守护进程自己维护应用表（`apps` 10 → 3 毫秒，`ax` 27 → 5 毫秒，`find` 21 → 8 毫秒）、没被挡住的窗口直接从主屏流里裁（第一次截窗口 114 → 25 毫秒）、`ax --compact` + `click-el --ref` 省 token、升级后自动重启旧守护进程
 - 🖱 **鼠标**：单击、右键、双击、移动、拖拽、滚动
 - ⌨️ **键盘**：直接输入 Unicode 文字（中文、emoji 都行，不经过输入法），支持组合键（`cmd+shift+4`）
@@ -256,6 +258,63 @@ xyzlcu value TextEdit --window 我的笔记                         # 读回核�
 
 **限制**：`events-pid`、`menu`、`paste` 绕开的是 HID 事件流上的监听；如果应用自己的主线程卡住了，哪条路都没用。要真正修好，需要重启卡住的进程（`xyzlcu taps` 里 `blocking: true` 的那个）或者注销/重启。XYZLCU 不会替你结束任何进程。
 
+## 后台 / 锁定窗口模式（v0.6.1）
+
+像沙盒里的智能体窗口一样：锁定**一个**应用窗口，之后的命令都只作用于它。**真实鼠标指针不动、应用不会被激活，你可以同时正常用键盘鼠标。**
+
+```bash
+xyzlcu lock --app Safari --window-title "Example"     # 或 --window-id N（见 xyzlcu windows）
+xyzlcu screenshot --out shot.png                       # 只截这个窗口，被别的窗口挡住也能截完整
+xyzlcu ax --compact                                    # 它的控件，内容区优先，中心点相对窗口
+xyzlcu click 841 33                                    # 坐标相对窗口左上角（点），这里是地址栏
+xyzlcu type -- "https://example.com/"
+xyzlcu key return
+xyzlcu scroll 0 -5 --at 800,600
+xyzlcu lock --status
+xyzlcu unlock
+```
+
+- 开启方式：`lock`（状态存在 `~/.xyzlcu/lock.json`，命令行、守护进程、MCP 共用）；或单条命令加 `--background` / `XYZLCU_BACKGROUND=1` 并配 `--app App [--window-title 标题]`；或 MCP 的 `lock` 工具 / `background: true` 参数。`--no-lock` 让单条命令忽略锁定。
+- **坐标相对窗口**（从窗口左上角算的点）。`ax --compact` 和 `find` 也按这个坐标输出。
+- **每个结果都带 `route`**（实际走的路），以及动作之后实测的 `cursorMoved`、`frontmostChanged`：
+
+| 操作 | 路线（按顺序尝试） | 说明 |
+|---|---|---|
+| `screenshot` | `sck-window` | ScreenCaptureKit 单独截这个窗口，被挡住也完整 |
+| `click` | `ax-focus` / `ax-press` / `ax-select` / `ax-showmenu`（右键），再 `pid-mouse` | 用辅助功能命中该点，向上找最近的控件；工具栏里被标签盖住的输入框用小范围邻近搜索找到（`nearby: true`）。`--via ax\|pid` 强制 |
+| `type` | `ax-selected-text`，再 `pid-keys` | 辅助功能在选区插入，并读回核对（`verified`） |
+| `key` | 带 ⌘ 且有可用菜单项 → `ax-menu`；Esc / Return 按对话框的取消 / 默认按钮（`ax-press-cancel` / `ax-press-default`）；否则 `pid-keys` | `--via pid\|menu` 强制 |
+| `scroll` | `ax-scrollbar`（直接设滚动条的值，1 行约 40 点），再 `pid-scroll` | `--via ax\|pid` |
+| `drag`、`move`、`activate` 等 | 拒绝（退出码 6） | 需要真实鼠标或前台；加 `--allow-foreground` 会激活应用、走原来的路线 |
+
+在 Apple Silicon Mac 上实测，目标窗口被别的应用挡住（所有情况下鼠标都没动、前台应用都没变）：
+
+| 应用 | 操作 | 路线 | 耗时 | 核对 |
+|---|---|---|---:|---|
+| 文本编辑 | 点文本区 | `ax-focus` | 14 毫秒 | 焦点移过去 |
+| 文本编辑 | 输入文字 | `ax-selected-text` | 10 毫秒 | 值里有这段文字 |
+| 文本编辑 | `type --via pid` | `pid-keys` | 85 毫秒 | 值里有这段文字 |
+| 文本编辑 | `key return` / `backspace` | `pid-keys` | 2–3 毫秒 | 值和截图 |
+| 文本编辑 | 打开面板里按 Esc | `ax-press-cancel` | 232 毫秒 | 面板关闭 |
+| 访达 | 点「列表」显示方式 | `ax-press` | 131 毫秒 | 按钮值 0 → 1 |
+| 访达 | 点搜索、输入文件名 | `ax-press`、`ax-selected-text` | 104、33 毫秒 | 结果里出现该文件 |
+| 访达 | 窗口截图 | `sck-window` | 约 80 毫秒 | 完整窗口 |
+| Safari | 点地址栏 | `ax-focus`（`nearby`） | 171 毫秒 | 输入框获得焦点 |
+| Safari | 输入网址、`key return` | `ax-selected-text`、`pid-keys` | 15、3 毫秒 | 页面打开 |
+| Safari | 点链接 | `ax-press` | 7 毫秒 | 页面跳转（等网络加载完） |
+| Safari | 滚动 | `ax-scrollbar` | 5 毫秒 + 80 毫秒读回 | 5 行，链接移动 200 点 |
+| Safari | 窗口截图 | `sck-window` | 约 68 毫秒 | 完整窗口 |
+
+**如实写明的限制**（不行或不稳定的地方）：
+
+- **后台应用可能延迟执行。** macOS 会节流后台应用（App Nap）。发给后台文本编辑的 ⌘S 有时几秒后才生效，或要等下一个事件。请核对结果（读回文件、截图），不要只看 `ok`；或者用 `--allow-foreground`。
+- **作用于文稿的菜单项在应用处于后台时常常是不可用的**（比如 Safari 的「关闭标签页」）。这时 `key` 会退回 `pid-keys`，而很多应用不理会发给进程的 ⌘ 组合键。
+- **直接投递的鼠标事件经常被忽略。** 实测 Safari 网页内容不理 `pid-mouse` 点击和 `pid-scroll` 滚轮，所以辅助功能路线排在前面。`ax-focus` 只让输入框获得焦点，不会把光标放到点击的位置。
+- 打开 / 存储面板里的 Esc 是按它的「取消」按钮（按标题找）；应用在后台时，发给面板进程的按键会被忽略。
+- 只在鼠标悬停时出现的控件（比如标签页的关闭按钮）和拖放做不到。
+- 不支持最小化的窗口和其他桌面（Space）上的窗口。锁定的窗口关掉后，命令会以退出码 4 失败，直到 `unlock`。
+- 权限弹窗（TCC）等系统对话框不在范围内，绝不会去点。
+
 ## 录制与回放
 
 ```bash
@@ -449,6 +508,7 @@ const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Bu
 
 - 只读：`check`、`screenshot`（直接返回图片，默认 JPEG）、`apps`、`windows`、`cursor`、`ax`、`find`
 - 操作：`click_element`、`click`、`type_text`、`key`、`activate`
+- 后台（v0.6.1）：`lock`（`app`、`window_title`、`window_id`、`unlock`、`status`）；`screenshot`、`ax`、`find`、`click_element`、`click`、`type_text`、`key` 支持 `background: true`（配 `app`）做单次后台操作。锁定时 `screenshot` 默认 scale 1，`ax` 支持 `focus`（`content` / `window` / `web`），`ax` / `find` 的 `app` 可省略
 - 批量：`batch`（`steps` 是命令字符串数组，比如 `["click-el TextEdit --title 保存", "wait TextEdit --role AXSheet", "screenshot --diff"]`，一次调用按顺序执行，返回每一步的输出和图片；`continue_on_error` 出错后继续）。省掉多次往返和模型多轮生成；截图步骤默认半尺寸 JPEG
 - `screenshot` 支持 `diff: true`：只返回变化的区域
 - 通用：`xyzlcu`（`args` 数组，执行任意子命令；不允许 `mcp`、`serve`、`record`、`replay`、`batch` 和 `--stdout`）
@@ -764,6 +824,7 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 - `press` 只按完全匹配（不区分大小写）的标题、描述、值或 identifier 找控件，返回第一个匹配项；需要更精确时用 `find` / `click-el` 的 `--role`、`--index`、`--window`。
 - `type` 不经过输入法，需要输入法联想的场景不适用。
 - 不支持其他桌面（Space）上的窗口的切换管理。
+- 后台 / 锁定窗口模式的限制见[那一节](#后台--锁定窗口模式v061)（App Nap 延迟、后台时菜单项不可用、投递的鼠标事件被忽略、不能拖拽、不支持最小化窗口）。
 - 守护进程的应用表最多 10 秒刷新一次：后台进程刚变成普通应用、又没有被激活时，`apps` 最多晚 10 秒看到它（按名字找应用时找不到会立刻整体重扫，不受影响）。
 - 从主屏流里裁出来的窗口截图，圆角外面是桌面而不是透明；窗口被别的窗口挡住、跨屏或主屏流没开时，会自动改回单独截窗口。
 
@@ -781,6 +842,12 @@ rm -rf ~/.xyzlcu
 
 ## 更新记录
 
+- **0.6.1**：锁定窗口的后台模式和若干修复。
+  - **`lock` / `unlock` / `--background`**：锁定一个窗口；只截这个窗口（ScreenCaptureKit，被挡住也行），点击先走辅助功能（聚焦 / 按下 / 选中 / 弹菜单）再投递给进程，输入先走辅助功能再投递按键，⌘ 组合键走菜单，Esc / Return 按对话框的取消 / 默认按钮，滚动直接设滚动条。坐标相对窗口，每个结果带 `route`，每次操作后核对鼠标和前台应用。`drag` / `move` / `activate` 默认拒绝，`--allow-foreground` 放行。MCP 新增 `lock` 工具和 `background` 参数。
+  - `screenshot -o` 等同 `--out`；以 `-` 开头的输出路径直接报错，不再生成名叫 `-o` 的文件。
+  - 有别的进程托管的打开 / 存储面板时，`key` / `type --app` 发给面板进程。
+  - `ax --compact` 先列内容区（网页、文稿、列表），并跳过滚出可视范围的控件（访达 183 → 43 行）。
+  - 修复：`record --duration` / `--no-moves` 被当成输出路径；按 id 找窗口时把还开着的窗口误报为已关闭。
 - **0.6.0**：守护进程查询更快，给智能体的控件列表更省 token。
   - **应用表**：守护进程自己维护运行中应用的表（启动 / 退出 / 激活 / 隐藏通知更新，最多 10 秒整体刷新一次），不再每次向 LaunchServices 逐个问。`apps` 9.5 → 3.2 毫秒，`ax` / `find` / `click-el` / `press` / 窗口截图都省掉 6–10 毫秒。
   - **控件树批量读**：`ax` 每个控件一次 IPC 取全部属性（文本编辑窗口 27 → 5 毫秒，`ax Finder --menu` 52 → 23 毫秒）。
