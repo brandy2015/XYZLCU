@@ -2,7 +2,9 @@
 
 **English** | [中文](README.zh-CN.md)
 
-[![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#requirements) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#requirements) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![Agents: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#supported-agents)
+
+**Supported agents:** [Grok · Codex · ChatGPT · Claude · DeepSeek · …](#supported-agents) (any agent that can run shell commands or connect to an MCP server)
 
 **XYZLCU (XYZ Local Computer Use)** is a dependency-free macOS GUI control CLI. Anything that can run shell commands, whether an AI agent (Claude Code, Codex, any shell-capable agent) or your own script, can use it to see the screen, click, type, press shortcuts, read the UI structure and press buttons. It is one Swift source file (built as `xyzlcu-core`) plus a tiny C client (`xyzlcu`): no Python, no Node, no Homebrew, no third-party libraries.
 
@@ -14,6 +16,7 @@
 
 All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see [Benchmark](#benchmark-vs-lcu) for the method and full data. The LCU numbers come from the 0.4.2 round on the same machine (LCU 0.13.4). LCU does some things better than XYZLCU too, and those are listed in [Benchmark](#benchmark-vs-lcu) as well.
 
+- 🔌 **Supports Grok, Codex, ChatGPT, Claude, DeepSeek** and other major agents: anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node, and shell scripts; ChatGPT, Claude and DeepSeek use the same interface and are compatible (not yet tested first-hand). See [Supported agents](#supported-agents).
 - ⚡ **Fast**: with the daemon running, `xyzlcu` is a tiny C program, about **3 ms** per call.
 
   | Operation | XYZLCU | LCU |
@@ -27,7 +30,6 @@ All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see 
 
 - 🧠 **In-memory and diff screenshots**: `--base64` / `--stdout` produce the image in memory, with no file written, and a `--fast` half-size JPEG takes about **9 ms**. `--diff` returns only the region that changed; if nothing changed you get a short JSON reply (3–4 ms, no image), which suits agents that keep taking a quick look.
 - 🛣 **Typing works even when the keyboard is stuck**: the event stream is probed for real every time. If it is stuck, typing falls back automatically: AX value write → posting to the process → paste via the menu. Shortcuts first look for the matching menu-bar item. Every path is **read back and verified**, and the next path is tried only if nothing landed. If the field cannot be read back, it stays on the current path, so **the same text is never typed twice**. The output says which path was actually used.
-- 🔌 **Works with any agent**: supports **Grok, Codex, ChatGPT, Claude, DeepSeek** and more. Anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node programs, and shell scripts; ChatGPT, Claude and DeepSeek use the same MCP / CLI interface and are compatible but not yet tested first-hand. See [Supported agents](#supported-agents).
 - 🪙 **Saves tokens**: `ax --compact` lists only actionable controls, one per line with a number and a center point; `click-el --ref N` then presses by number. Finder's control tree with the menu bar goes from **13.7 KB to 0.4 KB**, and a TextEdit window from 740 to 243 bytes.
 - 🧰 **Full feature set**: mouse position and movement, drag, scroll, full-screen / window / region screenshots, the window list, moving and resizing windows, the display list, pressing menus in the background, the control tree and pressing controls, waiting for a control to appear, and record / replay. LCU on the Mac has no mouse position or movement, no full-screen screenshots and no window list.
 - 🔒 **Safety**:

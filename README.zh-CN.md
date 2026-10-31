@@ -2,7 +2,9 @@
 
 [English](README.md) | **中文**
 
-[![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#系统要求) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#系统要求) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#系统要求) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#系统要求) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![智能体: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#支持的智能体)
+
+**支持的智能体：**[Grok · Codex · ChatGPT · Claude · DeepSeek · ……](#支持的智能体)（任何能跑 shell 命令或接 MCP 服务器的智能体都能用）
 
 **XYZLCU（XYZ Local Computer Use）** 是一个零依赖的 macOS 图形界面控制命令行工具。只要能执行 shell 命令，不管是 AI 智能体（Claude Code、Codex、任何会跑命令的 Agent）还是你自己写的脚本，就能看屏幕、点鼠标、打字、按快捷键、读取界面结构并按下按钮。整个工具是一个 Swift 源文件（编译成 `xyzlcu-core`）加一个几十行的 C 小客户端（`xyzlcu`），不用 Python、Node、Homebrew，也不需要任何第三方库。
 
@@ -14,6 +16,7 @@
 
 下面的数字都是在同一台 Apple Silicon Mac（macOS 26+）上实测的中位数，测法和完整数据见[性能对比](#性能对比与-lcu)。LCU 的数字是 0.4.2 那一轮在同一台机器上测的（LCU 0.13.4）。LCU 也有比 XYZLCU 强的地方，同样写在[性能对比](#性能对比与-lcu)里。
 
+- 🔌 **支持 Grok、Codex、ChatGPT、Claude、DeepSeek** 等主流智能体：能跑 shell 命令就能用，只认 MCP 的客户端用内置的 `xyzlcu mcp`。已实测：Grok Bot、Codex CLI、OpenCode、MCP 客户端（完整握手）、Python / Node、shell 脚本；ChatGPT、Claude、DeepSeek 走同一接口，兼容（还没亲自实测）。见[支持的智能体](#支持的智能体)。
 - ⚡ **快**：开着守护进程时，`xyzlcu` 是一个很小的 C 程序，一次调用约 **3 毫秒**。
 
   | 操作 | XYZLCU | LCU |
@@ -27,7 +30,6 @@
 
 - 🧠 **截图不落盘、只看变化**：`--base64` / `--stdout` 直接在内存里出图，`--fast` 半尺寸 JPEG 约 **9 毫秒**。`--diff` 只返回变化的那一块，画面没变时只回一小段 JSON（3–4 毫秒，没有图片），适合智能体反复「看一眼」。
 - 🛣 **键盘卡住也能打字**：每次先实测事件流。卡住时自动换路：辅助功能写值 → 直接投递给进程 → 菜单粘贴；快捷键先找菜单栏里对应的菜单项。每条路都**读回核对**，没生效才换下一条。读不到内容、没法核对时就停在当前这条路，**不会把同一段文字打两遍**。输出里写明实际走的是哪条路。
-- 🔌 **不挑智能体**：支持 **Grok、Codex、ChatGPT、Claude、DeepSeek** 等智能体。能跑 shell 命令就能用，只认 MCP 的客户端用内置的 `xyzlcu mcp`。已实测：Grok Bot、Codex CLI、OpenCode、MCP 客户端（完整握手）、Python / Node 程序、shell 脚本；ChatGPT、Claude、DeepSeek 走同样的 MCP / 命令行接口，兼容但还没亲自实测。见[支持的智能体](#支持的智能体)。
 - 🪙 **省 token**：`ax --compact` 只列可以操作的控件，一行一个，带编号和中心点；再用 `click-el --ref N` 按编号点。访达加菜单栏的控件树 **13.7 KB → 0.4 KB**，文本编辑窗口 740 → 243 字节。
 - 🧰 **功能全**：鼠标位置和移动、拖拽、滚动、整屏 / 窗口 / 区域截图、窗口列表、移动和调整窗口、显示器列表、后台按菜单、控件树和按控件、等控件出现、录制和回放。LCU 在 Mac 上没有鼠标位置 / 移动、整屏截图和窗口列表这几项。
 - 🔒 **安全**：
