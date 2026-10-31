@@ -6,7 +6,7 @@
 
 **XYZLCU (XYZ Local Computer Use)** is a dependency-free macOS GUI control CLI. Anything that can run shell commands, whether an AI agent (Claude Code, Codex, any shell-capable agent) or your own script, can use it to see the screen, click, type, press shortcuts, read the UI structure and press buttons. It is one Swift source file (built as `xyzlcu-core`) plus a tiny C client (`xyzlcu`): no Python, no Node, no Homebrew, no third-party libraries.
 
-> **General-purpose, not tied to any agent.** XYZLCU is a plain command-line program: any agent that can run shell commands and read JSON output can use it directly (Grok Bot, Claude Code, Codex CLI, Cursor, Gemini CLI, Cline / Roo, Aider, OpenClaw, OpenCode, Trae, …), with no plugin or adapter layer. MCP-only clients can use the built-in `xyzlcu mcp`. It works without an agent too: shell scripts, Shortcuts, cron / launchd. See [Supported agents](#supported-agents).
+> **General-purpose, not tied to any agent.** XYZLCU is a plain command-line program: any agent that can run shell commands and read JSON output can use it directly (**Grok**, **Codex**, **ChatGPT**, **Claude**, **DeepSeek**, plus Cursor, Gemini CLI, Cline / Roo, Aider, OpenClaw, OpenCode, Trae, …), with no plugin or adapter layer. MCP-only clients can use the built-in `xyzlcu mcp`. It works without an agent too: shell scripts, Shortcuts, cron / launchd. See [Supported agents](#supported-agents).
 
 > Inspired by and borrows ideas from [LCU (Local Computer Use)](https://github.com/amontlabs/lcu) by Amont Labs, with thanks (see [Acknowledgements](#acknowledgements)). XYZLCU is an **independent implementation**: it copies no LCU code and does **not** need the ChatGPT / Codex desktop app or its runtime. For a speed and usability comparison with LCU, see [Benchmark](#benchmark-vs-lcu).
 
@@ -27,7 +27,7 @@ All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see 
 
 - 🧠 **In-memory and diff screenshots**: `--base64` / `--stdout` produce the image in memory, with no file written, and a `--fast` half-size JPEG takes about **9 ms**. `--diff` returns only the region that changed; if nothing changed you get a short JSON reply (3–4 ms, no image), which suits agents that keep taking a quick look.
 - 🛣 **Typing works even when the keyboard is stuck**: the event stream is probed for real every time. If it is stuck, typing falls back automatically: AX value write → posting to the process → paste via the menu. Shortcuts first look for the matching menu-bar item. Every path is **read back and verified**, and the next path is tried only if nothing landed. If the field cannot be read back, it stays on the current path, so **the same text is never typed twice**. The output says which path was actually used.
-- 🔌 **Works with any agent**: anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node programs, and shell scripts. See [Supported agents](#supported-agents).
+- 🔌 **Works with any agent**: supports **Grok, Codex, ChatGPT, Claude, DeepSeek** and more. Anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node programs, and shell scripts; ChatGPT, Claude and DeepSeek use the same MCP / CLI interface and are compatible but not yet tested first-hand. See [Supported agents](#supported-agents).
 - 🪙 **Saves tokens**: `ax --compact` lists only actionable controls, one per line with a number and a center point; `click-el --ref N` then presses by number. Finder's control tree with the menu bar goes from **13.7 KB to 0.4 KB**, and a TextEdit window from 740 to 243 bytes.
 - 🧰 **Full feature set**: mouse position and movement, drag, scroll, full-screen / window / region screenshots, the window list, moving and resizing windows, the display list, pressing menus in the background, the control tree and pressing controls, waiting for a control to appear, and record / replay. LCU on the Mac has no mouse position or movement, no full-screen screenshots and no window list.
 - 🔒 **Safety**:
@@ -328,22 +328,43 @@ XYZLCU is **general-purpose**: it depends on no agent framework and needs no plu
 
 | Agent / tool | How it connects | Status |
 |---|---|---|
-| Grok Bot | shell tool runs `xyzlcu …` | ✅ tested |
-| Codex CLI | shell tool; or MCP (`~/.codex/config.toml`) | ✅ tested (0.163.0, shell), needs full access, see note below |
+| **Grok** (Grok Bot) | shell tool runs `xyzlcu …` | ✅ tested |
+| **Codex** (OpenAI Codex CLI) | shell tool; or MCP (`~/.codex/config.toml`) | ✅ tested (0.163.0, shell). Needs full-access mode: inside the sandbox `xyzlcu cursor` reads `0,0`, see note below |
+| **ChatGPT** (ChatGPT desktop / agents in ChatGPT) | ChatGPT-family tools that can run local commands (e.g. Codex) call `xyzlcu …` directly; MCP-only setups use `xyzlcu mcp` (stdio; if ChatGPT only accepts remote MCP servers, put a stdio→HTTP bridge in front) | 🟡 compatible (MCP / CLI), not tested |
+| **Claude** (Claude Code) | Bash tool; or `claude mcp add` (see below) | 🟡 compatible (CLI / MCP), not tested |
+| **Claude** (Claude Desktop) | MCP (`mcpServers` in `claude_desktop_config.json`, see below) | 🟡 compatible (MCP), not tested |
+| **DeepSeek** (DeepSeek-based agents / harnesses) | the harness's shell tool runs `xyzlcu …`; or add `xyzlcu mcp` to the harness's MCP config | 🟡 compatible (CLI / MCP), not tested |
 | OpenCode | bash tool | ✅ tested (2.0.32) |
-| Your own Python / Node program | `subprocess` / `child_process`, see examples below | ✅ tested |
 | Any MCP client | `xyzlcu mcp` (stdio) | ✅ tested (scripted full handshake: initialize, tools/list, tools/call, screenshot returned as an image) |
-| Claude Code | Bash tool; or `claude mcp add` | should work (shell tool), not tested |
-| Claude Desktop | MCP (`claude_desktop_config.json`) | should work (MCP), not tested |
-| Cursor | the agent's terminal; or `.cursor/mcp.json` | should work (shell tool), not tested |
-| Gemini CLI | `run_shell_command`; or `mcpServers` in `~/.gemini/settings.json` | should work (shell tool), not tested (sign-in unavailable on the test machine) |
-| Cline / Roo Code | `execute_command`; or the extension's MCP settings | should work (shell tool), not tested |
-| Aider | `/run xyzlcu …` | should work (shell tool), not tested |
-| OpenClaw | exec / shell tool | should work (shell tool), not tested |
-| Trae | terminal; or MCP settings | should work (shell tool), not tested |
+| Your own Python / Node program | `subprocess` / `child_process`, see examples below | ✅ tested |
+| Cursor | the agent's terminal; or `.cursor/mcp.json` | 🟡 compatible (CLI / MCP), not tested |
+| Gemini CLI | `run_shell_command`; or `mcpServers` in `~/.gemini/settings.json` | 🟡 compatible (CLI / MCP), not tested (sign-in unavailable on the test machine) |
+| Cline / Roo Code | `execute_command`; or the extension's MCP settings | 🟡 compatible (CLI / MCP), not tested |
+| Aider | `/run xyzlcu …` | 🟡 compatible (CLI), not tested |
+| OpenClaw | exec / shell tool | 🟡 compatible (CLI), not tested |
+| Trae | terminal; or MCP settings | 🟡 compatible (CLI / MCP), not tested |
 | No agent at all | shell scripts, Shortcuts "Run Shell Script", cron / launchd | ✅ tested (shell scripts) |
 
-"Tested" means the agent actually ran `xyzlcu` on the test machine (at least `check`, `cursor`, `apps` and a screenshot) and the results were checked. "Should work" means it has a shell tool, and XYZLCU behaves no differently for it than for any other caller, but it was not run here.
+"Tested" means the agent actually ran `xyzlcu` on the test machine (at least `check`, `cursor`, `apps` and a screenshot) and the results were checked. "Compatible" means it can run shell commands or connect to an MCP server, and XYZLCU behaves no differently for it than for any other caller, but it has not been run first-hand yet. If you get one working, an issue / PR to mark it tested is welcome.
+
+**Quick setup** (full details in [MCP server](#mcp-server))
+
+- Shell-capable agents (Grok, Codex, Claude Code, DeepSeek harnesses, …): paste the AGENTS.md / CLAUDE.md snippet below into your project instructions and call `xyzlcu …` directly.
+- Claude Code over MCP:
+
+  ```bash
+  claude mcp add xyzlcu -- "$(which xyzlcu)" mcp
+  ```
+
+- Claude Desktop and other clients using the `mcpServers` format (set `command` to the full path from `which xyzlcu`; many clients don't expand `~`):
+
+  ```json
+  {
+    "mcpServers": {
+      "xyzlcu": { "command": "xyzlcu", "args": ["mcp"] }
+    }
+  }
+  ```
 
 **Notes**
 

@@ -6,7 +6,7 @@
 
 **XYZLCU（XYZ Local Computer Use）** 是一个零依赖的 macOS 图形界面控制命令行工具。只要能执行 shell 命令，不管是 AI 智能体（Claude Code、Codex、任何会跑命令的 Agent）还是你自己写的脚本，就能看屏幕、点鼠标、打字、按快捷键、读取界面结构并按下按钮。整个工具是一个 Swift 源文件（编译成 `xyzlcu-core`）加一个几十行的 C 小客户端（`xyzlcu`），不用 Python、Node、Homebrew，也不需要任何第三方库。
 
-> **通用，不绑定任何智能体。** XYZLCU 就是一个普通的命令行程序：任何能执行 shell 命令、能读 JSON 输出的智能体都能直接用（Grok Bot、Claude Code、Codex CLI、Cursor、Gemini CLI、Cline / Roo、Aider、OpenClaw、OpenCode、Trae……），不需要专门的插件或适配层；只支持 MCP 的客户端可以用内置的 `xyzlcu mcp`。不用智能体也行：shell 脚本、快捷指令、cron / launchd 一样能调。见[支持的智能体](#支持的智能体)。
+> **通用，不绑定任何智能体。** XYZLCU 就是一个普通的命令行程序：任何能执行 shell 命令、能读 JSON 输出的智能体都能直接用（**Grok**、**Codex**、**ChatGPT**、**Claude**、**DeepSeek**，以及 Cursor、Gemini CLI、Cline / Roo、Aider、OpenClaw、OpenCode、Trae……），不需要专门的插件或适配层；只支持 MCP 的客户端可以用内置的 `xyzlcu mcp`。不用智能体也行：shell 脚本、快捷指令、cron / launchd 一样能调。见[支持的智能体](#支持的智能体)。
 
 > 借鉴自 Amont Labs 的 [LCU（Local Computer Use）](https://github.com/amontlabs/lcu)，在此致谢（见[致谢](#致谢)）。XYZLCU 是**独立实现**：没有复制 LCU 的代码，也**不需要 ChatGPT / Codex** 桌面应用或其运行时。和 LCU 的速度、用法对比见[性能对比](#性能对比与-lcu)。
 
@@ -27,7 +27,7 @@
 
 - 🧠 **截图不落盘、只看变化**：`--base64` / `--stdout` 直接在内存里出图，`--fast` 半尺寸 JPEG 约 **9 毫秒**。`--diff` 只返回变化的那一块，画面没变时只回一小段 JSON（3–4 毫秒，没有图片），适合智能体反复「看一眼」。
 - 🛣 **键盘卡住也能打字**：每次先实测事件流。卡住时自动换路：辅助功能写值 → 直接投递给进程 → 菜单粘贴；快捷键先找菜单栏里对应的菜单项。每条路都**读回核对**，没生效才换下一条。读不到内容、没法核对时就停在当前这条路，**不会把同一段文字打两遍**。输出里写明实际走的是哪条路。
-- 🔌 **不挑智能体**：能跑 shell 命令就能用，只认 MCP 的客户端用内置的 `xyzlcu mcp`。已实测：Grok Bot、Codex CLI、OpenCode、MCP 客户端（完整握手）、Python / Node 程序、shell 脚本。见[支持的智能体](#支持的智能体)。
+- 🔌 **不挑智能体**：支持 **Grok、Codex、ChatGPT、Claude、DeepSeek** 等智能体。能跑 shell 命令就能用，只认 MCP 的客户端用内置的 `xyzlcu mcp`。已实测：Grok Bot、Codex CLI、OpenCode、MCP 客户端（完整握手）、Python / Node 程序、shell 脚本；ChatGPT、Claude、DeepSeek 走同样的 MCP / 命令行接口，兼容但还没亲自实测。见[支持的智能体](#支持的智能体)。
 - 🪙 **省 token**：`ax --compact` 只列可以操作的控件，一行一个，带编号和中心点；再用 `click-el --ref N` 按编号点。访达加菜单栏的控件树 **13.7 KB → 0.4 KB**，文本编辑窗口 740 → 243 字节。
 - 🧰 **功能全**：鼠标位置和移动、拖拽、滚动、整屏 / 窗口 / 区域截图、窗口列表、移动和调整窗口、显示器列表、后台按菜单、控件树和按控件、等控件出现、录制和回放。LCU 在 Mac 上没有鼠标位置 / 移动、整屏截图和窗口列表这几项。
 - 🔒 **安全**：
@@ -328,22 +328,43 @@ XYZLCU 是**通用的**：它不依赖任何智能体框架，也不需要插件
 
 | 智能体 / 工具 | 怎么接入 | 状态 |
 |---|---|---|
-| Grok Bot | shell 工具直接运行 `xyzlcu …` | ✅ 实测 |
-| Codex CLI | shell 工具；或 MCP（`~/.codex/config.toml`） | ✅ 实测（0.163.0，shell 方式），需要完全访问，见下方说明 |
-| OpenCode | bash 工具 | ✅ 实测（2.0.32） |
-| 自己写的 Python / Node 程序 | `subprocess` / `child_process`，见下方示例 | ✅ 实测 |
-| 任意 MCP 客户端 | `xyzlcu mcp`（stdio） | ✅ 实测（用脚本做了完整握手：initialize、tools/list、tools/call、截图图片返回） |
-| Claude Code | Bash 工具；或 `claude mcp add` | 应该可用（shell 工具），未实测 |
-| Claude Desktop | MCP（`claude_desktop_config.json`） | 应该可用（MCP），未实测 |
-| Cursor | Agent 的终端；或 `.cursor/mcp.json` | 应该可用（shell 工具），未实测 |
-| Gemini CLI | `run_shell_command`；或 `~/.gemini/settings.json` 的 `mcpServers` | 应该可用（shell 工具），未实测（本机登录不可用，没跑完） |
-| Cline / Roo Code | `execute_command`；或扩展的 MCP 设置 | 应该可用（shell 工具），未实测 |
-| Aider | `/run xyzlcu …` | 应该可用（shell 工具），未实测 |
-| OpenClaw | exec / shell 工具 | 应该可用（shell 工具），未实测 |
-| Trae | 终端；或 MCP 设置 | 应该可用（shell 工具），未实测 |
-| 不用智能体 | shell 脚本、快捷指令「运行 Shell 脚本」、cron / launchd | ✅ 实测（shell 脚本） |
+| **Grok**（Grok Bot） | shell 工具直接运行 `xyzlcu …` | ✅ 已实测 |
+| **Codex**（OpenAI Codex CLI） | shell 工具；或 MCP（`~/.codex/config.toml`） | ✅ 已实测（0.163.0，shell 方式）。需要完全访问模式：在沙箱里 `xyzlcu cursor` 会返回 `0,0`，见下方说明 |
+| **ChatGPT**（ChatGPT 桌面版 / ChatGPT 里的 agent） | 能执行本机命令的 ChatGPT 系工具（如 Codex）直接跑 `xyzlcu …`；只接 MCP 的场景用 `xyzlcu mcp`（stdio；ChatGPT 若只支持远程 MCP，需要自己用 stdio→HTTP 桥接） | 🟡 兼容（MCP / 命令行），未实测 |
+| **Claude**（Claude Code） | Bash 工具；或 `claude mcp add`（见下方） | 🟡 兼容（命令行 / MCP），未实测 |
+| **Claude**（Claude Desktop） | MCP（`claude_desktop_config.json` 的 `mcpServers`，见下方） | 🟡 兼容（MCP），未实测 |
+| **DeepSeek**（基于 DeepSeek 模型的智能体 / harness） | harness 的 shell 工具运行 `xyzlcu …`；或在 harness 的 MCP 配置里加 `xyzlcu mcp` | 🟡 兼容（命令行 / MCP），未实测 |
+| OpenCode | bash 工具 | ✅ 已实测（2.0.32） |
+| 任意 MCP 客户端 | `xyzlcu mcp`（stdio） | ✅ 已实测（用脚本做了完整握手：initialize、tools/list、tools/call、截图图片返回） |
+| 自己写的 Python / Node 程序 | `subprocess` / `child_process`，见下方示例 | ✅ 已实测 |
+| Cursor | Agent 的终端；或 `.cursor/mcp.json` | 🟡 兼容（命令行 / MCP），未实测 |
+| Gemini CLI | `run_shell_command`；或 `~/.gemini/settings.json` 的 `mcpServers` | 🟡 兼容（命令行 / MCP），未实测（本机登录不可用，没跑完） |
+| Cline / Roo Code | `execute_command`；或扩展的 MCP 设置 | 🟡 兼容（命令行 / MCP），未实测 |
+| Aider | `/run xyzlcu …` | 🟡 兼容（命令行），未实测 |
+| OpenClaw | exec / shell 工具 | 🟡 兼容（命令行），未实测 |
+| Trae | 终端；或 MCP 设置 | 🟡 兼容（命令行 / MCP），未实测 |
+| 不用智能体 | shell 脚本、快捷指令「运行 Shell 脚本」、cron / launchd | ✅ 已实测（shell 脚本） |
 
-「实测」是指在本机真的让它调用了 `xyzlcu`（至少 `check`、`cursor`、`apps` 和截图）并核对了结果；「应该可用」是指它有执行 shell 命令的工具，XYZLCU 对它和对其他工具没有区别，但没在本机跑过。
+「已实测」是指在测试机上真的让它调用了 `xyzlcu`（至少 `check`、`cursor`、`apps` 和截图）并核对了结果；「兼容」是指它能执行 shell 命令或接 MCP 服务器，XYZLCU 对它和对其他调用方没有任何区别，但还没在测试机上亲自跑过。欢迎跑通后提 issue / PR 把状态改成已实测。
+
+**快速接入**（完整说明见 [MCP 服务器](#mcp-服务器)）
+
+- 会跑 shell 命令的智能体（Grok、Codex、Claude Code、DeepSeek harness……）：把下面「放进 AGENTS.md / CLAUDE.md」那段贴进项目说明，直接调用 `xyzlcu …` 即可。
+- Claude Code 用 MCP：
+
+  ```bash
+  claude mcp add xyzlcu -- "$(which xyzlcu)" mcp
+  ```
+
+- Claude Desktop 及其他用 `mcpServers` 格式的客户端（`command` 写 `which xyzlcu` 的完整路径，很多客户端不展开 `~`）：
+
+  ```json
+  {
+    "mcpServers": {
+      "xyzlcu": { "command": "xyzlcu", "args": ["mcp"] }
+    }
+  }
+  ```
 
 **注意**
 
