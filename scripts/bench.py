@@ -105,6 +105,7 @@ ops.append(("move", ["move", str(pos["x"]), str(pos["y"])], False))
 ops += [
     ("screenshot_full", ["screenshot", f"{TMP}/xyzlcu-bench.png"], False),
     ("screenshot_fast", ["screenshot", f"{TMP}/xyzlcu-bench.jpg", "--fast"], False),
+    ("screenshot_fast_mem", ["screenshot", "--fast", "--base64"], False),
 ]
 win = None
 if gui:
@@ -121,6 +122,7 @@ if gui:
         cx, cy = ta[0] + ta[2] // 2, ta[1] + ta[3] - 20          # 文本区下方空白处 / empty spot near the bottom
         ops += [
             ("screenshot_window", ["screenshot", f"{TMP}/xyzlcu-bench.png", "--window", "TextEdit", "--title", DOC_NAME], False),
+            ("screenshot_window_mem", ["screenshot", "--base64", "--window", "TextEdit", "--title", DOC_NAME], False),
             ("ax_tree", ["ax", "TextEdit", "--depth", "3"], False),
             ("click", ["click", str(cx), str(cy)], True),
             ("type", ["type", "abc", "--window", DOC_NAME], True),

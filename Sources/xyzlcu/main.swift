@@ -7,6 +7,8 @@ import ApplicationServices
 import CoreGraphics
 import ImageIO
 import ScreenCaptureKit
+import CoreMedia
+import VideoToolbox
 import Carbon.HIToolbox
 
 // MARK: - 工具函数
@@ -38,7 +40,14 @@ let eventSource = CGEventSource(stateID: .hidSystemState)
 
 // MARK: - 权限
 func axTrusted() -> Bool { AXIsProcessTrusted() }
-func screenTrusted() -> Bool { CGPreflightScreenCaptureAccess() }
+/// CGPreflightScreenCaptureAccess 一次要 10 毫秒左右；守护进程里把「已授权」缓存 30 秒（没授权不缓存，授权后立刻生效）
+var screenTrustedAt = Date.distantPast
+func screenTrusted() -> Bool {
+    if daemonMode, Date().timeIntervalSince(screenTrustedAt) < 30 { return true }
+    let ok = CGPreflightScreenCaptureAccess()
+    if ok && daemonMode { screenTrustedAt = Date() }
+    return ok
+}
 func screenLocked() -> Bool {
     guard let d = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
     return (d["CGSSessionScreenIsLocked"] as? Bool) ?? ((d["CGSSessionScreenIsLocked"] as? Int) == 1)
@@ -65,8 +74,8 @@ func pathOf(_ pid: pid_t) -> String {
 func mainDisplayHeight() -> CGFloat { CGDisplayBounds(CGMainDisplayID()).height }
 /// 键盘事件的目标：nil = 系统 HID 事件流（发给前台应用）；设了 pid 就直接投递给该进程（--app）
 var keyTargetPid: pid_t? = nil
-func post(_ e: CGEvent?) { e?.post(tap: .cghidEventTap) }
-func postKey(_ e: CGEvent?) { if let p = keyTargetPid { e?.postToPid(p) } else { e?.post(tap: .cghidEventTap) } }
+func post(_ e: CGEvent?) { lastInputAt = Date(); e?.post(tap: .cghidEventTap) }
+func postKey(_ e: CGEvent?) { lastInputAt = Date(); if let p = keyTargetPid { e?.postToPid(p) } else { e?.post(tap: .cghidEventTap) } }
 func mouse(_ type: CGEventType, _ p: CGPoint, _ btn: CGMouseButton = .left, clicks: Int64 = 1) {
     let e = CGEvent(mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: p, mouseButton: btn)
     e?.setIntegerValueField(.mouseEventClickState, value: clicks)
@@ -512,7 +521,7 @@ func pasteWrite(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceA
         let t0 = Date()
         while Date().timeIntervalSince(t0) < 2 {
             if let v = axStringValue(el), v != before, v.contains(text) { verified = true; break }
-            sleepMs(30)
+            sleepMs(5)
         }
     } else { sleepMs(300) }
     // 没核对上时，菜单动作可能排队到以后才执行；这时不恢复剪贴板，免得以后粘贴出旧内容
@@ -546,7 +555,7 @@ func waitValueChange(_ el: AXUIElement?, from before: String?, contains text: St
     let t0 = Date()
     repeat {
         if let v = axStringValue(el), v != before, v.contains(text) { return true }
-        sleepMs(25)
+        sleepMs(5)
     } while Date().timeIntervalSince(t0) * 1000 < Double(ms)
     return false
 }
@@ -882,13 +891,18 @@ func pixelsPerPoint(_ did: CGDirectDisplayID) -> Double {
     guard let m = CGDisplayCopyDisplayMode(did), b.width > 0 else { return 1 }
     return Double(m.pixelWidth) / Double(b.width)
 }
-func writeImage(_ img: CGImage, to url: URL, jpeg: Bool, quality: Double) -> Bool {
+/// 在内存里编码（不落盘）；需要文件时再一次性写出
+func encodeImage(_ img: CGImage, jpeg: Bool, quality: Double) -> Data? {
     let type = (jpeg ? "public.jpeg" : "public.png") as CFString
-    guard let dest = CGImageDestinationCreateWithURL(url as CFURL, type, 1, nil) else { return false }
+    let buf = NSMutableData()
+    guard let dest = CGImageDestinationCreateWithData(buf as CFMutableData, type, 1, nil) else { return nil }
     let props: [CFString: Any] = jpeg ? [kCGImageDestinationLossyCompressionQuality: quality] : [:]
     CGImageDestinationAddImage(dest, img, props as CFDictionary)
-    return CGImageDestinationFinalize(dest)
+    return CGImageDestinationFinalize(dest) ? buf as Data : nil
 }
+/// --stdout 时的原始图像字节（守护进程里随回复带回客户端）和放到 stderr 的元数据
+var binOut: Data? = nil
+var binMeta: String? = nil
 func scaled(_ img: CGImage, _ s: Double) -> CGImage {
     let w = max(1, Int(Double(img.width) * s)), h = max(1, Int(Double(img.height) * s))
     guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
@@ -933,15 +947,101 @@ func grab(_ filter: SCContentFilter, _ cfg: SCStreamConfiguration) -> CGImage? {
     if !waitSignal(sem, timeout: sckTimeout) { sckTimedOut = true; return nil }
     return result
 }
-enum Target { case display(CGDirectDisplayID), region(CGDirectDisplayID, CGRect), window(CGWindowID) }
+enum Target { case display(CGDirectDisplayID), region(CGDirectDisplayID, CGRect), window(CGWindowID, CGRect) }
+// MARK: - 常驻截图流（只在守护进程里）
+// 同一目标第一次截图走 SCScreenshotManager，同时在后台开一路 SCStream；之后的截图直接取流里最新的一帧（内存里，几毫秒）。
+// 画面不变时流不出新帧、几乎不占资源；闲置 XYZLCU_STREAM_IDLE 秒（默认 20）自动关掉。XYZLCU_STREAM=0 关闭这个功能。
+var lastInputAt = Date.distantPast
+var streamsEnabled: Bool { daemonMode && ProcessInfo.processInfo.environment["XYZLCU_STREAM"] != "0" }
+@available(macOS 14.0, *)
+final class LiveStream: NSObject, SCStreamOutput, SCStreamDelegate {
+    let key: String, rect: CGRect
+    var stream: SCStream?
+    let queue = DispatchQueue(label: "xyzlcu.stream")
+    let lock = NSLock()
+    var latest: CVPixelBuffer?
+    var latestAt = Date.distantPast
+    var lastUsed = Date()
+    var failed = false
+    init(key: String, rect: CGRect) { self.key = key; self.rect = rect }
+    func start(_ filter: SCContentFilter, _ cfg: SCStreamConfiguration) {
+        let s = SCStream(filter: filter, configuration: cfg, delegate: self)
+        do { try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue) } catch { failed = true; return }
+        stream = s
+        s.startCapture { [weak self] e in if e != nil { self?.failed = true } }
+    }
+    func stop() { stream?.stopCapture { _ in }; stream = nil }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { failed = true }
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen,
+              let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = atts.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
+              let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+        lock.lock(); latest = pb; latestAt = Date(); lock.unlock()
+    }
+    /// 最新一帧。刚发过鼠标/键盘事件时，最多再等 maxWait 秒看有没有新帧（画面没变就不会有，直接用旧帧）
+    func frame(maxWait: Double) -> CGImage? {
+        if failed { return nil }
+        let deadline = Date(timeIntervalSinceNow: maxWait)
+        while true {
+            lock.lock(); let pb = latest, at = latestAt; lock.unlock()
+            if pb != nil && (at > lastInputAt || Date() >= deadline) {
+                var img: CGImage?
+                VTCreateCGImageFromCVPixelBuffer(pb!, options: nil, imageOut: &img)
+                lastUsed = Date()
+                return img
+            }
+            if pb == nil && Date() >= deadline { return nil }
+            usleep(2000)
+        }
+    }
+}
+var liveStreams: [String: AnyObject] = [:]
+var lastCaptureMethod: String? = nil
+var streamReaper: Timer? = nil
+@available(macOS 14.0, *)
+func liveFrame(_ key: String, rect: CGRect) -> CGImage? {
+    guard streamsEnabled, let s = liveStreams[key] as? LiveStream else { return nil }
+    if s.failed || s.rect != rect { s.stop(); liveStreams[key] = nil; return nil }
+    return s.frame(maxWait: Date().timeIntervalSince(lastInputAt) < 1 ? 0.12 : 0)
+}
+@available(macOS 14.0, *)
+func startLiveStream(_ key: String, rect: CGRect, _ filter: SCContentFilter, _ cfg: SCStreamConfiguration) {
+    guard streamsEnabled, liveStreams[key] == nil else { return }
+    // 最多同时 3 路，超出关掉最久没用的
+    let all = liveStreams.values.compactMap { $0 as? LiveStream }
+    if all.count >= 3, let old = all.min(by: { $0.lastUsed < $1.lastUsed }) { old.stop(); liveStreams[old.key] = nil }
+    cfg.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+    cfg.queueDepth = 4
+    cfg.pixelFormat = kCVPixelFormatType_32BGRA
+    let s = LiveStream(key: key, rect: rect)
+    s.start(filter, cfg)
+    liveStreams[key] = s
+    if streamReaper == nil {
+        let idle = Double(ProcessInfo.processInfo.environment["XYZLCU_STREAM_IDLE"] ?? "") ?? 20
+        streamReaper = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            for case let s as LiveStream in liveStreams.values where Date().timeIntervalSince(s.lastUsed) > idle || s.failed {
+                s.stop(); liveStreams[s.key] = nil
+            }
+        }
+    }
+}
+
 /// 快路径：ScreenCaptureKit（macOS 14+），在进程内截图，直接按目标尺寸输出
 func captureSCK(_ target: Target, scale: Double) -> (CGImage, CGRect)? {
     guard #available(macOS 14.0, *) else { return nil }
+    // 常驻流的键：目标 + 缩放；有现成的帧就直接用
+    var liveKey = "", liveRect = CGRect.zero
+    switch target {
+    case .display(let did): liveRect = CGDisplayBounds(did); liveKey = "d\(did)@\(scale)"
+    case .region(let did, let r): liveRect = r; liveKey = "r\(did):\(r.minX),\(r.minY),\(r.width),\(r.height)@\(scale)"
+    case .window(let wid, let r): liveRect = r; liveKey = "w\(wid)@\(scale)"
+    }
+    if let img = liveFrame(liveKey, rect: liveRect) { lastCaptureMethod = "screencapturekit-stream"; return (img, liveRect) }
     for attempt in 0..<2 {
         if sckTimedOut { return nil }
-        var maxAge = 30.0
-        if case .window = target { maxAge = 2 }  // 窗口大小/位置变化快，缓存时间短一些
-        guard let content = shareableContent(maxAge: attempt == 1 ? 0 : maxAge) else { return nil }
+        // 窗口也用缓存：下面会拿缓存里的窗口位置和 CGWindowList 的实时位置比对，不一致才重新取
+        guard let content = shareableContent(maxAge: attempt == 1 ? 0 : 30) else { return nil }
         let cfg = SCStreamConfiguration()
         cfg.showsCursor = false
         cfg.captureResolution = .best
@@ -955,14 +1055,17 @@ func captureSCK(_ target: Target, scale: Double) -> (CGImage, CGRect)? {
                 cfg.sourceRect = CGRect(x: r.minX - b.minX, y: r.minY - b.minY, width: r.width, height: r.height)
             }
             cfg.width = max(1, Int(rect.width * pps * scale)); cfg.height = max(1, Int(rect.height * pps * scale))
-            if let img = grab(SCContentFilter(display: d, excludingWindows: []), cfg) { return (img, rect) }
+            let filter = SCContentFilter(display: d, excludingWindows: [])
+            if let img = grab(filter, cfg) { startLiveStream(liveKey, rect: liveRect, filter, cfg); return (img, rect) }
             if attempt == 0 { continue }; return nil
-        case .window(let wid):
+        case .window(let wid, let want):
             guard let w = content.windows.first(where: { $0.windowID == wid }) else { continue }
+            let f = w.frame
+            if attempt == 0, abs(f.minX - want.minX) > 0.5 || abs(f.minY - want.minY) > 0.5 || abs(f.width - want.width) > 0.5 || abs(f.height - want.height) > 0.5 { continue }
             let filter = SCContentFilter(desktopIndependentWindow: w)
             let r = filter.contentRect, pps = Double(filter.pointPixelScale)
             cfg.width = max(1, Int(r.width * pps * scale)); cfg.height = max(1, Int(r.height * pps * scale))
-            if let img = grab(filter, cfg) { return (img, w.frame) }
+            if let img = grab(filter, cfg) { startLiveStream(liveKey, rect: liveRect, filter, cfg); return (img, w.frame) }
             if attempt == 0 { continue }; return nil
         }
     }
@@ -992,7 +1095,10 @@ func appWindow(_ appName: String, title: String?) throws -> (CGWindowID, CGRect,
     }
     try fail("\(app.localizedName ?? appName) 没有可见窗口" + (title.map { "（标题含 \($0)）" } ?? ""))
 }
-func screenshot(path: String, scale: Double?, display: Int, region: CGRect?, window: (String, String?)?, jpeg: Bool, quality: Double, forceCLI: Bool) throws {
+func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, window: (String, String?)?, jpeg: Bool, quality: Double, forceCLI: Bool,
+                base64: Bool = false, toStdout: Bool = false, timing: Bool = false) throws {
+    let t0 = Date(); var marks: [String: Int] = [:]
+    func mark(_ k: String) { marks[k] = Int(Date().timeIntervalSince(t0) * 1000) }
     let displays = activeDisplays()
     let s = (scale ?? 1) > 0 ? (scale ?? 1) : 1
     var target: Target
@@ -1001,7 +1107,7 @@ func screenshot(path: String, scale: Double?, display: Int, region: CGRect?, win
     var extra: [String: Any] = [:]
     if let (app, title) = window {
         let (wid, r, t) = try appWindow(app, title: title)
-        target = .window(wid); cliArgs = ["-o", "-l", String(wid)]; rect = r
+        target = .window(wid, r); cliArgs = ["-o", "-l", String(wid)]; rect = r
         extra = ["window": t, "windowId": Int(wid)]
     } else if let r = region {
         let did = displays.first { CGDisplayBounds($0).contains(CGPoint(x: r.midX, y: r.midY)) } ?? CGMainDisplayID()
@@ -1015,17 +1121,25 @@ func screenshot(path: String, scale: Double?, display: Int, region: CGRect?, win
     }
     var method = "screencapturekit"
     var img: CGImage? = nil
-    if !forceCLI && screenTrusted(), let (i, _) = captureSCK(target, scale: s) { img = i }
+    lastCaptureMethod = nil
+    mark("resolved")
+    if !forceCLI && screenTrusted(), let (i, _) = captureSCK(target, scale: s) { img = i; method = lastCaptureMethod ?? method }
     if img == nil {
         method = "screencapture"
         img = captureCLI(cliArgs, tmp: NSTemporaryDirectory() + "xyzlcu-raw-\(getpid()).png")
         if let i = img, s != 1 { img = scaled(i, s); method += "+scaled" }
     }
-    guard let cg = img, writeImage(cg, to: URL(fileURLWithPath: path), jpeg: jpeg, quality: quality) else {
+    mark("captured")
+    guard let cg = img, let data = encodeImage(cg, jpeg: jpeg, quality: quality) else {
         try fail("截图失败（多半是没有屏幕录制权限）", code: 2)
     }
+    mark("encoded")
+    if let path = path {
+        do { try data.write(to: URL(fileURLWithPath: path)) } catch { try fail("写不了文件 \(path): \(error.localizedDescription)") }
+        mark("written")
+    }
     // 锁屏时截图全黑；没有屏幕录制权限时只能拍到桌面和菜单栏
-    var o: [String: Any] = ["path": path, "pixelWidth": cg.width, "pixelHeight": cg.height,
+    var o: [String: Any] = ["pixelWidth": cg.width, "pixelHeight": cg.height,
          "originX": Int(rect.minX), "originY": Int(rect.minY), "pointWidth": Int(rect.width), "pointHeight": Int(rect.height),
          "pixelsPerPoint": rect.width > 0 ? Double(cg.width) / Double(rect.width) : 1, "method": method, "screenLocked": screenLocked(),
          "note": "全局点坐标 x = originX + x_pixel / pixelsPerPoint，y = originY + y_pixel / pixelsPerPoint"]
@@ -1033,6 +1147,18 @@ func screenshot(path: String, scale: Double?, display: Int, region: CGRect?, win
         o["warning"] = "ScreenCaptureKit 没有响应，已改用 screencapture（较慢）。守护进程在运行时用 XYZLCU_DAEMON=0 截图会这样，去掉它走守护进程即可"
     }
     o.merge(extra) { a, _ in a }
+    o["format"] = jpeg ? "jpeg" : "png"; o["bytes"] = data.count
+    if let path = path { o["path"] = path }
+    if timing { mark("total"); o["timingMs"] = marks }
+    if toStdout {
+        let meta = (try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        if daemonMode { binOut = data; binMeta = meta } else {
+            FileHandle.standardOutput.write(data)
+            FileHandle.standardError.write((meta + "\n").data(using: .utf8)!)
+        }
+        return
+    }
+    if base64 { o["base64"] = data.base64EncodedString() }
     out(o)
 }
 
@@ -1042,6 +1168,7 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   check [--probe] | request | whoami
   screenshot [path] [--scale 0.5] [--display N] [--format png|jpg] [--quality 0.7] [--fast] [--cli]
              [--window "App" [--title 标题]] [--region x,y,w,h]      （--fast = jpg、质量 0.6、缩放 0.5）
+             [--base64 | --stdout] [--out path] [--timing]   --base64/--stdout 在内存里出图（默认 jpg），不写文件
   click x y [--right] [--double] | move x y | drag x1 y1 x2 y2 | scroll dx dy
   type "文字" [--app "App"] [--window 标题] [--via auto|ax|events|pid|paste]   （输出 JSON，path = 实际走的路）
   key cmd+shift+4 [--app "App"] [--via auto|events|menu|pid]    （auto：事件流卡住时改按对应菜单项 / 直接投递给进程）
@@ -1060,11 +1187,12 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   batch [--continue-on-error] [脚本文件]  （从 stdin 或文件逐行读取命令，一次启动执行多步）
   run [--continue-on-error] 'click 10 20; type 你好; key return'
   serve [--status | --stop]  常驻守护进程（~/.xyzlcu/sock），之后的命令自动转发给它，更快
+  mcp                        以 stdio MCP 服务器运行（给只支持 MCP 的客户端，如 Claude Desktop）
   通用选项: --delay N  事件间隔毫秒（默认 2，也可用环境变量 XYZLCU_DELAY）
   环境变量: XYZLCU_DAEMON=0 不用守护进程；=1 必须用守护进程
             XYZLCU_EVENTS_HEALTH=bad 模拟事件流卡住（测试备用路径）；XYZLCU_TAP_THRESHOLD_MS 卡住阈值（默认 1000）
 """
-let version = "0.4.1"
+let version = "0.4.2"
 var inBatch = false
 let startedAt = Date()
 
@@ -1082,7 +1210,7 @@ case "check":
     cachedHealth = nil  // check 总是重新检测
     let h = inputHealth(), ax = axTrusted()
     forceProbe = false
-    var o: [String: Any] = ["accessibility": ax, "screenRecording": screenTrusted(), "screenLocked": screenLocked(), "binary": pathOf(getpid()),
+    var o: [String: Any] = ["accessibility": ax, "screenRecording": CGPreflightScreenCaptureAccess(), "screenLocked": screenLocked(), "binary": pathOf(getpid()),
          "inputMonitoring": CGPreflightListenEventAccess(), "version": version,
          "responsibleProcess": responsiblePid(getpid()).map { pathOf($0) } ?? "unknown", "daemon": daemonMode,
          "keyboardBlockedBy": h.keyboardBlockedBy, "tapThresholdMs": tapThresholdMs()]
@@ -1129,11 +1257,14 @@ case "screenshot":
         guard v.count == 4, v[2] > 0, v[3] > 0 else { try fail("--region 格式: x,y,w,h（全局点坐标）") }
         region = CGRect(x: v[0], y: v[1], width: v[2], height: v[3])
     }
-    let p0 = args.first?.lowercased() ?? ""
-    let jpeg = fmtOpt.map { $0 == "jpg" || $0 == "jpeg" } ?? (p0.hasSuffix(".jpg") || p0.hasSuffix(".jpeg") || fast)
-    let path = args.first ?? (NSTemporaryDirectory() + "xyzlcu-\(Int(Date().timeIntervalSince1970 * 1000)).\(jpeg ? "jpg" : "png")")
+    // --base64：图像放进 JSON；--stdout：原始字节写到标准输出（元数据到标准错误）。两者都不落盘，除非另给路径
+    let b64 = flag("--base64"), toStdout = flag("--stdout"), timing = flag("--timing")
+    let given = option("--out") ?? args.first
+    let p0 = given?.lowercased() ?? ""
+    let jpeg = fmtOpt.map { $0 == "jpg" || $0 == "jpeg" } ?? (p0.hasSuffix(".jpg") || p0.hasSuffix(".jpeg") || fast || ((b64 || toStdout) && given == nil))
+    let path = given ?? ((b64 || toStdout) ? nil : NSTemporaryDirectory() + "xyzlcu-\(Int(Date().timeIntervalSince1970 * 1000)).\(jpeg ? "jpg" : "png")")
     try screenshot(path: path, scale: scale, display: display, region: region, window: winApp.map { ($0, winTitle) },
-                   jpeg: jpeg, quality: quality, forceCLI: forceCLI)
+                   jpeg: jpeg, quality: quality, forceCLI: forceCLI, base64: b64, toStdout: toStdout, timing: timing)
 case "click":
     try guardUnlocked(); let right = flag("--right"), double = flag("--double")
     try need(2, "click x y [--right] [--double]")
@@ -1376,8 +1507,9 @@ case "replay":
     try replaySession(path: args[0], speed: speed, force: force, noKeys: noKeys)
 case "__status":
     out(["running": daemonMode, "pid": Int(getpid()), "version": version, "uptimeSec": Int(Date().timeIntervalSince(startedAt)),
-         "socket": socketPath(), "accessibility": axTrusted(), "screenRecording": screenTrusted(), "screenLocked": screenLocked(),
-         "responsibleProcess": responsiblePid(getpid()).map { pathOf($0) } ?? "unknown"])
+         "socket": socketPath(), "accessibility": axTrusted(), "screenRecording": CGPreflightScreenCaptureAccess(), "screenLocked": screenLocked(),
+         "responsibleProcess": responsiblePid(getpid()).map { pathOf($0) } ?? "unknown",
+         "liveStreams": liveStreams.count, "streamsEnabled": streamsEnabled])
 case "batch", "run":
     try fail("batch/run 不能嵌套")
 case "serve":
@@ -1423,6 +1555,10 @@ func batchOptions(_ rest: [String]) throws -> (rest: [String], delay: Int?, coe:
 }
 
 /// 执行一次完整的命令行（单条命令或 batch/run），返回退出码。CLI 和守护进程共用
+/// 会改变界面的命令执行完记一下时间：之后的截图若取常驻流的帧，会等到这之后的新帧
+let readOnlyCommands: Set<String> = ["help", "-h", "--help", "version", "--version", "-v", "check", "whoami", "screenshot", "value", "cursor",
+                                     "sleep", "wait", "find", "apps", "displays", "windows", "ax", "taps", "__status", "serve"]
+func markIfMutating(_ argv: [String]) { if let c = argv.first, !readOnlyCommands.contains(c) { lastInputAt = Date() } }
 func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) -> Int32 {
     if top.isEmpty { emit(usage); return 0 }
     do {
@@ -1436,6 +1572,7 @@ func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) ->
             else { text = stdinText() }
             var worst: Int32 = 0
             for (n, c) in parseScript(text).enumerated() {
+                defer { markIfMutating(c) }
                 do { try execute(c) } catch let e as XErr {
                     err("error: 第 \(n + 1) 步（\(c.joined(separator: " "))）: \(e.msg)")
                     if !coe { return e.code }
@@ -1444,6 +1581,7 @@ func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) ->
             }
             return worst
         }
+        defer { markIfMutating(top) }
         try execute(top); return 0
     } catch let e as XErr { err("error: " + e.msg); return e.code }
     catch { err("error: \(error)"); return 1 }
@@ -1497,6 +1635,7 @@ func forward(_ top: [String]) -> Int32? {
     guard let resp = try? JSONSerialization.jsonObject(with: readAll(fd)) as? [String: Any], let code = resp["code"] as? Int else { return nil }
     if code == 98 { return nil }  // 版本不一致
     if let o = resp["out"] as? String, !o.isEmpty { FileHandle.standardOutput.write(o.data(using: .utf8)!) }
+    if let b = resp["bin"] as? String, let d = Data(base64Encoded: b) { FileHandle.standardOutput.write(d) }
     if let e = resp["err"] as? String, !e.isEmpty { FileHandle.standardError.write(e.data(using: .utf8)!) }
     return Int32(code)
 }
@@ -1511,10 +1650,12 @@ func handle(_ data: Data) -> (Data, Bool) {
             let saved = stepDelay
             if let d = req["delay"] as? Int { stepDelay = d }
             envOverlay = req["env"] as? [String: String] ?? [:]
-            outBuf = ""; var errText = ""
+            outBuf = ""; var errText = ""; binOut = nil; binMeta = nil
             let code = runMain(argv, stdinText: { req["stdin"] as? String ?? "" }, err: { errText += $0 + "\n" })
+            if let m = binMeta { errText = m + "\n" + errText }
             resp = ["code": Int(code), "out": outBuf ?? "", "err": errText]
-            outBuf = nil; stepDelay = saved
+            if let b = binOut { resp["bin"] = b.base64EncodedString() }
+            outBuf = nil; binOut = nil; binMeta = nil; stepDelay = saved
         }
     }
     return ((try? JSONSerialization.data(withJSONObject: resp)) ?? Data("{\"code\":1}".utf8), stop)
@@ -1535,6 +1676,8 @@ func serve() throws -> Never {
     chmod(path, 0o600)
     guard listen(fd, 16) == 0 else { try fail("listen 失败") }
     daemonMode = true
+    // 客户端提前断开（比如只是探测守护进程在不在）时，写回复会触发 SIGPIPE，不忽略的话守护进程会直接退出
+    signal(SIGPIPE, SIG_IGN)
     for sig in [SIGINT, SIGTERM, SIGHUP] {
         signal(sig, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
@@ -1553,6 +1696,7 @@ func serve() throws -> Never {
             // 只接受同一用户的连接
             if getpeereid(c, &uid, &gid) != 0 || uid != me { close(c); continue }
             let body = readAll(c)
+            if body.isEmpty { close(c); continue }   // 只是连上看看守护进程在不在
             var reply = Data(); var stop = false
             DispatchQueue.main.sync { (reply, stop) = handle(body) }
             _ = writeAll(c, reply); close(c)
@@ -1563,6 +1707,151 @@ func serve() throws -> Never {
     exit(0)
 }
 var signalSources: [DispatchSourceSignal] = []
+
+// MARK: - MCP 服务器（stdio，给只支持 MCP 的客户端用；工具调用直接发给守护进程，没有守护进程就在本进程里执行，不起子进程）
+/// 执行一条 xyzlcu 命令并拿回输出：守护进程在就直接发给它（不起新进程），不在就在本进程里执行
+func mcpRunSelf(_ argv: [String]) -> (out: String, err: String, code: Int32) {
+    if ProcessInfo.processInfo.environment["XYZLCU_DAEMON"] != "0", let fd = connectDaemon(socketPath()) {
+        defer { close(fd) }
+        var env: [String: String] = [:]
+        for k in forwardedEnv { if let v = ProcessInfo.processInfo.environment[k] { env[k] = v } }
+        let req: [String: Any] = ["v": version, "argv": argv, "cwd": FileManager.default.currentDirectoryPath, "env": env]
+        if let body = try? JSONSerialization.data(withJSONObject: req), writeAll(fd, body) {
+            shutdown(fd, SHUT_WR)
+            if let resp = try? JSONSerialization.jsonObject(with: readAll(fd)) as? [String: Any], let code = resp["code"] as? Int, code != 98 {
+                return (resp["out"] as? String ?? "", resp["err"] as? String ?? "", Int32(code))
+            }
+        }
+    }
+    outBuf = ""; var errText = ""
+    let code = runMain(argv, stdinText: { "" }, err: { errText += $0 + "\n" })
+    let o = outBuf ?? ""; outBuf = nil
+    return (o, errText, code)
+}
+
+func mcpTools() -> [[String: Any]] {
+    func t(_ name: String, _ desc: String, _ props: [String: Any] = [:], _ req: [String] = [], readOnly: Bool = false) -> [String: Any] {
+        var schema: [String: Any] = ["type": "object", "properties": props]
+        if !req.isEmpty { schema["required"] = req }
+        return ["name": name, "description": desc, "inputSchema": schema,
+                "annotations": ["readOnlyHint": readOnly, "destructiveHint": false]]
+    }
+    let s: [String: Any] = ["type": "string"], n: [String: Any] = ["type": "number"], b: [String: Any] = ["type": "boolean"]
+    return [
+        t("check", "Permissions, screen lock and input-path health. Call first; stop if screenLocked is true or permissions are missing.", readOnly: true),
+        t("screenshot", "Screenshot returned as a JPEG image (in memory, no file). Whole display (default scale 0.5), one app window (window, optional title), or a region \"x,y,w,h\" in global points. The text part has originX/originY/pixelsPerPoint: global point = origin + pixel / pixelsPerPoint.",
+          ["window": s, "title": s, "region": s, "display": n, "scale": n, "quality": n], readOnly: true),
+        t("apps", "Running GUI apps; the one with active=true is frontmost.", readOnly: true),
+        t("windows", "On-screen windows with owner, title and bounds (global points).", readOnly: true),
+        t("cursor", "Current pointer position.", readOnly: true),
+        t("ax", "Dump an app's accessibility tree: role title value [x,y wxh] per line.", ["app": s, "depth": n], ["app"], readOnly: true),
+        t("find", "Find a control by role/title; returns frame and center (global points).",
+          ["app": s, "role": s, "title": s, "contains": b, "window": s], ["app"], readOnly: true),
+        t("click_element", "Find a control and press it (AXPress, falling back to clicking its center).",
+          ["app": s, "role": s, "title": s, "window": s], ["app"]),
+        t("click", "Click at global point coordinates (moves the real pointer).", ["x": n, "y": n, "right": b, "double": b], ["x", "y"]),
+        t("type_text", "Type Unicode text into the focused element. Pass app and window so it refuses to type anywhere else.",
+          ["text": s, "app": s, "window": s], ["text"]),
+        t("key", "Press keys or combos, e.g. [\"cmd+s\"] or [\"return\"].", ["keys": ["type": "array", "items": s], "app": s], ["keys"]),
+        t("activate", "Bring an app to the front.", ["app": s], ["app"]),
+        t("xyzlcu", "Run any other xyzlcu command with raw arguments, e.g. [\"wait\",\"TextEdit\",\"--role\",\"AXSheet\",\"--timeout\",\"3\"] or [\"run\",\"click-el TextEdit --title Save; key return\"]. See `xyzlcu help`.",
+          ["args": ["type": "array", "items": s]], ["args"]),
+    ]
+}
+
+func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
+    func str(_ k: String) -> String? { if let v = a[k] as? String, !v.isEmpty { return v }; if let v = a[k] as? NSNumber { return v.stringValue }; return nil }
+    func on(_ k: String) -> Bool { (a[k] as? Bool) ?? false }
+    func text(_ s: String, _ isErr: Bool = false) -> [String: Any] { ["content": [["type": "text", "text": s]], "isError": isErr] }
+    var argv: [String] = []
+    switch name {
+    case "check", "apps", "windows", "cursor": argv = [name]
+    case "screenshot":
+        argv = ["screenshot", "--base64", "--format", "jpg", "--quality", str("quality") ?? "0.7"]
+        if let w = str("window") { argv += ["--window", w]; if let t = str("title") { argv += ["--title", t] } }
+        if let r = str("region") { argv += ["--region", r] }
+        if let d = str("display") { argv += ["--display", d] }
+        argv += ["--scale", str("scale") ?? (str("window") != nil || str("region") != nil ? "1" : "0.5")]
+        let r = mcpRunSelf(argv)
+        guard r.code == 0, var meta = (try? JSONSerialization.jsonObject(with: Data(r.out.utf8))) as? [String: Any],
+              let b64 = meta.removeValue(forKey: "base64") as? String else {
+            return text((r.err.isEmpty ? r.out : r.err) + "\nexit code \(r.code)", true)
+        }
+        let metaText = (try? JSONSerialization.data(withJSONObject: meta, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        return ["content": [["type": "image", "data": b64, "mimeType": "image/jpeg"], ["type": "text", "text": metaText]], "isError": false]
+    case "ax": argv = ["ax", str("app") ?? ""] + (str("depth").map { ["--depth", $0] } ?? [])
+    case "find", "click_element":
+        argv = [name == "find" ? "find" : "click-el", str("app") ?? ""]
+        for k in ["role", "title", "window"] { if let v = str(k) { argv += ["--\(k)", v] } }
+        if name == "find" && on("contains") { argv.append("--contains") }
+    case "click":
+        argv = ["click", str("x") ?? "", str("y") ?? ""]
+        if on("right") { argv.append("--right") }; if on("double") { argv.append("--double") }
+    case "type_text":
+        argv = ["type"]
+        if let v = str("app") { argv += ["--app", v] }; if let v = str("window") { argv += ["--window", v] }
+        argv.append(str("text") ?? "")
+    case "key":
+        argv = ["key"] + ((a["keys"] as? [String]) ?? [])
+        if let v = str("app") { argv += ["--app", v] }
+    case "activate": argv = ["activate", str("app") ?? ""]
+    case "xyzlcu":
+        argv = (a["args"] as? [String]) ?? []
+        if argv.contains("--stdout") { return text("--stdout 会破坏 MCP 输出，用 screenshot 工具 / use the screenshot tool", true) }
+        if let f = argv.first, ["mcp", "serve", "record", "replay", "batch"].contains(f) {
+            return text("`\(f)` 不能通过 MCP 运行 / not available over MCP", true)
+        }
+    default: return text("unknown tool: \(name)", true)
+    }
+    let r = mcpRunSelf(argv)
+    var s = r.out
+    if !r.err.isEmpty { s += (s.isEmpty ? "" : "\n") + r.err }
+    if r.code != 0 { s += "\nexit code \(r.code)" }
+    return text(s.isEmpty ? "ok" : s, r.code != 0)
+}
+
+func mcpServe() -> Never {
+    func send(_ obj: [String: Any]) {
+        guard var d = try? JSONSerialization.data(withJSONObject: obj, options: [.withoutEscapingSlashes]) else { return }
+        d.append(0x0A); FileHandle.standardOutput.write(d)
+    }
+    // MCP 服务器本身就是常驻进程：没有守护进程时它自己当守护进程用（缓存、常驻截图流都生效）
+    if connectDaemon(socketPath()).map({ close($0); return true }) != true {
+        daemonMode = true; envOverlay = ProcessInfo.processInfo.environment
+    }
+    func handleLine(_ line: String) {
+        guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard let msg = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else {
+            send(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "parse error"]]); return
+        }
+        let method = msg["method"] as? String ?? ""
+        guard let id = msg["id"] else { return }   // 通知（notifications/initialized 等）不回复
+        let params = msg["params"] as? [String: Any] ?? [:]
+        switch method {
+        case "initialize":
+            let want = params["protocolVersion"] as? String ?? ""
+            let pv = ["2024-11-05", "2025-03-26", "2025-06-18"].contains(want) ? want : "2025-06-18"
+            send(["jsonrpc": "2.0", "id": id, "result": [
+                "protocolVersion": pv, "capabilities": ["tools": ["listChanged": false]],
+                "serverInfo": ["name": "xyzlcu", "version": version],
+                "instructions": "macOS GUI control. Call check first. Confirm the frontmost app (apps) before click/type/key. Prefer find/click_element over raw coordinates. Ask the user before irreversible actions; stop at captchas."]])
+        case "ping": send(["jsonrpc": "2.0", "id": id, "result": [:]])
+        case "tools/list": send(["jsonrpc": "2.0", "id": id, "result": ["tools": mcpTools()]])
+        case "tools/call":
+            let name = params["name"] as? String ?? ""
+            send(["jsonrpc": "2.0", "id": id, "result": mcpCall(name, params["arguments"] as? [String: Any] ?? [:])])
+        default:
+            send(["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "method not found: \(method)"]])
+        }
+    }
+    // 后台线程读标准输入，主线程执行（主 runloop 要转，ScreenCaptureKit 回调和定时器才会到）
+    Thread {
+        while let line = readLine(strippingNewline: true) { DispatchQueue.main.sync { handleLine(line) } }
+        DispatchQueue.main.async { exit(0) }
+    }.start()
+    RunLoop.main.run()
+    exit(0)
+}
 
 // MARK: - 入口
 let top = Array(CommandLine.arguments.dropFirst())
@@ -1579,6 +1868,7 @@ if top.first == "serve" {
     }
     do { try serve() } catch let e as XErr { errOut("error: " + e.msg); exit(e.code) } catch { exit(1) }
 }
+if top.first == "mcp" { mcpServe() }
 let daemonEnv = ProcessInfo.processInfo.environment["XYZLCU_DAEMON"]
 // record / replay 运行时间长，总在当前进程里执行，不占用守护进程
 if daemonEnv != "0", !top.isEmpty, !["help", "-h", "--help", "record", "replay"].contains(top[0]) {

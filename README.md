@@ -4,11 +4,14 @@
 
 **XYZLCU（XYZ Local Computer Use）** 是一个零依赖的 macOS 图形界面控制命令行工具。只要能执行 shell 命令，不管是 AI 智能体（Claude Code、Codex、任何会跑命令的 Agent）还是你自己写的脚本，就能看屏幕、点鼠标、打字、按快捷键、读取界面结构并按下按钮。整个工具只有一个 Swift 源文件和一个二进制，不用 Python、Node、Homebrew，也不需要任何第三方库。
 
+> **通用，不绑定任何智能体。** XYZLCU 就是一个普通的命令行程序：任何能执行 shell 命令、能读 JSON 输出的智能体都能直接用（Grok Bot、Claude Code、Codex CLI、Cursor、Gemini CLI、Cline / Roo、Aider、OpenClaw、OpenCode、Trae……），不需要专门的插件或适配层；只支持 MCP 的客户端可以用内置的 `xyzlcu mcp`。不用智能体也行：shell 脚本、快捷指令、cron / launchd 一样能调。见[支持的智能体](#支持的智能体)。
+
 > 借鉴自 Amont Labs 的 [LCU（Local Computer Use）](https://github.com/amontlabs/lcu)，在此致谢（见[致谢](#致谢)）。XYZLCU 是**独立实现**：没有复制 LCU 的代码，也**不需要 ChatGPT / Codex** 桌面应用或其运行时。和 LCU 的速度、用法对比见[性能对比](#性能对比与-lcu)。
 
 ## 功能
 
 - 📸 **截屏**：截整块屏、单个窗口（`--window`）或一块区域（`--region`），可缩小；`--fast` 一键出小 JPEG；会输出点坐标与像素的换算关系
+- 🧠 **内存截图**（v0.4.2）：`--base64` / `--stdout` 直接在内存里出图，不写文件；守护进程按需保持截图流，重复截同一个窗口约 20–35 毫秒
 - 🖱 **鼠标**：单击、右键、双击、移动、拖拽、滚动
 - ⌨️ **键盘**：直接输入 Unicode 文字（中文、emoji 都行，不经过输入法），支持组合键（`cmd+shift+4`）
 - 🌳 **辅助功能树**：导出任意应用窗口的控件树（角色、标题、值、坐标）；`find` 按角色/标题直接返回坐标和中心点，`click-el` 一步找到并按下，`wait` 等控件出现或消失
@@ -18,6 +21,7 @@
 - 🔒 **锁屏保护**：屏幕锁定时拒绝键鼠操作，防止把字打进锁屏密码框
 - 📊 **实测数据**：和 LCU 的逐项速度对比见[性能对比](#性能对比与-lcu)，脚本可复现
 - ⚡ **常驻守护进程**：`xyzlcu serve &` 之后，命令自动转发给它，省掉进程启动和权限检查开销，大部分命令 7–20 毫秒
+- 🔌 **MCP 服务器**（v0.4.2）：`xyzlcu mcp` 走 stdio，给只支持 MCP 的客户端（如 Claude Desktop），截图直接作为图片返回
 - 🧾 **输出好解析**：结果是 JSON 或一行 `ok`，出错时返回明确的退出码
 
 ## 快速开始（3 步）
@@ -99,6 +103,9 @@ xyzlcu whoami
 | `screenshot … --fast` | 快速截图：JPEG、质量 0.6、缩放 0.5 | `xyzlcu screenshot --fast` |
 | `screenshot … --window "App" [--title T]` | 只截某个应用的窗口（默认它最前面的窗口） | `xyzlcu screenshot /tmp/w.png --window Safari` |
 | `screenshot … --region x,y,w,h` | 只截一块区域（全局点坐标） | `xyzlcu screenshot /tmp/r.png --region 100,100,400,300` |
+| `screenshot … --base64` | 不写文件，图片以 base64 放在 JSON 的 `base64` 字段（没给路径时默认 JPEG） | `xyzlcu screenshot --fast --base64` |
+| `screenshot … --stdout` | 不写文件，图片原始字节写到 stdout，元数据 JSON 写到 stderr | `xyzlcu screenshot --window Safari --stdout > w.jpg` |
+| `screenshot … --out 路径` / `--timing` | `--out` 同时写一份文件；`--timing` 输出各阶段耗时 `timingMs` | `xyzlcu screenshot --fast --base64 --timing` |
 | `displays` | 列出显示器及其坐标范围 | `xyzlcu displays` |
 | `click x y [--right] [--double]` | 点击 | `xyzlcu click 500 300 --double` |
 | `move x y` | 移动鼠标 | `xyzlcu move 800 600` |
@@ -129,6 +136,7 @@ xyzlcu whoami
 | `run [--continue-on-error] '命令; 命令; …'` | 一次执行多条命令（`;` 或换行分隔） | `xyzlcu run 'click-el TextEdit --title 保存; wait TextEdit --role AXSheet; key return'` |
 | `batch [--continue-on-error] [文件]` | 从文件或 stdin 逐行读命令执行 | `printf 'type a\nkey return\n' \| xyzlcu batch` |
 | `serve [--status\|--stop]` | 启动 / 查看 / 停止常驻守护进程，见[守护进程](#守护进程) | `xyzlcu serve &` |
+| `mcp` | 以 stdio MCP 服务器运行，见[MCP 服务器](#mcp-服务器) | `xyzlcu mcp` |
 
 补充：
 
@@ -235,6 +243,7 @@ xyzlcu serve --stop     # 停止
 - 套接字在 `~/.xyzlcu/sock`（目录权限 0700，套接字 0600），只接受**同一用户**的连接（`getpeereid` 校验），不监听网络端口。可以用 `XYZLCU_SOCKET` 改路径。
 - 守护进程里同样有锁屏保护和权限检查，相对路径按调用方的当前目录解析。
 - **权限（TCC）**：守护进程使用的是**启动它的那个 App** 的权限，所以要在智能体或终端自己的 shell 里运行 `xyzlcu serve &`，这样负责 App 和直接运行命令时一样。用 `xyzlcu serve --status` 看 `responsibleProcess`。
+- **截图流（v0.4.2）**：守护进程第一次截某个窗口 / 屏幕 / 区域时，会在后台为它开一个 ScreenCaptureKit 截图流，之后的截图直接取最新一帧（输出 `method: "screencapturekit-stream"`），不用每次重新截。最多同时 3 个流；某个流 20 秒没人用就自动关掉（`XYZLCU_STREAM_IDLE=秒` 可改）。刚点击 / 打字之后的截图会等到新的一帧（最多 0.12 秒），不会拿到操作前的旧画面。截图流开着时，菜单栏会显示系统的录屏指示，这是正常的；`XYZLCU_STREAM=0` 关闭截图流，每次单独截。`xyzlcu serve --status` 里 `liveStreams` 是当前开着的流数。
 - 想开机自动启动，可以自己写一个 LaunchAgent（`~/Library/LaunchAgents/*.plist`，`ProgramArguments` 为 `xyzlcu serve`）。注意这时负责进程是 launchd 启动的 xyzlcu 本身，要在系统设置里单独给 xyzlcu 二进制授权。XYZLCU 不会替你安装 LaunchAgent。
 
 ## 完整示例：用文本编辑写一段中文并保存
@@ -266,28 +275,211 @@ cat ~/Documents/xyzlcu-demo.txt
 xyzlcu key cmd+w
 ```
 
-## 配合 AI 智能体使用
+## 支持的智能体
 
-任何会执行 shell 命令的智能体都能用，比如 Claude Code、Codex CLI，或者你自己的 Agent。可以把下面这段放进系统提示词或 `AGENTS.md` / `CLAUDE.md`：
+XYZLCU 是**通用的**：它不依赖任何智能体框架，也不需要插件。一个智能体只要能 ① 执行 shell 命令、② 读命令的输出（JSON 或 `ok`）和退出码，就能用 XYZLCU 操作这台 Mac。只会说 MCP 的客户端用 `xyzlcu mcp`。
 
-```text
-你可以用 `xyzlcu` 操作这台 Mac 的图形界面。规则：
-0. 会话开始时运行一次 `xyzlcu serve &`，之后每条命令都更快（`xyzlcu check` 里 daemon 为 true）。
-1. 开始前运行 `xyzlcu check`。如果 screenLocked 为 true 或权限缺失，停下来告诉用户。
-2. 循环：观察 → 定位 → 操作 → 验证。
-   - 观察：优先用 `xyzlcu find "App" --role AXButton --title 保存` 或 `xyzlcu ax "App" --depth 6`；需要看画面时用 `xyzlcu screenshot --fast`，只看一个窗口用 `--window "App"`，只看一块用 `--region x,y,w,h`。
-   - 定位：find 直接给出 center；用截图时按 pixelsPerPoint 和 originX/originY 换算成点坐标。
-   - 操作：能 `xyzlcu click-el "App" --role R --title T` 就不用 click 坐标。
-   - 等待：用 `xyzlcu wait "App" --title T --timeout 5` 等界面变化，不要固定 sleep。
-   - 验证：操作后重新 find / ax 或截图，确认结果。
-3. 每次 `type` 或 `key` 之前先 `xyzlcu activate "目标App"`，再用 `xyzlcu apps` 确认它是前台（active: true）。键盘输入会发给当前前台应用。打字优先用 `xyzlcu type --app "App" --window "窗口标题" "文字"`：焦点不在那个窗口就拒绝；看输出的 path 和 verified 确认结果。
-4. 付款、删除、发送、提交这类不可撤销的操作，先征得用户同意。
-5. 不要用 --force 绕过锁屏保护。
-6. 已经确认过前台、要连续做几步时，可以合成一条 `xyzlcu run 'click-el App --title 搜索; type 你好; key return; wait App --title 结果'`，比分开调用快好几倍。
-7. 遇到验证码、「确认你是真人」或其他反机器人检查时，停下来交给用户处理，不要尝试绕过。
+| 智能体 / 工具 | 怎么接入 | 状态 |
+|---|---|---|
+| Grok Bot | shell 工具直接运行 `xyzlcu …` | ✅ 实测 |
+| Codex CLI | shell 工具；或 MCP（`~/.codex/config.toml`） | ✅ 实测（0.163.0，shell 方式），需要完全访问，见下方说明 |
+| OpenCode | bash 工具 | ✅ 实测（2.0.32） |
+| 自己写的 Python / Node 程序 | `subprocess` / `child_process`，见下方示例 | ✅ 实测 |
+| 任意 MCP 客户端 | `xyzlcu mcp`（stdio） | ✅ 实测（用脚本做了完整握手：initialize、tools/list、tools/call、截图图片返回） |
+| Claude Code | Bash 工具；或 `claude mcp add` | 应该可用（shell 工具），未实测 |
+| Claude Desktop | MCP（`claude_desktop_config.json`） | 应该可用（MCP），未实测 |
+| Cursor | Agent 的终端；或 `.cursor/mcp.json` | 应该可用（shell 工具），未实测 |
+| Gemini CLI | `run_shell_command`；或 `~/.gemini/settings.json` 的 `mcpServers` | 应该可用（shell 工具），未实测（本机登录不可用，没跑完） |
+| Cline / Roo Code | `execute_command`；或扩展的 MCP 设置 | 应该可用（shell 工具），未实测 |
+| Aider | `/run xyzlcu …` | 应该可用（shell 工具），未实测 |
+| OpenClaw | exec / shell 工具 | 应该可用（shell 工具），未实测 |
+| Trae | 终端；或 MCP 设置 | 应该可用（shell 工具），未实测 |
+| 不用智能体 | shell 脚本、快捷指令「运行 Shell 脚本」、cron / launchd | ✅ 实测（shell 脚本） |
+
+「实测」是指在本机真的让它调用了 `xyzlcu`（至少 `check`、`cursor`、`apps` 和截图）并核对了结果；「应该可用」是指它有执行 shell 命令的工具，XYZLCU 对它和对其他工具没有区别，但没在本机跑过。
+
+**注意**
+
+- **权限跟着负责 App 走**：系统的「辅助功能」「屏幕与系统录音」要授给启动 `xyzlcu` 的那个 App（终端、Cursor、Claude.app……）。用 `xyzlcu whoami` 查看。先在智能体自己的 shell 里运行 `xyzlcu serve &`，之后的命令和 `xyzlcu mcp` 都会转发给这个守护进程、用它的权限。
+- **Codex CLI 的沙箱**：在默认的沙箱模式里，命令连不上窗口服务器（比如 `xyzlcu cursor` 返回 `0,0`、截图失败）。要用完全访问模式（`--sandbox danger-full-access`），或者在它询问时允许这条命令在沙箱外运行。别的有沙箱的智能体同理。
+- 智能体在沙箱或远程容器里跑、碰不到本机图形会话时，XYZLCU 无法工作。
+
+### 放进 AGENTS.md / CLAUDE.md / .cursor/rules 的一段
+
+直接复制到项目的 `AGENTS.md`（Codex、OpenCode、Gemini CLI 等）、`CLAUDE.md`（Claude Code）、`.cursor/rules/xyzlcu.mdc`（Cursor）、`.clinerules`（Cline）或系统提示词里：
+
+```markdown
+## 操作 Mac 图形界面：xyzlcu
+
+你可以用命令行工具 `xyzlcu` 看屏幕、点击、打字、按键、读取界面控件树。
+
+开始
+- 会话开始时运行一次 `xyzlcu serve &`（之后的命令都更快），再运行 `xyzlcu check`。
+- `screenLocked` 为 true 或权限缺失：停下来告诉用户，不要继续。
+
+常用命令（输出 JSON 或 `ok`）
+- 看：`xyzlcu find "App" --role AXButton --title 保存`（返回 center）、`xyzlcu ax "App" --depth 6`
+- 截图：`xyzlcu screenshot --fast --base64`（整屏，图片在 JSON 的 base64 字段，不写文件）、
+  `xyzlcu screenshot --window "App" --base64`、`xyzlcu screenshot /tmp/s.jpg --region x,y,w,h`
+- 按控件：`xyzlcu click-el "App" --role AXButton --title 保存`
+- 点坐标：`xyzlcu click x y`（全局点坐标；截图像素要按 pixelsPerPoint 和 originX/originY 换算）
+- 打字：`xyzlcu type --app "App" --window "窗口标题" "文字"`（看输出的 path 和 verified）
+- 按键：`xyzlcu key --app "App" cmd+s`
+- 应用：`xyzlcu apps`、`xyzlcu activate "App"`
+- 等待：`xyzlcu wait "App" --title T --timeout 5`（不要用固定 sleep）
+- 连续几步：`xyzlcu run 'click-el App --title 搜索; type 你好; key return'`
+
+退出码
+- 0 成功；1 参数错误或找不到应用/元素；2 缺少权限；3 屏幕锁定，操作被拒绝；
+  4 找不到控件、wait 超时、输入没生效或 --window 不符；5 要求守护进程但连不上。
+
+安全规则
+- 每次 `type` / `key` 之前确认目标应用和窗口在前台（`xyzlcu apps` 里 active: true），或者用 `--app` / `--window` 限定。
+- 循环：观察 → 定位 → 操作 → 验证。操作后重新 find / 截图确认结果。
+- 付款、删除、发送、提交等不可撤销的操作先征得用户同意。
+- 不要用 `--force` 绕过锁屏保护。
+- 遇到验证码、「确认你是真人」或其他反机器人检查时停下来交给用户，不要尝试绕过。
 ```
 
+### 在自己的程序里调用
+
+Python：
+
+```python
+import base64, json, subprocess
+
+def xyz(*args):
+    r = subprocess.run(["xyzlcu", *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"xyzlcu {args[0]} 失败（退出码 {r.returncode}）：{r.stderr.strip()}")
+    out = r.stdout.strip()
+    return json.loads(out) if out.startswith(("{", "[")) else out
+
+print(xyz("cursor"))                                   # {"x": …, "y": …}
+shot = xyz("screenshot", "--fast", "--base64")         # 不写文件
+jpeg = base64.b64decode(shot["base64"])
+```
+
+Node：
+
+```js
+import { execFileSync } from "node:child_process";
+const xyz = (...args) => JSON.parse(execFileSync("xyzlcu", args, { encoding: "utf8" }));
+console.log(xyz("cursor"));
+const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Buffer，原始 JPEG 字节；元数据 JSON 在 stderr
+```
+
+### MCP 服务器
+
+`xyzlcu mcp` 以 stdio 方式运行一个 MCP 服务器（JSON-RPC 2.0，一行一条消息），给只支持 MCP、不能直接跑命令的客户端。提供这些工具：
+
+- 只读：`check`、`screenshot`（直接返回图片，默认 JPEG）、`apps`、`windows`、`cursor`、`ax`、`find`
+- 操作：`click_element`、`click`、`type_text`、`key`、`activate`
+- 通用：`xyzlcu`（`args` 数组，执行任意子命令；不允许 `mcp`、`serve`、`record`、`replay`、`batch` 和 `--stdout`）
+
+有守护进程在跑时，每个工具调用都转发给它；没有时 `xyzlcu mcp` 自己就是一个常驻进程（同样会保持截图流），不会每次调用都启动新进程。
+
+下面把 `/Users/你的用户名/.local/bin/xyzlcu` 换成 `which xyzlcu` 的结果（很多客户端不展开 `~`）。
+
+Claude Desktop（`~/Library/Application Support/Claude/claude_desktop_config.json`）、Cursor（项目里的 `.cursor/mcp.json` 或 `~/.cursor/mcp.json`）、Gemini CLI（`~/.gemini/settings.json`）用的都是这个格式：
+
+```json
+{
+  "mcpServers": {
+    "xyzlcu": {
+      "command": "/Users/你的用户名/.local/bin/xyzlcu",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Claude Code：
+
+```bash
+claude mcp add xyzlcu -- "$(which xyzlcu)" mcp
+```
+
+Codex CLI（`~/.codex/config.toml`）：
+
+```toml
+[mcp_servers.xyzlcu]
+command = "/Users/你的用户名/.local/bin/xyzlcu"
+args = ["mcp"]
+```
+
+自己测一下握手：
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | xyzlcu mcp
+```
+
+- MCP 服务器由客户端 App 启动，所以系统权限要授给**那个 App**（比如 Claude.app、Cursor）；或者先在已授权的终端里 `xyzlcu serve &`，MCP 调用就会转发给它、用它的权限。
+- 客户端问是否允许调用某个工具时，按你对它的信任来选；操作类工具（`click`、`type_text`、`key` 等）会真的操作你的电脑。
+
 ## 性能对比（与 LCU）
+
+**环境**：Apple Silicon Mac（macOS 26+）。XYZLCU 0.4.2 对比 [LCU](https://github.com/amontlabs/lcu) 0.13.4（ChatGPT 自带的 CUA 运行时 0.0.35）。每项跑 15 次，表里是**中位数 / p90**，单位毫秒；最后一列是同一台机器上 0.4.1 守护进程的中位数。
+
+| 操作 | XYZLCU 进程内 | XYZLCU 守护进程 | LCU（MCP `js` 调用） | 0.4.1 守护进程 |
+|---|---:|---:|---:|---:|
+| 版本号（`version`，相当于空调用） | 6 / 7 | 7 / 12 | — | 10 |
+| 列出应用（`apps` / `cua.listApps`） | 15 / 19 | **13 / 13** | 17 / 18 | 17 |
+| 列出窗口（`windows`） | 44 / 52 | **9 / 18** | —（Mac 上没有） | 7 |
+| 鼠标位置（`cursor`） | 26 / 32 | **8 / 11** | —（Mac 上没有） | 6 |
+| 移动鼠标（`move`） | 55 / 73 | **9 / 19** | —（Mac 上没有） | 7 |
+| 整屏截图（全尺寸 PNG，写文件） | 352 / 361 | 180 / 200 | —（Mac 上没有） | 233 |
+| 整屏截图（`--fast`，半尺寸 JPEG，写文件） | 184 / 200 | **13 / 75** | —（Mac 上没有） | 60 |
+| 整屏截图（`--fast --base64`，只在内存里） | 192 / 208 | **21 / 23** | —（Mac 上没有） | — |
+| 窗口截图（文本编辑窗口，PNG 写文件） | 199 / 207 | **35 / 72** | 51 / 53 | 68 |
+| 窗口截图（`--window … --base64`，只在内存里） | 185 / 199 | **23 / 27** | 51 / 53 | — |
+| 控件树（`ax --depth 3` / `getAXState`） | 66 / 69 | **26 / 29** | 55 / 76 | 28 |
+| 点击（`click`） | 56 / 74 | **12 / 19** | 140 / 166 | 12 |
+| 输入英文 `abc` | 82 / 93 | **13 / 17** | 43 / 48 | 12 |
+| 输入中文 `你好abc` | 82 / 116 | **13 / 18** | 9057 / 10541 | 14 |
+| 按键（`cmd+right` / `super+Right`） | 78 / 98 | **10 / 13** | 14 / 19 | 8 |
+
+**怎么测的**
+
+- **XYZLCU**：每次都是一次完整的命令行调用（启动进程 → 执行 → 输出 JSON），也就是智能体从 shell 调用时真正付出的时间。「进程内」= `XYZLCU_DAEMON=0`；「守护进程」= 先运行 `xyzlcu serve`。先测进程内、再启动守护进程测（原因见[常见问题](#常见问题)里截图那一条）。
+- **LCU**：在临时目录里装了一份（不改系统、不改任何智能体配置），用 LCU 自带的 `adapters/client.mjs` 以 stdio 方式连上 `lcu` MCP 服务器，每个操作是一次 `js` 工具调用，比如 `await app.click([x, y])`、`await app.typeText("abc")`。计的是**已连上之后**一次调用的往返时间；连接（约 270 ms）、首次调用（约 520 ms）、`getApp`（约 70 ms）都不算在内，智能体自己生成工具调用的时间也不算。
+- **GUI 操作**都在一份临时的文本编辑文稿里做：每次输入前确认它在前台、而且是最前面的窗口；结束后读回文稿内容核对（两边输入的文字都正确），再关闭、删除这份文稿。LCU 第一次操作文本编辑时会请求授权，测试只回答「仅本次会话」。
+
+**结果怎么看（实话实说）**
+
+- **截窗口现在 XYZLCU 更快**（内存里 23 ms vs LCU 51 ms；0.4.1 时是 68 vs 47）。0.4.2 起守护进程为截过的窗口保持一个截图流，重复截图直接取最新一帧；`--base64` / `--stdout` 不写文件。第一次截某个窗口仍要 50 ms 左右（建流），之后才快，所以 p90 偶尔偏高。
+- **全尺寸 PNG 截图慢在编码**：截图本身约 50 ms，PNG 编码一张 4112×2658 的图要 150 ms 左右。给模型看用 `--fast` 或 `--format jpg --scale 0.5` 就好。
+- `--base64` 比写文件的 `--fast` 稍慢（21 vs 13 ms）：base64 要多传 1/3 的数据并经过 JSON；好处是不留文件、不用再读一次。
+- **不开守护进程时，XYZLCU 的打字和按键比 LCU 慢**（82 / 78 ms vs 43 / 14 ms），多出来的主要是每次启动进程和检查权限。常驻守护进程后，XYZLCU 这几项都在 10–13 ms。
+- **LCU 的点击慢一些（140 ms），但它是后台投递**：不移动真实鼠标、不把应用切到前台，用户可以同时用电脑。XYZLCU 的 `click` 会真的移动鼠标去点。想后台操作，XYZLCU 有 `click-el`（AXPress）、`type --app`、`menu`、`insert` / `settext` 这些不抢前台的路。
+- **LCU 输入中文很慢**：`你好abc` 中位数约 9 秒，纯英文只要 43 ms。XYZLCU 直接发送 Unicode 或写辅助功能，中英文一样快。
+- **「—」不是没测，是 LCU 在 Mac 上没有这个能力**（没有鼠标位置 / 移动、整屏截图和窗口列表，它按应用来操作）。
+- 这张表只比单个操作的延迟，不代表完成整个任务的能力。LCU 背后是 ChatGPT 的 CUA 运行时，在和模型配合、后台操作方面有它的长处。
+
+**用起来的区别**
+
+| | XYZLCU | LCU |
+|---|---|---|
+| 需要什么 | 一个二进制，macOS 13+，Apple Silicon 或 Intel | 已安装 ChatGPT 桌面应用（借用它的 CUA 运行时）、Apple Silicon；自带 Node |
+| 怎么接入 | 任何能跑 shell 命令的工具；也可以 `xyzlcu mcp` | MCP 服务器（`lcu setup --agent …` 写入智能体配置） |
+| 授权 | 系统「辅助功能」「屏幕与系统录音」授给负责 App | 系统权限之外，每个应用第一次被操作时还要批准（仅本次会话 / 始终） |
+| 操作方式 | 全局坐标 + 真实键鼠事件，另有辅助功能、直接投递、菜单等不经过键盘事件的路 | 按应用操作，坐标是窗口截图里的像素，后台投递 |
+| 输出 | JSON；截图写成文件，或 `--base64` / `--stdout` 只在内存里；MCP 下直接返回图片 | 工具结果直接带图片 |
+
+**自己跑一遍**
+
+```bash
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15            # 只测 XYZLCU（进程内 + 守护进程）
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui      # 再加点击、输入、按键（会开一个临时文本编辑文稿）
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui \
+    --lcu /path/to/lcu --lcu-allow-session --json bench.json       # 同时测 LCU（需要已装好 LCU 和 ChatGPT 桌面应用）
+```
+
+`--mode inproc|daemon` 只测一种模式。不加 `--lcu-allow-session` 时，脚本会拒绝 LCU 的授权请求，需要授权的那些操作就没有数字；脚本永远不会选「始终允许」。想要干净的进程内截图数字，先 `xyzlcu serve --stop`。
+
+<details>
+<summary>v0.4.1 的对比结果</summary>
 
 **环境**：Apple Silicon Mac（macOS 26+）。XYZLCU 0.4.1 对比 [LCU](https://github.com/amontlabs/lcu) 0.13.4（ChatGPT 自带的 CUA 运行时 0.0.35）。每项跑 15 次，表里是**中位数 / p90**，单位毫秒。
 
@@ -307,41 +499,9 @@ xyzlcu key cmd+w
 | 输入中文 `你好abc` | 87 / 115 | **14 / 16** | 9060 / 10560 |
 | 按键（`cmd+right` / `super+Right`） | 73 / 96 | **8 / 14** | 14 / 24 |
 
-**怎么测的**
+0.4.1 的截图每次都要重新截、编码 PNG 并写文件，所以窗口截图比 LCU 慢（68 vs 47 ms）。
 
-- **XYZLCU**：每次都是一次完整的命令行调用（启动进程 → 执行 → 输出 JSON），也就是智能体从 shell 调用时真正付出的时间。「进程内」= `XYZLCU_DAEMON=0`；「守护进程」= 先运行 `xyzlcu serve`。先测进程内、再启动守护进程测（原因见[常见问题](#常见问题)里截图那一条）。
-- **LCU**：在临时目录里装了一份（不改系统、不改任何智能体配置），用 LCU 自带的 `adapters/client.mjs` 以 stdio 方式连上 `lcu` MCP 服务器，每个操作是一次 `js` 工具调用，比如 `await app.click([x, y])`、`await app.typeText("abc")`。计的是**已连上之后**一次调用的往返时间；连接（约 260 ms）、首次调用（约 260 ms）、`getApp`（约 100 ms）都不算在内，智能体自己生成工具调用的时间也不算。
-- **GUI 操作**都在一份临时的文本编辑文稿里做：每次输入前确认它在前台、而且是最前面的窗口；结束后读回文稿内容核对（两边输入的文字都正确），再关闭、删除这份文稿。LCU 第一次操作文本编辑时会请求授权，测试只回答「仅本次会话」。
-
-**结果怎么看（实话实说）**
-
-- **LCU 截窗口更快**（47 vs 68 ms）：它把 JPEG 留在内存里直接交给模型；XYZLCU 要编码 PNG 并写成文件。
-- **不开守护进程时，XYZLCU 的打字和按键比 LCU 慢**（87 / 73 ms vs 41 / 14 ms），多出来的主要是每次启动进程和检查权限。常驻守护进程后，XYZLCU 这几项都在 8–14 ms。
-- **LCU 的点击慢一些（135 ms），但它是后台投递**：不移动真实鼠标、不把应用切到前台，用户可以同时用电脑。XYZLCU 的 `click` 会真的移动鼠标去点。想后台操作，XYZLCU 有 `click-el`（AXPress）、`type --app`、`menu`、`insert` / `settext` 这些不抢前台的路。
-- **LCU 输入中文很慢**：`你好abc` 中位数约 9 秒，纯英文只要 41 ms。XYZLCU 直接发送 Unicode 或写辅助功能，中英文一样快。
-- **「—」不是没测，是 LCU 在 Mac 上没有这个能力**（没有鼠标位置 / 移动、整屏截图和窗口列表，它按应用来操作）。
-- 这张表只比单个操作的延迟，不代表完成整个任务的能力。LCU 背后是 ChatGPT 的 CUA 运行时，在和模型配合、后台操作方面有它的长处。
-
-**用起来的区别**
-
-| | XYZLCU | LCU |
-|---|---|---|
-| 需要什么 | 一个二进制，macOS 13+，Apple Silicon 或 Intel | 已安装 ChatGPT 桌面应用（借用它的 CUA 运行时）、Apple Silicon；自带 Node |
-| 怎么接入 | 任何能跑 shell 命令的工具 | MCP 服务器（`lcu setup --agent …` 写入智能体配置） |
-| 授权 | 系统「辅助功能」「屏幕与系统录音」授给负责 App | 系统权限之外，每个应用第一次被操作时还要批准（仅本次会话 / 始终） |
-| 操作方式 | 全局坐标 + 真实键鼠事件，另有辅助功能、直接投递、菜单等不经过键盘事件的路 | 按应用操作，坐标是窗口截图里的像素，后台投递 |
-| 输出 | JSON；截图写成文件 | 工具结果直接带图片 |
-
-**自己跑一遍**
-
-```bash
-python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15            # 只测 XYZLCU（进程内 + 守护进程）
-python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui      # 再加点击、输入、按键（会开一个临时文本编辑文稿）
-python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui \
-    --lcu /path/to/lcu --lcu-allow-session --json bench.json       # 同时测 LCU（需要已装好 LCU 和 ChatGPT 桌面应用）
-```
-
-`--mode inproc|daemon` 只测一种模式。不加 `--lcu-allow-session` 时，脚本会拒绝 LCU 的授权请求，需要授权的那些操作就没有数字；脚本永远不会选「始终允许」。想要干净的进程内截图数字，先 `xyzlcu serve --stop`。
+</details>
 
 <details>
 <summary>历史版本对比（v0.2.0 → v0.3.0）</summary>
@@ -407,7 +567,7 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 - `check` 里 `daemon` 一直是 false：守护进程没启动，或者是旧版本（版本不一致时会自动退回进程内执行）。运行 `xyzlcu serve --status` 看看。
 - 守护进程里权限是 false：它是从另一个 App 启动的。`xyzlcu serve --stop` 后，在已授权的终端 / 智能体 shell 里重新 `xyzlcu serve &`。
 - 更新 xyzlcu 后记得 `xyzlcu serve --stop` 再重新启动（版本号不同时会自动退回进程内执行）。
-- 进程内截图（`XYZLCU_DAEMON=0`）输出里有 `warning`、要 2 秒左右：同一个 xyzlcu 的守护进程正在运行时，macOS 不给进程内的 ScreenCaptureKit 截图回调，XYZLCU 等 1.5 秒后改用系统 `screencapture`。去掉 `XYZLCU_DAEMON=0` 走守护进程就好（60–230 毫秒）。
+- 进程内截图（`XYZLCU_DAEMON=0`）输出里有 `warning`、要 2 秒左右：同一个 xyzlcu 的守护进程正在运行时，macOS 不给进程内的 ScreenCaptureKit 截图回调，XYZLCU 等 1.5 秒后改用系统 `screencapture`。去掉 `XYZLCU_DAEMON=0` 走守护进程就好（13–180 毫秒）。
 - 自己覆盖安装二进制时，先写到临时文件再 `mv` 过去（`build.sh --install` 就是这么做的）；直接 `cp` 覆盖正在使用的已签名二进制，新进程可能被系统直接杀掉（退出码 137）。
 
 **中文输入法会干扰吗？**
@@ -453,6 +613,7 @@ rm -rf ~/.xyzlcu
 
 ## 更新记录
 
+- **0.4.2**：截图更快、可以只在内存里出图：`--base64` / `--stdout` / `--out` / `--timing`；守护进程按需保持 ScreenCaptureKit 截图流（窗口截图 68 → 23–35 毫秒，比 LCU 的 51 毫秒快），缓存屏幕录制权限检查和窗口内容列表，输入读回的轮询间隔缩短到 5 毫秒。新增 `xyzlcu mcp`（stdio MCP 服务器，13 个工具，截图直接返回图片）。README 新增[支持的智能体](#支持的智能体)。修复：客户端只连上不发请求就断开（比如探测守护进程在不在）时，守护进程会因 SIGPIPE 退出。
 - **0.4.1**：进程内截图等 ScreenCaptureKit 回调时会处理主线程事件；回调超时只等一次（1.5 秒）就改用 `screencapture` 并给出 `warning`，不再卡 10 秒以上。守护进程里的 `apps` 不再固定等 20 毫秒（42 → 17 ms）。新增和 LCU 的对比测试（`scripts/bench.py --lcu`、`scripts/bench_lcu.mjs`）。
 - **0.4.0**：多条输入路径（辅助功能写值、直接投递、菜单、粘贴）、事件流健康检查、`insert` / `settext` / `value` / `menu` / `taps`、只监听的录制与回放。
 - 更早的版本见 [Releases](https://github.com/brandy2015/XYZLCU/releases)。
