@@ -8,12 +8,13 @@
 
 ## 功能
 
-- 📸 **截屏**：截主屏或指定显示器，可缩小；会输出点坐标与像素的换算关系
+- 📸 **截屏**：截整块屏、单个窗口（`--window`）或一块区域（`--region`），可缩小；`--fast` 一键出小 JPEG；会输出点坐标与像素的换算关系
 - 🖱 **鼠标**：单击、右键、双击、移动、拖拽、滚动
 - ⌨️ **键盘**：直接输入 Unicode 文字（中文、emoji 都行，不经过输入法），支持组合键（`cmd+shift+4`）
-- 🌳 **辅助功能树**：导出任意应用窗口的控件树（角色、标题、值、坐标），不截图也能找到按钮；可以按标题直接 `press`
+- 🌳 **辅助功能树**：导出任意应用窗口的控件树（角色、标题、值、坐标）；`find` 按角色/标题直接返回坐标和中心点，`click-el` 一步找到并按下，`wait` 等控件出现或消失
 - 🪟 **应用与窗口**：列出、打开、激活、隐藏应用；列出窗口；移动和调整窗口大小；列出显示器
 - 🔒 **锁屏保护**：屏幕锁定时拒绝键鼠操作，防止把字打进锁屏密码框
+- ⚡ **常驻守护进程**：`xyzlcu serve &` 之后，命令自动转发给它，省掉进程启动和权限检查开销，大部分命令 7–20 毫秒
 - 🧾 **输出好解析**：结果是 JSON 或一行 `ok`，出错时返回明确的退出码
 
 ## 快速开始（3 步）
@@ -92,14 +93,17 @@ xyzlcu whoami
 | `whoami` | 进程链与负责 App | `xyzlcu whoami` |
 | `version` | 版本号 | `xyzlcu version` |
 | `screenshot [path] [--scale S] [--display N] [--format png\|jpg] [--quality Q]` | 截屏（默认 PNG，JPEG 更快更小） | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
+| `screenshot … --fast` | 快速截图：JPEG、质量 0.6、缩放 0.5 | `xyzlcu screenshot --fast` |
+| `screenshot … --window "App" [--title T]` | 只截某个应用的窗口（默认它最前面的窗口） | `xyzlcu screenshot /tmp/w.png --window Safari` |
+| `screenshot … --region x,y,w,h` | 只截一块区域（全局点坐标） | `xyzlcu screenshot /tmp/r.png --region 100,100,400,300` |
 | `displays` | 列出显示器及其坐标范围 | `xyzlcu displays` |
 | `click x y [--right] [--double]` | 点击 | `xyzlcu click 500 300 --double` |
 | `move x y` | 移动鼠标 | `xyzlcu move 800 600` |
 | `drag x1 y1 x2 y2` | 按住左键拖动 | `xyzlcu drag 100 100 400 400` |
 | `scroll dx dy` | 滚动，单位是行，正 dy 向上 | `xyzlcu scroll 0 -5` |
 | `cursor` | 当前鼠标位置 | `xyzlcu cursor` |
-| `type "文字"` | 输入 Unicode 文本 | `xyzlcu type "你好 Hello 😀"` |
-| `key 组合…` | 按键 / 组合键，可以一次多个 | `xyzlcu key cmd+s` · `xyzlcu key cmd+c cmd+v` |
+| `type "文字" [--app "App"]` | 输入 Unicode 文本 | `xyzlcu type "你好 Hello 😀"` |
+| `key 组合… [--app "App"]` | 按键 / 组合键，可以一次多个 | `xyzlcu key cmd+s` · `xyzlcu key cmd+c cmd+v` |
 | `apps` | 正在运行的图形界面应用 | `xyzlcu apps` |
 | `open "App"` | 打开应用 | `xyzlcu open "TextEdit"` |
 | `activate "App"` | 切换到前台 | `xyzlcu activate Finder` |
@@ -107,21 +111,46 @@ xyzlcu whoami
 | `windows [--all]` | 屏幕上的窗口（所属应用、标题、位置） | `xyzlcu windows` |
 | `movewin "App" x y [--w W --h H] [--title T]` | 移动 / 缩放窗口并置前 | `xyzlcu movewin "Safari" 200 100 --w 1200 --h 800` |
 | `ax ["App"] [--depth N] [--menu]` | 导出界面控件树 | `xyzlcu ax TextEdit --depth 6` |
-| `press "App" "标题"` | 按标题找到控件并按下 | `xyzlcu press TextEdit "取消"` |
-| `wait 毫秒` | 等待 | `xyzlcu wait 500` |
+| `find "App" [--role R] [--title T] [--contains] [--index N\|--all] [--window T] [--menu]` | 找控件，返回 role、title、frame、center；找到就停 | `xyzlcu find TextEdit --role AXButton --title 保存` |
+| `click-el "App" --role R --title T [--click] [--right] [--double]` | 找到控件并按下（AXPress，不行就点中心） | `xyzlcu click-el TextEdit --role AXButton --title 保存` |
+| `press "App" "标题"` | 按标题找到控件并按下（旧写法；新脚本建议用 `click-el`） | `xyzlcu press TextEdit "取消"` |
+| `wait "App" --title T [--role R] [--timeout 秒] [--gone]` | 等控件出现（或 `--gone` 消失），默认 5 秒超时 | `xyzlcu wait TextEdit --role AXSheet --timeout 3` |
+| `wait 毫秒` / `sleep 毫秒` | 等待固定时间 | `xyzlcu sleep 300` |
 | `taps` | 列出系统事件监听（排查输入卡顿/丢失） | `xyzlcu taps` |
-| `run '命令; 命令; …'` | 一次启动执行多条命令（`;` 或换行分隔） | `xyzlcu run 'click 500 300; type 你好; key return'` |
-| `batch [文件]` | 从文件或 stdin 逐行读命令执行 | `printf 'type a\nkey return\n' \| xyzlcu batch` |
+| `run [--continue-on-error] '命令; 命令; …'` | 一次执行多条命令（`;` 或换行分隔） | `xyzlcu run 'click-el TextEdit --title 保存; wait TextEdit --role AXSheet; key return'` |
+| `batch [--continue-on-error] [文件]` | 从文件或 stdin 逐行读命令执行 | `printf 'type a\nkey return\n' \| xyzlcu batch` |
+| `serve [--status\|--stop]` | 启动 / 查看 / 停止常驻守护进程，见[守护进程](#守护进程) | `xyzlcu serve &` |
 
 补充：
 
 - **应用名**可以写本地化名称（「访达」）、英文名（`Finder`）或 bundle ID（`com.apple.finder`）。
 - **按键名**：`a–z`、`0–9`、常用符号、`return`/`enter`、`tab`、`space`、`delete`/`backspace`、`forwarddelete`、`esc`、`up`/`down`/`left`/`right`、`home`/`end`/`pageup`/`pagedown`、`f1–f12`。修饰键：`cmd`、`shift`、`opt`/`alt`、`ctrl`、`fn`。
 - **`ax` 输出格式**：`角色(子角色) title="…" desc="…" value="…" id="…" [x,y 宽x高]`。中括号里的就是点坐标，中心点 = `(x + 宽/2, y + 高/2)`。
-- **`press`** 优先执行 AXPress，按不了就点控件中心。
-- **`run` / `batch`**：引号规则和 shell 一样（`"…"`、`'…'`、`\` 转义），`#` 开头的行是注释。遇到第一个出错的命令就停止，退出码同单条命令。
+- **`find` / `click-el` / `wait`**：`--title` 也可以写成第二个参数（`xyzlcu find TextEdit 保存`）。标题按完全匹配（不区分大小写）比对 title、description、value 和 identifier，加 `--contains` 改为包含匹配。先搜当前焦点窗口，再搜其他窗口；`--menu` 才搜菜单栏。找到第 `--index` 个（默认第 1 个）就立刻停止，不会遍历整棵树。找不到返回退出码 4。
+- **`click-el` / `press`** 优先执行 AXPress，按不了就点控件中心；加 `--click`（或 `--right`、`--double`）强制用鼠标点中心。
+- **`wait "App" …`** 先 20 毫秒检查一次，间隔逐步加到 250 毫秒，超时返回退出码 4。
+- **`type` / `key --app "App"`**：把键盘事件直接投递给这个应用的进程（`CGEventPostToPid`），而不是发给系统输入流。前台被别的窗口抢走时也不会打错地方，但仍然要先确认这个应用的焦点窗口是你要的。
+- **`run` / `batch`**：引号规则和 shell 一样（`"…"`、`'…'`、`\` 转义），`#` 开头的行是注释。默认遇到第一个出错的命令就停止，退出码同那条命令，错误信息会写明是第几步；加 `--continue-on-error` 则继续执行后面的步骤，最后返回最后一个出错步骤的退出码（全部成功为 0）。里面可以混用 `find`、`click-el`、`wait`、`sleep`。
 - **`--delay N`**：鼠标/键盘事件之间的间隔（毫秒，默认 2）。个别应用反应慢、丢字时调大，例如 `xyzlcu --delay 20 type …` 或 `XYZLCU_DELAY=20`。
-- **截图**：macOS 14+ 走 ScreenCaptureKit（进程内截图，直接按 `--scale` 输出目标尺寸），否则或加 `--cli` 时退回系统 `screencapture`。输出里的 `method` 字段会告诉你走的哪条路。
+- **截图**：macOS 14+ 走 ScreenCaptureKit（进程内截图，直接按 `--scale` 输出目标尺寸；`--window` 只截那个窗口，被挡住也能截到；`--region` 只截那块区域），否则或加 `--cli` 时退回系统 `screencapture`。输出里的 `method` 字段会告诉你走的哪条路，`originX/originY` 是图片左上角的全局点坐标。
+
+## 守护进程
+
+每次执行 `xyzlcu` 都要启动进程、检查权限、连接窗口服务器，大约 15–50 毫秒。常驻守护进程把这些开销只付一次：
+
+```bash
+xyzlcu serve &          # 在智能体/终端自己的 shell 里启动
+xyzlcu serve --status   # 查看：pid、版本、运行时长、权限、负责 App
+xyzlcu check            # 输出里 "daemon": true 表示已经在走守护进程
+xyzlcu serve --stop     # 停止
+```
+
+- 启动后，所有命令（包括 `run`、`batch`）**自动转发**给守护进程，用法和输出完全一样。连不上或版本不一致时自动退回进程内执行。
+- `XYZLCU_DAEMON=0`：不用守护进程；`XYZLCU_DAEMON=1`：必须用守护进程，连不上就返回退出码 5。
+- 套接字在 `~/.xyzlcu/sock`（目录权限 0700，套接字 0600），只接受**同一用户**的连接（`getpeereid` 校验），不监听网络端口。可以用 `XYZLCU_SOCKET` 改路径。
+- 守护进程里同样有锁屏保护和权限检查，相对路径按调用方的当前目录解析。
+- **权限（TCC）**：守护进程使用的是**启动它的那个 App** 的权限，所以要在智能体或终端自己的 shell 里运行 `xyzlcu serve &`，这样负责 App 和直接运行命令时一样。用 `xyzlcu serve --status` 看 `responsibleProcess`。
+- 想开机自动启动，可以自己写一个 LaunchAgent（`~/Library/LaunchAgents/*.plist`，`ProgramArguments` 为 `xyzlcu serve`）。注意这时负责进程是 launchd 启动的 xyzlcu 本身，要在系统设置里单独给 xyzlcu 二进制授权。XYZLCU 不会替你安装 LaunchAgent。
 
 ## 完整示例：用文本编辑写一段中文并保存
 
@@ -132,12 +161,12 @@ open -a TextEdit ~/Documents/xyzlcu-demo.txt
 xyzlcu wait 1500
 xyzlcu activate TextEdit
 
-# 1. 找到文本区域
-xyzlcu ax TextEdit --depth 3 | grep AXTextArea
-#   AXTextArea id="First Text View" [234,135 656x384]
+# 1. 确认前台和焦点窗口就是这个文件（不是别的文稿）
+xyzlcu wait TextEdit --role AXWindow --title xyzlcu-demo.txt --timeout 5
+xyzlcu ax TextEdit --depth 0          # 第一行窗口的 title 应该是 xyzlcu-demo.txt
 
-# 2. 点进去（中心点 = 234+656/2, 135+384/2）
-xyzlcu click 562 327
+# 2. 找到文本区域并点进去（一步完成）
+xyzlcu click-el TextEdit --role AXTextArea --window xyzlcu-demo.txt --click
 
 # 3. 输入中文、换行、再来一行
 xyzlcu type "你好，这是 XYZLCU 的电脑操控测试 123"
@@ -158,38 +187,46 @@ xyzlcu key cmd+w
 
 ```text
 你可以用 `xyzlcu` 操作这台 Mac 的图形界面。规则：
+0. 会话开始时运行一次 `xyzlcu serve &`，之后每条命令都更快（`xyzlcu check` 里 daemon 为 true）。
 1. 开始前运行 `xyzlcu check`。如果 screenLocked 为 true 或权限缺失，停下来告诉用户。
 2. 循环：观察 → 定位 → 操作 → 验证。
-   - 观察：优先用 `xyzlcu ax "App" --depth 6` 读控件树；需要看画面时用 `xyzlcu screenshot /tmp/s.png --scale 0.5`。
-   - 定位：用 ax 输出的 [x,y 宽x高] 算出中心点；用截图时按 pixelsPerPoint 和 originX/originY 换算成点坐标。
-   - 操作：能 `xyzlcu press "App" "标题"` 就不用 click。
-   - 验证：操作后重新 ax 或截图，确认结果。
+   - 观察：优先用 `xyzlcu find "App" --role AXButton --title 保存` 或 `xyzlcu ax "App" --depth 6`；需要看画面时用 `xyzlcu screenshot --fast`，只看一个窗口用 `--window "App"`，只看一块用 `--region x,y,w,h`。
+   - 定位：find 直接给出 center；用截图时按 pixelsPerPoint 和 originX/originY 换算成点坐标。
+   - 操作：能 `xyzlcu click-el "App" --role R --title T` 就不用 click 坐标。
+   - 等待：用 `xyzlcu wait "App" --title T --timeout 5` 等界面变化，不要固定 sleep。
+   - 验证：操作后重新 find / ax 或截图，确认结果。
 3. 每次 `type` 或 `key` 之前先 `xyzlcu activate "目标App"`，再用 `xyzlcu apps` 确认它是前台（active: true）。键盘输入会发给当前前台应用。
 4. 付款、删除、发送、提交这类不可撤销的操作，先征得用户同意。
 5. 不要用 --force 绕过锁屏保护。
-6. 已经确认过前台、要连续做几步时，可以合成一条 `xyzlcu run 'click 500 300; type 你好; key return'`，比分开调用快好几倍。
+6. 已经确认过前台、要连续做几步时，可以合成一条 `xyzlcu run 'click-el App --title 搜索; type 你好; key return; wait App --title 结果'`，比分开调用快好几倍。
+7. 遇到验证码、「确认你是真人」或其他反机器人检查时，停下来交给用户处理，不要尝试绕过。
 ```
 
 ## 性能
 
-v0.2.0 做了这些优化：去掉固定的 15–60 毫秒等待（改成 `--delay`，默认 2 毫秒）、复用同一个事件源、文字按 20 个 UTF-16 单元一段发送、截图改走 ScreenCaptureKit 并直接输出缩放后的尺寸、支持 JPEG、`-wmo` 编译，以及新增 `run`/`batch`，多步操作只启动一次进程。
+v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`、`find` / `click-el` / `wait`（提前停止的控件搜索，一次 IPC 取多个属性），以及 `run --continue-on-error`。
 
-在 Apple Silicon Mac（macOS 26+）上用 `scripts/bench.py` 测得的中位数：
+在 Apple Silicon Mac（macOS 26+）上用 `scripts/bench.py` 每项跑 15 次的中位数：
 
-| 命令 | v0.1.0 | v0.2.0 | 提升 |
+| 命令 | v0.2.0 | v0.3.0 | v0.3.0 + 守护进程 |
 |---|---:|---:|---:|
-| `screenshot --scale 0.5`（PNG） | 750 ms | 251 ms | 3.0× |
-| `screenshot --scale 0.5 --format jpg` | — | 197 ms | 3.8×（对比 v0.1.0 PNG） |
-| `screenshot`（全尺寸 4112×2658 PNG） | 555 ms | 501 ms | 1.1× |
-| `type`（128 个字符，中英混合） | 222 ms | 73 ms | 3.0× |
-| `type`（5 个字符） | 84 ms | 58 ms | 1.4× |
-| `key right` | 102 ms | 68 ms | 1.5× |
-| `click` | 85 ms | 58 ms | 1.5× |
-| `move` | 60 ms | 51 ms | 1.2× |
-| 5 步操作（type/key 交替） | 约 310 ms（5 次调用） | 76 ms（一次 `batch`） | 4× |
-| `check` / `apps` / `windows` / `cursor` / `ax` | 15–50 ms | 15–55 ms | 持平（主要是进程启动开销） |
+| `check` | 31 ms | 29 ms | 22 ms |
+| `apps` | 17 ms | 16 ms | 14 ms |
+| `windows` | 50 ms | 52 ms | **9 ms** |
+| `cursor` | 29 ms | 28 ms | **7 ms** |
+| `move` | 63 ms | 60 ms | **9 ms** |
+| `ax Finder --depth 3` | 48 ms | 49 ms | **16 ms** |
+| `find Finder --role AXMenuBarItem --menu --index 2` | — | 47 ms | **12 ms** |
+| `screenshot`（全尺寸 4112×2658 PNG） | 503 ms | 499 ms | 382 ms |
+| `screenshot --scale 0.5`（PNG） | 250 ms | 266 ms | 136 ms |
+| `screenshot --scale 0.5 --format jpg` | 190 ms | 194 ms | 71 ms |
+| `screenshot --fast` | — | 202 ms | **67 ms** |
+| `screenshot --region 100,100,400,300` | — | 184 ms | **60 ms** |
+| `screenshot --window`（960×660 点窗口，`--scale 0.5`） | — | 212 ms | **80 ms** |
 
-自己测：`python3 scripts/bench.py build/xyzlcu`（加 `--gui` 会新建一个临时文本编辑文稿来测点击和输入，结束后自动关闭）。
+不用守护进程时，v0.3.0 和 v0.2.0 基本持平（差别在测量误差内），时间主要花在进程启动上。守护进程常驻后，查询类命令降到 7–22 毫秒，截图快 1.3–3 倍（省掉了 ScreenCaptureKit 的初始化，并缓存了显示器 / 窗口列表）。v0.2.0 相对 v0.1.0 的提升（`type` 128 字 222 → 73 毫秒、截图 750 → 251 毫秒等）见 v0.2.0 的发布说明。
+
+自己测：`python3 scripts/bench.py build/xyzlcu`；加 `--daemon` 会先启动守护进程再测；加 `--gui` 会新建一个临时文本编辑文稿来测点击和输入，结束后自动关闭。
 
 ## 坐标系
 
@@ -207,6 +244,8 @@ v0.2.0 做了这些优化：去掉固定的 15–60 毫秒等待（改成 `--del
 | 1 | 参数错误，或找不到应用 / 元素 / 显示器 |
 | 2 | 缺少权限（辅助功能或屏幕录制） |
 | 3 | 屏幕已锁定，键鼠操作被拒绝 |
+| 4 | `find` / `click-el` 找不到控件，或 `wait` 超时 |
+| 5 | 设置了 `XYZLCU_DAEMON=1` 但连不上守护进程 |
 
 ## 常见问题
 
@@ -220,6 +259,12 @@ v0.2.0 做了这些优化：去掉固定的 15–60 毫秒等待（改成 `--del
 - 改过权限或更新过 App 之后，可能要把开关关掉再打开。
 - 输入很久之后才出现、或者丢字：运行 `xyzlcu taps`。如果有 `listenOnly: false` 且 `avgLatencyMs` 很大（几百毫秒以上）的进程，说明它拦着输入事件处理得很慢，常见于屏幕共享（RFBEventHelperd）、语音助手或其他「电脑操控」工具。退出或重启那个程序后再试。
 - 某些应用来不及处理快速输入时，加大间隔：`xyzlcu --delay 20 type …`。
+- 键盘完全没反应、鼠标却正常：多半是某个拦截键盘的事件监听卡住了（`xyzlcu taps` 里它的 `avgLatencyMs` 会大到几十万甚至上百万毫秒，`eventsMask` 只含键盘事件）。这时系统层面的键盘输入都会被堵住，`type --app "App"` 也不一定能送到。需要退出或重启那个进程（常见是 Siri 或屏幕共享的 RFBEventHelperd），或者注销重新登录。
+
+**守护进程相关**
+- `check` 里 `daemon` 一直是 false：守护进程没启动，或者是旧版本（版本不一致时会自动退回进程内执行）。运行 `xyzlcu serve --status` 看看。
+- 守护进程里权限是 false：它是从另一个 App 启动的。`xyzlcu serve --stop` 后，在已授权的终端 / 智能体 shell 里重新 `xyzlcu serve &`。
+- 更新 xyzlcu 后记得 `xyzlcu serve --stop` 再重新启动。
 
 **中文输入法会干扰吗？**
 - `type` 直接发送 Unicode 字符，不经过输入法，中文输入法开着也能输入正确的文字。
@@ -238,20 +283,23 @@ v0.2.0 做了这些优化：去掉固定的 15–60 毫秒等待（改成 `--del
 - **`type` / `key` 前一定确认前台应用**，否则文字可能打进别的文档，快捷键也可能关掉别的窗口。
 - **锁屏保护**：锁屏时 `click / move / drag / scroll / type / key` 返回码 3 并拒绝执行。`--force` 可以强制执行，但不建议。
 - 不要让智能体在付款、删除、发送这类确认框上自动点「确定」。
-- XYZLCU 不联网、不收集任何数据，也不修改系统权限数据库。
+- XYZLCU 不联网、不收集任何数据，也不修改系统权限数据库。守护进程只监听本机 Unix 套接字，只接受同一用户。
+- **不做反检测**：XYZLCU 发出的就是普通的合成键鼠事件，不会伪装成真人、不会随机化节奏、也不会绕过验证码或网站的机器人检测。遇到验证码、「确认你是真人」或其他反机器人检查时，智能体应该停下来交给人处理。
 
 ## 已知限制
 
 - 只支持 macOS，只操作当前登录用户的图形会话。锁屏时没法操作，截图也是全黑。
-- 截图用的是系统的 `/usr/sbin/screencapture`。
-- `press` 只按完全匹配（不区分大小写）的标题、描述、值或 identifier 找控件，返回第一个匹配项。
+- macOS 13 上没有 ScreenCaptureKit 截图，会退回 `/usr/sbin/screencapture`（`--window` 用 `-l 窗口号`，`--region` 用 `-R`）。
+- `press` 只按完全匹配（不区分大小写）的标题、描述、值或 identifier 找控件，返回第一个匹配项；需要更精确时用 `find` / `click-el` 的 `--role`、`--index`、`--window`。
 - `type` 不经过输入法，需要输入法联想的场景不适用。
 - 不支持其他桌面（Space）上的窗口的切换管理。
 
 ## 卸载
 
 ```bash
+xyzlcu serve --stop 2>/dev/null
 rm -f ~/.local/bin/xyzlcu ~/.local/bin/macctl
+rm -rf ~/.xyzlcu
 ```
 
 然后在「系统设置 > 隐私与安全性」的「辅助功能」和「屏幕与系统录音」里，把不再需要的 App 关掉或移除。

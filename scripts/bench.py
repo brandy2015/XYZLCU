@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """XYZLCU 基准测试 / benchmark.
-用法: python3 scripts/bench.py [path/to/xyzlcu] [--runs 10] [--gui]
+用法: python3 scripts/bench.py [path/to/xyzlcu] [--runs 10] [--gui] [--daemon]
 --gui 会打开一个临时文本编辑文稿，测试 click/type/key（会确认前台应用后才输入）。
+--daemon 先启动 xyzlcu serve，测完再停掉（测守护进程模式）；不加则强制进程内执行。
 """
 import os, subprocess, sys, time, json, statistics, tempfile
 
@@ -11,7 +12,13 @@ if "--runs" in args:
     i = args.index("--runs"); runs = int(args[i + 1]); del args[i:i + 2]
 gui = "--gui" in args
 if gui: args.remove("--gui")
+daemon = "--daemon" in args
+if daemon: args.remove("--daemon")
 B = args[0] if args else "xyzlcu"
+os.environ["XYZLCU_DAEMON"] = "1" if daemon else "0"
+if daemon:
+    srv = subprocess.Popen([B, "serve"], stderr=subprocess.DEVNULL, env=dict(os.environ, XYZLCU_DAEMON="0"))
+    time.sleep(1)
 
 def run(cmd, stdin=None):
     return subprocess.run([B] + cmd, input=stdin, capture_output=True, text=True)
@@ -49,6 +56,14 @@ res["screenshot full"] = bench("screenshot full", ["screenshot", f"{tmp}/xyzlcu-
 res["screenshot 0.5"] = bench("screenshot --scale 0.5", ["screenshot", f"{tmp}/xyzlcu-bench.png", "--scale", "0.5"], n=min(runs, 5))
 if run(["help"]).stdout.find("--format") >= 0:
     res["screenshot jpg 0.5"] = bench("screenshot 0.5 jpg", ["screenshot", f"{tmp}/xyzlcu-bench.jpg", "--scale", "0.5", "--format", "jpg"], n=min(runs, 5))
+if run(["help"]).stdout.find("--fast") >= 0:
+    res["screenshot fast"] = bench("screenshot --fast", ["screenshot", f"{tmp}/xyzlcu-bench.jpg", "--fast"], n=min(runs, 5))
+    res["screenshot region"] = bench("screenshot --region 400x300", ["screenshot", f"{tmp}/xyzlcu-bench.png", "--region", "100,100,400,300"])
+    wins = json.loads(run(["windows"]).stdout)
+    if wins:
+        app = wins[0]["owner"]
+        res["screenshot window"] = bench(f"screenshot --window ({wins[0]['w']}x{wins[0]['h']})", ["screenshot", f"{tmp}/xyzlcu-bench.png", "--window", app, "--title", wins[0]["title"]] if wins[0]["title"] else ["screenshot", f"{tmp}/xyzlcu-bench.png", "--window", app])
+    res["find menu item"] = bench("find Finder AXMenuBarItem", ["find", "Finder", "--role", "AXMenuBarItem", "--menu", "--index", "2"])
 for f in ("xyzlcu-bench.png", "xyzlcu-bench.jpg"):
     try: os.remove(f"{tmp}/{f}")
     except FileNotFoundError: pass
@@ -85,4 +100,6 @@ if gui:
         res["text_ok"] = got == want
         os.remove(doc)
     if prev: run(["activate", prev])
+if daemon:
+    srv.terminate(); srv.wait()
 print(json.dumps(res, ensure_ascii=False))
