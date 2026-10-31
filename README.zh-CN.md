@@ -1,12 +1,14 @@
 # XYZLCU
 
+**给 AI 智能体用的 macOS 电脑操控工具**：零依赖命令行 + MCP 服务器，做桌面自动化 / GUI 自动化（截屏、鼠标、键盘、辅助功能树），支持 Claude、Codex、ChatGPT、Grok、DeepSeek。
+
 [English](README.md) | **中文**
 
 [![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#系统要求) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#系统要求) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![智能体: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#支持的智能体)
 
 **支持的智能体：**[Grok · Codex · ChatGPT · Claude · DeepSeek · ……](#支持的智能体)（任何能跑 shell 命令或接 MCP 服务器的智能体都能用）
 
-**XYZLCU（XYZ Local Computer Use）** 是一个零依赖的 macOS 图形界面控制命令行工具。只要能执行 shell 命令，不管是 AI 智能体（Claude Code、Codex、任何会跑命令的 Agent）还是你自己写的脚本，就能看屏幕、点鼠标、打字、按快捷键、读取界面结构并按下按钮。整个工具是一个 Swift 源文件（编译成 `xyzlcu-core`）加一个几十行的 C 小客户端（`xyzlcu`），不用 Python、Node、Homebrew，也不需要任何第三方库。
+**XYZLCU（XYZ Local Computer Use）** 是一个零依赖的 macOS 电脑操控（computer use）命令行工具和 MCP 服务器，用于图形界面 / 桌面自动化。只要能执行 shell 命令，不管是 AI 智能体（Claude Code、Codex、任何会跑命令的 Agent）还是你自己写的脚本，就能看屏幕、点鼠标、打字、按快捷键、读取界面结构并按下按钮。整个工具是一个 Swift 源文件（编译成 `xyzlcu-core`）加一个几十行的 C 小客户端（`xyzlcu`），不用 Python、Node、Homebrew，也不需要任何第三方库。
 
 > **通用，不绑定任何智能体。** XYZLCU 就是一个普通的命令行程序：任何能执行 shell 命令、能读 JSON 输出的智能体都能直接用（**Grok**、**Codex**、**ChatGPT**、**Claude**、**DeepSeek**，以及 Cursor、Gemini CLI、Cline / Roo、Aider、OpenClaw、OpenCode、Trae……），不需要专门的插件或适配层；只支持 MCP 的客户端可以用内置的 `xyzlcu mcp`。不用智能体也行：shell 脚本、快捷指令、cron / launchd 一样能调。见[支持的智能体](#支持的智能体)。
 

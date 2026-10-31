@@ -1,12 +1,14 @@
 # XYZLCU
 
+**Fast macOS computer use for AI agents**: a zero-dependency CLI and MCP server for GUI automation (screenshots, mouse, keyboard, accessibility tree) that works with Claude, Codex, ChatGPT, Grok and DeepSeek.
+
 **English** | [中文](README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#requirements) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![Agents: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#supported-agents)
 
 **Supported agents:** [Grok · Codex · ChatGPT · Claude · DeepSeek · …](#supported-agents) (any agent that can run shell commands or connect to an MCP server)
 
-**XYZLCU (XYZ Local Computer Use)** is a dependency-free macOS GUI control CLI. Anything that can run shell commands, whether an AI agent (Claude Code, Codex, any shell-capable agent) or your own script, can use it to see the screen, click, type, press shortcuts, read the UI structure and press buttons. It is one Swift source file (built as `xyzlcu-core`) plus a tiny C client (`xyzlcu`): no Python, no Node, no Homebrew, no third-party libraries.
+**XYZLCU (XYZ Local Computer Use)** is a dependency-free macOS computer-use CLI and MCP server for GUI automation. Anything that can run shell commands, whether an AI agent (Claude Code, Codex, any shell-capable agent) or your own script, can use it to see the screen, click, type, press shortcuts, read the UI structure and press buttons. It is one Swift source file (built as `xyzlcu-core`) plus a tiny C client (`xyzlcu`): no Python, no Node, no Homebrew, no third-party libraries.
 
 > **General-purpose, not tied to any agent.** XYZLCU is a plain command-line program: any agent that can run shell commands and read JSON output can use it directly (**Grok**, **Codex**, **ChatGPT**, **Claude**, **DeepSeek**, plus Cursor, Gemini CLI, Cline / Roo, Aider, OpenClaw, OpenCode, Trae, …), with no plugin or adapter layer. MCP-only clients can use the built-in `xyzlcu mcp`. It works without an agent too: shell scripts, Shortcuts, cron / launchd. See [Supported agents](#supported-agents).
 
