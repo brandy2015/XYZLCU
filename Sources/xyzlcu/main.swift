@@ -198,6 +198,12 @@ func findElement(_ el: AXUIElement, _ target: String, depth: Int = 0) -> AXUIEle
 /// 守护进程里应用列表靠主 runloop 更新；找不到时让 runloop 转一下再找一次
 var daemonMode = false
 func pumpRunLoop() { if daemonMode { RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.02)) } }
+/// 只处理已经排队的 runloop 事件，不等待（apps 用；原来固定等 20 毫秒）
+func drainRunLoop() {
+    guard daemonMode else { return }
+    var n = 0
+    while n < 64, CFRunLoopRunInMode(.defaultMode, 0, true) == .handledSource { n += 1 }
+}
 func findApp(_ name: String) -> NSRunningApplication? {
     if let a = findAppOnce(name) { return a }
     if daemonMode { pumpRunLoop(); return findAppOnce(name) }
@@ -891,6 +897,21 @@ func scaled(_ img: CGImage, _ s: Double) -> CGImage {
     ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
     return ctx.makeImage() ?? img
 }
+/// 等待回调。在主线程上等时要同时转主运行循环：命令行（不经守护进程）时 ScreenCaptureKit 的回调
+/// 需要主运行循环才会到，干等信号量会一直等到超时（实测每次 5 秒）。
+func waitSignal(_ sem: DispatchSemaphore, timeout: Double) -> Bool {
+    guard Thread.isMainThread else { return sem.wait(timeout: .now() + timeout) == .success }
+    let deadline = Date(timeIntervalSinceNow: timeout)
+    while sem.wait(timeout: .now() + 0.001) == .timedOut {
+        if Date() >= deadline { return false }
+        RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.002))
+    }
+    return true
+}
+/// ScreenCaptureKit 回调超时过一次就不再重试，直接改用 screencapture。
+/// 实测：同一路径的 xyzlcu 守护进程在运行时，XYZLCU_DAEMON=0 的进程内截图拿不到回调。
+var sckTimedOut = false
+var sckTimeout: Double { daemonMode ? 5 : 1.5 }
 /// SCShareableContent 取一次要几十毫秒；守护进程里缓存起来复用
 var cachedContent: AnyObject? = nil
 var cachedAt = Date.distantPast
@@ -900,7 +921,7 @@ func shareableContent(maxAge: Double) -> SCShareableContent? {
     let sem = DispatchSemaphore(value: 0)
     var result: SCShareableContent?
     SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { c, _ in result = c; sem.signal() }
-    if sem.wait(timeout: .now() + 5) == .timedOut { return nil }
+    if !waitSignal(sem, timeout: sckTimeout) { sckTimedOut = true; return nil }
     if let r = result { cachedContent = r; cachedAt = Date() }
     return result
 }
@@ -909,13 +930,15 @@ func grab(_ filter: SCContentFilter, _ cfg: SCStreamConfiguration) -> CGImage? {
     let sem = DispatchSemaphore(value: 0)
     var result: CGImage?
     SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg) { img, _ in result = img; sem.signal() }
-    return sem.wait(timeout: .now() + 5) == .timedOut ? nil : result
+    if !waitSignal(sem, timeout: sckTimeout) { sckTimedOut = true; return nil }
+    return result
 }
 enum Target { case display(CGDirectDisplayID), region(CGDirectDisplayID, CGRect), window(CGWindowID) }
 /// 快路径：ScreenCaptureKit（macOS 14+），在进程内截图，直接按目标尺寸输出
 func captureSCK(_ target: Target, scale: Double) -> (CGImage, CGRect)? {
     guard #available(macOS 14.0, *) else { return nil }
     for attempt in 0..<2 {
+        if sckTimedOut { return nil }
         var maxAge = 30.0
         if case .window = target { maxAge = 2 }  // 窗口大小/位置变化快，缓存时间短一些
         guard let content = shareableContent(maxAge: attempt == 1 ? 0 : maxAge) else { return nil }
@@ -1006,6 +1029,9 @@ func screenshot(path: String, scale: Double?, display: Int, region: CGRect?, win
          "originX": Int(rect.minX), "originY": Int(rect.minY), "pointWidth": Int(rect.width), "pointHeight": Int(rect.height),
          "pixelsPerPoint": rect.width > 0 ? Double(cg.width) / Double(rect.width) : 1, "method": method, "screenLocked": screenLocked(),
          "note": "全局点坐标 x = originX + x_pixel / pixelsPerPoint，y = originY + y_pixel / pixelsPerPoint"]
+    if sckTimedOut {
+        o["warning"] = "ScreenCaptureKit 没有响应，已改用 screencapture（较慢）。守护进程在运行时用 XYZLCU_DAEMON=0 截图会这样，去掉它走守护进程即可"
+    }
     o.merge(extra) { a, _ in a }
     out(o)
 }
@@ -1038,7 +1064,7 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   环境变量: XYZLCU_DAEMON=0 不用守护进程；=1 必须用守护进程
             XYZLCU_EVENTS_HEALTH=bad 模拟事件流卡住（测试备用路径）；XYZLCU_TAP_THRESHOLD_MS 卡住阈值（默认 1000）
 """
-let version = "0.4.0"
+let version = "0.4.1"
 var inBatch = false
 let startedAt = Date()
 
@@ -1248,7 +1274,7 @@ case "click-el":
     }
     findOutput(r, all: false, t0: t0, extra: ["action": how])
 case "apps":
-    pumpRunLoop()
+    drainRunLoop()
     out(NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }.map(appInfo))
 case "open":
     try need(1, "open \"App\"")

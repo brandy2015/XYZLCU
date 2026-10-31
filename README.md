@@ -4,7 +4,7 @@
 
 **XYZLCU（XYZ Local Computer Use）** 是一个零依赖的 macOS 图形界面控制命令行工具。只要能执行 shell 命令，不管是 AI 智能体（Claude Code、Codex、任何会跑命令的 Agent）还是你自己写的脚本，就能看屏幕、点鼠标、打字、按快捷键、读取界面结构并按下按钮。整个工具只有一个 Swift 源文件和一个二进制，不用 Python、Node、Homebrew，也不需要任何第三方库。
 
-> 灵感来自 [amontlabs/lcu](https://github.com/amontlabs/lcu) 的思路，但这是**独立实现**：没有共用任何代码，也**不需要 ChatGPT / Codex** 桌面应用或其运行时。
+> 借鉴自 Amont Labs 的 [LCU（Local Computer Use）](https://github.com/amontlabs/lcu)，在此致谢（见[致谢](#致谢)）。XYZLCU 是**独立实现**：没有复制 LCU 的代码，也**不需要 ChatGPT / Codex** 桌面应用或其运行时。和 LCU 的速度、用法对比见[性能对比](#性能对比与-lcu)。
 
 ## 功能
 
@@ -16,6 +16,7 @@
 - 🛣 **多条输入路径**（v0.4.0）：先实测事件流是否卡住，再在辅助功能写值、键盘事件、直接投递进程、菜单粘贴之间自动挑一条走得通的，输出里写明实际走的路
 - ⏺ **录制 / 回放**：只监听地录下键鼠操作（不拦截输入，密码框和锁屏时不录按键），按原节奏回放
 - 🔒 **锁屏保护**：屏幕锁定时拒绝键鼠操作，防止把字打进锁屏密码框
+- 📊 **实测数据**：和 LCU 的逐项速度对比见[性能对比](#性能对比与-lcu)，脚本可复现
 - ⚡ **常驻守护进程**：`xyzlcu serve &` 之后，命令自动转发给它，省掉进程启动和权限检查开销，大部分命令 7–20 毫秒
 - 🧾 **输出好解析**：结果是 JSON 或一行 `ok`，出错时返回明确的退出码
 
@@ -286,7 +287,64 @@ xyzlcu key cmd+w
 7. 遇到验证码、「确认你是真人」或其他反机器人检查时，停下来交给用户处理，不要尝试绕过。
 ```
 
-## 性能
+## 性能对比（与 LCU）
+
+**环境**：Apple Silicon Mac（macOS 26+）。XYZLCU 0.4.1 对比 [LCU](https://github.com/amontlabs/lcu) 0.13.4（ChatGPT 自带的 CUA 运行时 0.0.35）。每项跑 15 次，表里是**中位数 / p90**，单位毫秒。
+
+| 操作 | XYZLCU 进程内 | XYZLCU 守护进程 | LCU（MCP `js` 调用） |
+|---|---:|---:|---:|
+| 版本号（`version`，相当于空调用） | 5 / 6 | 10 / 18 | — |
+| 列出应用（`apps` / `cua.listApps`） | 14 / 16 | 17 / 18 | 14 / 16 |
+| 列出窗口（`windows`） | 52 / 63 | **7 / 8** | —（Mac 上没有） |
+| 鼠标位置（`cursor`） | 27 / 35 | **6 / 6** | —（Mac 上没有） |
+| 移动鼠标（`move`） | 54 / 65 | **7 / 10** | —（Mac 上没有） |
+| 整屏截图（全尺寸 PNG） | 354 / 367 | 233 / 250 | —（Mac 上没有） |
+| 整屏截图（`--fast`，半尺寸 JPEG） | 190 / 196 | 60 / 68 | —（Mac 上没有） |
+| 窗口截图（文本编辑窗口） | 198 / 210 | 68 / 78 | **47 / 51** |
+| 控件树（`ax --depth 3` / `getAXState`） | 66 / 71 | **28 / 47** | 49 / 70 |
+| 点击（`click`） | 54 / 63 | **12 / 14** | 135 / 175 |
+| 输入英文 `abc` | 87 / 118 | **12 / 14** | 41 / 45 |
+| 输入中文 `你好abc` | 87 / 115 | **14 / 16** | 9060 / 10560 |
+| 按键（`cmd+right` / `super+Right`） | 73 / 96 | **8 / 14** | 14 / 24 |
+
+**怎么测的**
+
+- **XYZLCU**：每次都是一次完整的命令行调用（启动进程 → 执行 → 输出 JSON），也就是智能体从 shell 调用时真正付出的时间。「进程内」= `XYZLCU_DAEMON=0`；「守护进程」= 先运行 `xyzlcu serve`。先测进程内、再启动守护进程测（原因见[常见问题](#常见问题)里截图那一条）。
+- **LCU**：在临时目录里装了一份（不改系统、不改任何智能体配置），用 LCU 自带的 `adapters/client.mjs` 以 stdio 方式连上 `lcu` MCP 服务器，每个操作是一次 `js` 工具调用，比如 `await app.click([x, y])`、`await app.typeText("abc")`。计的是**已连上之后**一次调用的往返时间；连接（约 260 ms）、首次调用（约 260 ms）、`getApp`（约 100 ms）都不算在内，智能体自己生成工具调用的时间也不算。
+- **GUI 操作**都在一份临时的文本编辑文稿里做：每次输入前确认它在前台、而且是最前面的窗口；结束后读回文稿内容核对（两边输入的文字都正确），再关闭、删除这份文稿。LCU 第一次操作文本编辑时会请求授权，测试只回答「仅本次会话」。
+
+**结果怎么看（实话实说）**
+
+- **LCU 截窗口更快**（47 vs 68 ms）：它把 JPEG 留在内存里直接交给模型；XYZLCU 要编码 PNG 并写成文件。
+- **不开守护进程时，XYZLCU 的打字和按键比 LCU 慢**（87 / 73 ms vs 41 / 14 ms），多出来的主要是每次启动进程和检查权限。常驻守护进程后，XYZLCU 这几项都在 8–14 ms。
+- **LCU 的点击慢一些（135 ms），但它是后台投递**：不移动真实鼠标、不把应用切到前台，用户可以同时用电脑。XYZLCU 的 `click` 会真的移动鼠标去点。想后台操作，XYZLCU 有 `click-el`（AXPress）、`type --app`、`menu`、`insert` / `settext` 这些不抢前台的路。
+- **LCU 输入中文很慢**：`你好abc` 中位数约 9 秒，纯英文只要 41 ms。XYZLCU 直接发送 Unicode 或写辅助功能，中英文一样快。
+- **「—」不是没测，是 LCU 在 Mac 上没有这个能力**（没有鼠标位置 / 移动、整屏截图和窗口列表，它按应用来操作）。
+- 这张表只比单个操作的延迟，不代表完成整个任务的能力。LCU 背后是 ChatGPT 的 CUA 运行时，在和模型配合、后台操作方面有它的长处。
+
+**用起来的区别**
+
+| | XYZLCU | LCU |
+|---|---|---|
+| 需要什么 | 一个二进制，macOS 13+，Apple Silicon 或 Intel | 已安装 ChatGPT 桌面应用（借用它的 CUA 运行时）、Apple Silicon；自带 Node |
+| 怎么接入 | 任何能跑 shell 命令的工具 | MCP 服务器（`lcu setup --agent …` 写入智能体配置） |
+| 授权 | 系统「辅助功能」「屏幕与系统录音」授给负责 App | 系统权限之外，每个应用第一次被操作时还要批准（仅本次会话 / 始终） |
+| 操作方式 | 全局坐标 + 真实键鼠事件，另有辅助功能、直接投递、菜单等不经过键盘事件的路 | 按应用操作，坐标是窗口截图里的像素，后台投递 |
+| 输出 | JSON；截图写成文件 | 工具结果直接带图片 |
+
+**自己跑一遍**
+
+```bash
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15            # 只测 XYZLCU（进程内 + 守护进程）
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui      # 再加点击、输入、按键（会开一个临时文本编辑文稿）
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui \
+    --lcu /path/to/lcu --lcu-allow-session --json bench.json       # 同时测 LCU（需要已装好 LCU 和 ChatGPT 桌面应用）
+```
+
+`--mode inproc|daemon` 只测一种模式。不加 `--lcu-allow-session` 时，脚本会拒绝 LCU 的授权请求，需要授权的那些操作就没有数字；脚本永远不会选「始终允许」。想要干净的进程内截图数字，先 `xyzlcu serve --stop`。
+
+<details>
+<summary>历史版本对比（v0.2.0 → v0.3.0）</summary>
 
 v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`、`find` / `click-el` / `wait`（提前停止的控件搜索，一次 IPC 取多个属性），以及 `run --continue-on-error`。
 
@@ -310,7 +368,7 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 
 不用守护进程时，v0.3.0 和 v0.2.0 基本持平（差别在测量误差内），时间主要花在进程启动上。守护进程常驻后，查询类命令降到 7–22 毫秒，截图快 1.3–3 倍（省掉了 ScreenCaptureKit 的初始化，并缓存了显示器 / 窗口列表）。v0.2.0 相对 v0.1.0 的提升（`type` 128 字 222 → 73 毫秒、截图 750 → 251 毫秒等）见 v0.2.0 的发布说明。
 
-自己测：`python3 scripts/bench.py build/xyzlcu`；加 `--daemon` 会先启动守护进程再测；加 `--gui` 会新建一个临时文本编辑文稿来测点击和输入，结束后自动关闭。
+</details>
 
 ## 坐标系
 
@@ -349,6 +407,7 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 - `check` 里 `daemon` 一直是 false：守护进程没启动，或者是旧版本（版本不一致时会自动退回进程内执行）。运行 `xyzlcu serve --status` 看看。
 - 守护进程里权限是 false：它是从另一个 App 启动的。`xyzlcu serve --stop` 后，在已授权的终端 / 智能体 shell 里重新 `xyzlcu serve &`。
 - 更新 xyzlcu 后记得 `xyzlcu serve --stop` 再重新启动（版本号不同时会自动退回进程内执行）。
+- 进程内截图（`XYZLCU_DAEMON=0`）输出里有 `warning`、要 2 秒左右：同一个 xyzlcu 的守护进程正在运行时，macOS 不给进程内的 ScreenCaptureKit 截图回调，XYZLCU 等 1.5 秒后改用系统 `screencapture`。去掉 `XYZLCU_DAEMON=0` 走守护进程就好（60–230 毫秒）。
 - 自己覆盖安装二进制时，先写到临时文件再 `mv` 过去（`build.sh --install` 就是这么做的）；直接 `cp` 覆盖正在使用的已签名二进制，新进程可能被系统直接杀掉（退出码 137）。
 
 **中文输入法会干扰吗？**
@@ -391,6 +450,18 @@ rm -rf ~/.xyzlcu
 然后在「系统设置 > 隐私与安全性」的「辅助功能」和「屏幕与系统录音」里，把不再需要的 App 关掉或移除。
 
 > 想继续用旧名字的话：`ln -sf ~/.local/bin/xyzlcu ~/.local/bin/macctl`
+
+## 更新记录
+
+- **0.4.1**：进程内截图等 ScreenCaptureKit 回调时会处理主线程事件；回调超时只等一次（1.5 秒）就改用 `screencapture` 并给出 `warning`，不再卡 10 秒以上。守护进程里的 `apps` 不再固定等 20 毫秒（42 → 17 ms）。新增和 LCU 的对比测试（`scripts/bench.py --lcu`、`scripts/bench_lcu.mjs`）。
+- **0.4.0**：多条输入路径（辅助功能写值、直接投递、菜单、粘贴）、事件流健康检查、`insert` / `settext` / `value` / `menu` / `taps`、只监听的录制与回放。
+- 更早的版本见 [Releases](https://github.com/brandy2015/XYZLCU/releases)。
+
+## 致谢
+
+XYZLCU 借鉴自 Amont Labs 的 **[LCU（Local Computer Use）](https://github.com/amontlabs/lcu)**：让本机上任何智能体都能看屏幕、点击、打字，用截图配合辅助功能树来定位，以及「Local Computer Use」这个名字本身，都受它启发。感谢 Amont Labs 把 LCU 开源出来。
+
+XYZLCU 是独立实现，没有复制 LCU 的代码。LCU 以 MIT 许可证发布，Copyright (c) 2026 Amont Labs。
 
 ## 许可证
 

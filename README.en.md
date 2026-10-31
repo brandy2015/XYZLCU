@@ -4,7 +4,7 @@
 
 **XYZLCU (XYZ Local Computer Use)** is a dependency-free macOS GUI control CLI. Anything that can run shell commands, whether an AI agent (Claude Code, Codex, any shell-capable agent) or your own script, can use it to see the screen, click, type, press shortcuts, read the UI structure and press buttons. It is a single Swift source file compiled into a single binary: no Python, no Node, no Homebrew, no third-party libraries.
 
-> Inspired by the idea behind [amontlabs/lcu](https://github.com/amontlabs/lcu), but an **independent implementation**: it shares no code and does **not** need the ChatGPT / Codex desktop app or its runtime.
+> Inspired by and borrows ideas from [LCU (Local Computer Use)](https://github.com/amontlabs/lcu) by Amont Labs, with thanks (see [Acknowledgements](#acknowledgements)). XYZLCU is an **independent implementation**: it copies no LCU code and does **not** need the ChatGPT / Codex desktop app or its runtime. For a speed and usability comparison with LCU, see [Benchmark](#benchmark-vs-lcu).
 
 ## Features
 
@@ -16,6 +16,7 @@
 - 🛣 **Multiple input paths** (v0.4.0): probes whether the event stream is stuck, then picks a working path among Accessibility writes, keyboard events, direct-to-process delivery and menu paste, and reports which one it used
 - ⏺ **Record / replay**: listen-only recording of keyboard and mouse (never intercepts input; no keys recorded in password fields or while locked), replayed with the original timing
 - 🔒 **Lock-screen guard**: refuses mouse and keyboard input while the screen is locked, so nothing gets typed into the password field
+- 📊 **Measured**: a per-operation speed comparison with LCU is in [Benchmark](#benchmark-vs-lcu), with a reproducible script
 - ⚡ **Resident daemon**: after `xyzlcu serve &`, commands are forwarded to it automatically, skipping process start-up and permission checks; most commands take 7–20 ms
 - 🧾 **Parseable output**: JSON or a plain `ok`, plus clear exit codes
 
@@ -286,7 +287,64 @@ You can control this Mac's GUI with `xyzlcu`. Rules:
 7. If you hit a captcha, an "are you human" check or any other anti-bot check, stop and hand it to the user. Don't try to get around it.
 ```
 
-## Performance
+## Benchmark (vs LCU)
+
+**Setup**: Apple Silicon Mac (macOS 26+). XYZLCU 0.4.1 vs [LCU](https://github.com/amontlabs/lcu) 0.13.4 (the CUA runtime 0.0.35 shipped with ChatGPT). 15 runs per operation; the table shows **median / p90** in milliseconds.
+
+| Operation | XYZLCU in-process | XYZLCU daemon | LCU (MCP `js` call) |
+|---|---:|---:|---:|
+| Version (`version`, ~empty call) | 5 / 6 | 10 / 18 | — |
+| List apps (`apps` / `cua.listApps`) | 14 / 16 | 17 / 18 | 14 / 16 |
+| List windows (`windows`) | 52 / 63 | **7 / 8** | — (not on Mac) |
+| Pointer position (`cursor`) | 27 / 35 | **6 / 6** | — (not on Mac) |
+| Move pointer (`move`) | 54 / 65 | **7 / 10** | — (not on Mac) |
+| Full-screen screenshot (full-size PNG) | 354 / 367 | 233 / 250 | — (not on Mac) |
+| Full-screen screenshot (`--fast`, half-size JPEG) | 190 / 196 | 60 / 68 | — (not on Mac) |
+| Window screenshot (TextEdit window) | 198 / 210 | 68 / 78 | **47 / 51** |
+| UI tree (`ax --depth 3` / `getAXState`) | 66 / 71 | **28 / 47** | 49 / 70 |
+| Click (`click`) | 54 / 63 | **12 / 14** | 135 / 175 |
+| Type `abc` | 87 / 118 | **12 / 14** | 41 / 45 |
+| Type `你好abc` (Chinese) | 87 / 115 | **14 / 16** | 9060 / 10560 |
+| Key (`cmd+right` / `super+Right`) | 73 / 96 | **8 / 14** | 14 / 24 |
+
+**Method**
+
+- **XYZLCU**: each sample is a full CLI invocation (process start → run → JSON output), which is what an agent actually pays when calling it from a shell. "In-process" = `XYZLCU_DAEMON=0`; "daemon" = after `xyzlcu serve`. In-process runs first, then the daemon is started (see the screenshot item under [Troubleshooting](#troubleshooting)).
+- **LCU**: installed into a temp directory (no system changes, no agent config changes) and driven through LCU's own `adapters/client.mjs` over stdio MCP. Each sample is one `js` tool call such as `await app.click([x, y])` or `await app.typeText("abc")`, timed as a round trip **on an already-connected client**. Connecting (~260 ms), the first call (~260 ms) and `getApp` (~100 ms) are excluded, as is the agent's own time to produce a tool call.
+- **GUI operations** all target a temporary TextEdit document. Before every input the script checks that TextEdit is frontmost and the document is its front window; at the end it reads the document back (both tools typed the right text), then closes and deletes it. LCU asks for approval the first time it touches TextEdit; the benchmark only answers "this session".
+
+**Reading the numbers (honestly)**
+
+- **LCU's window screenshot is faster** (47 vs 68 ms): it keeps the JPEG in memory and hands it straight to the model, while XYZLCU encodes a PNG and writes a file.
+- **Without the daemon, XYZLCU types and presses keys more slowly than LCU** (87 / 73 ms vs 41 / 14 ms), mostly process start-up and permission checks. With the daemon running, these drop to 8–14 ms.
+- **LCU's click is slower (135 ms) but it is background delivery**: it does not move the real pointer or bring the app to the front, so the user can keep working. XYZLCU's `click` really moves the pointer. For background work XYZLCU has `click-el` (AXPress), `type --app`, `menu`, and `insert` / `settext`.
+- **LCU types Chinese very slowly**: `你好abc` has a ~9 s median, while plain ASCII takes 41 ms. XYZLCU sends Unicode directly or writes via Accessibility, so both are equally fast.
+- **"—" means LCU has no such capability on Mac** (no pointer position/move, no full-screen screenshot, no window list; it works per app). It does not mean the test was skipped.
+- This compares single-operation latency only, not the ability to finish whole tasks. LCU sits on ChatGPT's CUA runtime and has strengths in model integration and background operation.
+
+**Usability differences**
+
+| | XYZLCU | LCU |
+|---|---|---|
+| Needs | One binary, macOS 13+, Apple Silicon or Intel | The ChatGPT desktop app installed (it uses its CUA runtime), Apple Silicon; bundles Node |
+| Integration | Anything that can run shell commands | MCP server (`lcu setup --agent …` writes agent configs) |
+| Approval | System Accessibility and Screen & System Audio Recording for the responsible app | On top of system permissions, each app needs approval the first time (this session / always) |
+| Interaction model | Global coordinates + real input events, plus Accessibility, direct-to-process and menu paths that avoid keyboard events | Per app; coordinates are pixels in the window screenshot; background delivery |
+| Output | JSON; screenshots written to files | Tool results carry the image |
+
+**Reproduce**
+
+```bash
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15            # XYZLCU only (in-process + daemon)
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui      # plus click/type/key (opens a temporary TextEdit doc)
+python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui \
+    --lcu /path/to/lcu --lcu-allow-session --json bench.json       # also LCU (needs LCU and the ChatGPT desktop app)
+```
+
+`--mode inproc|daemon` runs one mode only. Without `--lcu-allow-session`, the script declines LCU approval requests, so operations that need approval report no numbers; the script never chooses "always". For clean in-process screenshot numbers, run `xyzlcu serve --stop` first.
+
+<details>
+<summary>Earlier versions (v0.2.0 → v0.3.0)</summary>
 
 v0.3.0 adds the resident daemon (`serve`), window and region screenshots, `--fast`, `find` / `click-el` / `wait` (an early-exit control search that fetches several attributes per IPC call), and `run --continue-on-error`.
 
@@ -310,7 +368,7 @@ Medians of 15 runs per command from `scripts/bench.py` on an Apple Silicon Mac (
 
 Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); most of the time is process start-up. With the daemon running, query commands drop to 7–22 ms and screenshots get 1.3–3× faster (ScreenCaptureKit is already initialized, and the display/window lists are cached). The v0.2.0 gains over v0.1.0 (`type` of 128 chars 222 → 73 ms, screenshots 750 → 251 ms, and so on) are listed in the v0.2.0 release notes.
 
-Run it yourself: `python3 scripts/bench.py build/xyzlcu`; `--daemon` starts the daemon first; `--gui` also opens a temporary TextEdit document to time clicks and typing, and closes it afterwards.
+</details>
 
 ## Coordinate system
 
@@ -349,6 +407,7 @@ Run it yourself: `python3 scripts/bench.py build/xyzlcu`; `--daemon` starts the 
 - `daemon` stays false in `check`: the daemon isn't running, or it's an older version (on a version mismatch commands run in-process). Run `xyzlcu serve --status`.
 - Permissions are false inside the daemon: it was started from a different app. Run `xyzlcu serve --stop`, then `xyzlcu serve &` again from the authorized terminal / agent shell.
 - After updating xyzlcu, run `xyzlcu serve --stop` and start it again. (a version mismatch falls back to in-process automatically).
+- An in-process screenshot (`XYZLCU_DAEMON=0`) takes ~2 s and has a `warning`: while a daemon of the same xyzlcu binary is running, macOS does not deliver in-process ScreenCaptureKit callbacks, so XYZLCU waits 1.5 s and falls back to `screencapture`. Drop `XYZLCU_DAEMON=0` and go through the daemon (60–230 ms).
 - When replacing the binary yourself, write to a temp file and `mv` it into place (`build.sh --install` does this); overwriting a signed binary that is in use with `cp` can get new processes killed by the system (exit code 137).
 
 **Does a Chinese input method get in the way?**
@@ -391,6 +450,18 @@ rm -rf ~/.xyzlcu
 Then, in System Settings > Privacy & Security, turn off or remove any apps you no longer need under Accessibility and Screen & System Audio Recording.
 
 > To keep using the old name: `ln -sf ~/.local/bin/xyzlcu ~/.local/bin/macctl`
+
+## Changelog
+
+- **0.4.1**: in-process screenshots pump the main run loop while waiting for ScreenCaptureKit; a callback timeout is waited out once (1.5 s), then it falls back to `screencapture` with a `warning` instead of stalling for 10+ s. `apps` in the daemon no longer waits a fixed 20 ms (42 → 17 ms). New LCU comparison benchmark (`scripts/bench.py --lcu`, `scripts/bench_lcu.mjs`).
+- **0.4.0**: multiple input paths (Accessibility writes, direct-to-process, menus, paste), event-stream health checks, `insert` / `settext` / `value` / `menu` / `taps`, listen-only record and replay.
+- Older versions: see [Releases](https://github.com/brandy2015/XYZLCU/releases).
+
+## Acknowledgements
+
+XYZLCU is inspired by and borrows ideas from **[LCU (Local Computer Use)](https://github.com/amontlabs/lcu)** by Amont Labs: letting any local agent see the screen, click and type, locating things with screenshots plus the accessibility tree, and the "Local Computer Use" name itself. Many thanks to Amont Labs for open-sourcing LCU.
+
+XYZLCU is an independent implementation and contains no LCU code. LCU is released under the MIT License, Copyright (c) 2026 Amont Labs.
 
 ## License
 
