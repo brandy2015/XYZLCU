@@ -102,7 +102,11 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `drag x1 y1 x2 y2` | Drag with the left button held | `xyzlcu drag 100 100 400 400` |
 | `scroll dx dy` | Scroll in lines; positive dy scrolls up | `xyzlcu scroll 0 -5` |
 | `cursor` | Current pointer position | `xyzlcu cursor` |
-| `type "text" [--app "App"]` | Type Unicode text | `xyzlcu type "你好 Hello 😀"` |
+| `type "text" [--app "App"] [--via auto\|events\|ax\|paste]` | Type Unicode text. Default auto: keyboard events normally, Accessibility value writes when the keyboard is detected as blocked | `xyzlcu type "你好 Hello 😀"` |
+| `insert "App" [target] "text"` | Insert text at the focus via Accessibility (sets AXSelectedText), no keyboard events; verified by reading back | `xyzlcu insert TextEdit --window Notes "hello"` |
+| `settext "App" [target] "text"` | Replace a text field's whole content via Accessibility (sets AXValue); verified by reading back | `xyzlcu settext Safari --role AXTextField --title Search "XYZLCU"` |
+| `value "App" [target]` | Read back an element's value (focused element by default) to check the input | `xyzlcu value TextEdit` |
+| `menu "App" "Menu>Item"` | Press a menu item by path instead of a shortcut; each level accepts alternatives like `File\|文件` | `xyzlcu menu TextEdit "File>Save"` |
 | `key combo… [--app "App"]` | Keys / combos, several at once | `xyzlcu key cmd+s` · `xyzlcu key cmd+c cmd+v` |
 | `apps` | Running GUI apps | `xyzlcu apps` |
 | `open "App"` | Open an app | `xyzlcu open "TextEdit"` |
@@ -133,6 +137,30 @@ Notes:
 - **`run` / `batch`**: quoting works like the shell (`"…"`, `'…'`, `\` escapes); lines starting with `#` are comments. By default execution stops at the first failing command, with that command's exit code, and the error names the step number; with `--continue-on-error` the remaining steps still run and the exit code is that of the last failing step (0 if all succeed). `find`, `click-el`, `wait` and `sleep` can be mixed in.
 - **`--delay N`**: gap between synthesized mouse/keyboard events in ms (default 2). Raise it if a slow app drops input, e.g. `xyzlcu --delay 20 type …` or `XYZLCU_DELAY=20`.
 - **Screenshots**: on macOS 14+ capture goes through ScreenCaptureKit (in-process, rendered directly at the `--scale` size; `--window` captures only that window, even when covered; `--region` only that area); otherwise, or with `--cli`, it falls back to the system `screencapture`. The `method` field tells you which path ran, and `originX/originY` is the image's top-left in global points.
+
+## When keyboard events are blocked
+
+Sometimes another process's keyboard event tap hangs. `xyzlcu type` / `key` then return ok, but nothing shows up in the app, not even with `--app` direct delivery. The mouse usually still works.
+
+**How to tell**: `xyzlcu check` lists the stuck taps under `keyboardBlockedBy` (active filter, interested in key events, average latency above 1 s). `xyzlcu taps` shows all the details. If the latency numbers never change, events are not being drained and old keystrokes are not being replayed either.
+
+**Input paths that skip keyboard events** (none of them go through the keyboard event stream):
+
+```bash
+xyzlcu insert TextEdit --window "My notes" "inserted at the caret"         # sets AXSelectedText
+xyzlcu settext TextEdit --role AXTextArea --window "My notes" "replace all" # sets AXValue
+xyzlcu value TextEdit --window "My notes"                                   # read it back
+xyzlcu type "hello"     # default --via auto switches to Accessibility writes when the keyboard is blocked
+```
+
+- Target: the app's focused element by default, or pick one with `--role` / `--subrole` / `--title` (or `--id`) / `--index`. `--window TITLE` checks which window the element is in and refuses to write if it does not match, so you cannot write into the wrong document.
+- Every write reads `AXValue` back. Only `verified: true` counts as success; a mismatch exits with code 1.
+- The app does not need to be frontmost, and nothing outside the target element is touched. Native Cocoa text views (TextEdit, Notes, most text fields) support it. Some web pages and custom-drawn UIs do not accept value writes and report an error.
+- `--via paste`: puts the text on the clipboard, presses the "Edit>Paste" menu item, then restores your original clipboard.
+
+**Instead of shortcuts**: press menu items with `menu`, for example `xyzlcu menu TextEdit "File>Save"`, `"文件>关闭"`, or `"Edit|编辑>Select All|全选"`. If an item is not found, every item on that level is listed.
+
+**Limitation**: menu actions (`menu`, `press`, `--via paste`) rely on the app processing its own event queue. If the event pipeline is stuck as a whole, the app does not process them: the command reports success but nothing happens, and the action may be queued until the pipeline recovers. So when a stuck tap is detected, `menu` adds a `warning` to its output and `--via auto` does not fall back to paste. In that state only `insert` / `settext` / `type --via ax` take effect immediately. The real fix is to restart the stuck process (the one with the huge latency in `xyzlcu taps`) or to log out/reboot. XYZLCU does not kill system processes for you.
 
 ## Daemon
 

@@ -278,6 +278,163 @@ func findOutput(_ r: (matches: [[String: Any]], els: [AXUIElement], visited: Int
     out(o)
 }
 
+// MARK: - 不经过键盘事件流的输入：辅助功能写值 / 剪贴板 + 菜单「粘贴」/ 菜单项
+// 用途：系统里有卡住的键盘事件监听（event tap）时，合成的键盘事件送不到应用，这些路径完全不走事件流
+func axElement(_ v: AnyObject?) -> AXUIElement? {
+    guard let v = v, CFGetTypeID(v) == AXUIElementGetTypeID() else { return nil }
+    return (v as! AXUIElement)
+}
+func axSettable(_ el: AXUIElement, _ a: String) -> Bool {
+    var b: DarwinBoolean = false
+    return AXUIElementIsAttributeSettable(el, a as CFString, &b) == .success && b.boolValue
+}
+func axStringValue(_ el: AXUIElement) -> String? { attr(el, kAXValueAttribute) as? String }
+func windowTitle(of el: AXUIElement) -> String? {
+    if let w = axElement(attr(el, kAXWindowAttribute)) { return str(w, kAXTitleAttribute) }
+    return nil
+}
+/// 被键盘事件卡住的监听：主动拦截、已启用、关心 keyDown、平均延迟超过 1 秒
+func blockingKeyboardTaps() -> [[String: Any]] {
+    var n: UInt32 = 0; CGGetEventTapList(0, nil, &n)
+    guard n > 0 else { return [] }
+    var list = [CGEventTapInformation](repeating: CGEventTapInformation(), count: Int(n)); CGGetEventTapList(n, &list, &n)
+    return list.prefix(Int(n)).filter { t in
+        t.enabled && t.options != .listenOnly && (t.eventsOfInterest & (1 << CGEventType.keyDown.rawValue)) != 0 && t.avgUsecLatency > 1_000_000
+    }.map { t in ["process": pathOf(t.tappingProcess), "pid": Int(t.tappingProcess), "avgLatencyMs": Double(t.avgUsecLatency) / 1000] }
+}
+
+/// 解析输入目标：给了 --role/--subrole/--title/--id 就按条件找，否则用应用当前的焦点元素。--window 限定所在窗口标题
+func inputTarget(_ appName: String?, role: String?, subrole: String?, title: String?, window: String?, index: Int) throws -> (AXUIElement, NSRunningApplication) {
+    if role != nil || subrole != nil || title != nil {
+        var q = Query(); q.role = role; q.subrole = subrole; q.title = title; q.windowTitle = window; q.index = index
+        let r = try axFind(appName, q)
+        guard let el = r.els.first else { try fail("找不到要输入的元素（搜索了 \(r.visited) 个节点）", code: 4) }
+        return (el, r.app)
+    }
+    let (root, app) = try axRoot(appName)
+    guard let el = axElement(attr(root, kAXFocusedUIElementAttribute)) else {
+        try fail("\(app.localizedName ?? "应用") 没有焦点元素。先 click-el 点进输入框，或用 --role/--title 指定", code: 4)
+    }
+    if let w = window {
+        let wt = windowTitle(of: el) ?? ""
+        guard wt.localizedCaseInsensitiveContains(w) else { try fail("焦点元素在窗口「\(wt)」里，不是「\(w)」，已拒绝输入", code: 4) }
+    }
+    return (el, app)
+}
+
+/// 剪贴板快照：保存所有条目的所有类型，事后原样恢复
+func snapshotPasteboard() -> [[NSPasteboard.PasteboardType: Data]] {
+    (NSPasteboard.general.pasteboardItems ?? []).map { item in
+        var d: [NSPasteboard.PasteboardType: Data] = [:]
+        for t in item.types { if let v = item.data(forType: t) { d[t] = v } }
+        return d
+    }
+}
+func restorePasteboard(_ snap: [[NSPasteboard.PasteboardType: Data]]) {
+    let pb = NSPasteboard.general
+    pb.clearContents()
+    let items = snap.map { d -> NSPasteboardItem in
+        let it = NSPasteboardItem(); for (t, v) in d { it.setData(v, forType: t) }; return it
+    }
+    if !items.isEmpty { pb.writeObjects(items) }
+}
+
+/// 菜单路径匹配：每一级可写「编辑|Edit」多个候选；比较时忽略大小写和结尾的 … / ...
+func menuNorm(_ s: String) -> String {
+    var t = s.trimmingCharacters(in: .whitespaces).lowercased()
+    for suf in ["…", "..."] where t.hasSuffix(suf) { t = String(t.dropLast(suf.count)) }
+    return t.trimmingCharacters(in: .whitespaces)
+}
+var lastMenuWasDisabled = false
+func pressMenu(_ appName: String?, _ path: [[String]]) throws -> [String] {
+    let (root, _) = try axRoot(appName)
+    guard let bar = axElement(attr(root, kAXMenuBarAttribute)) else { try fail("这个应用没有菜单栏") }
+    var level: [AXUIElement] = children(bar)
+    var picked: [String] = []
+    for (i, cands) in path.enumerated() {
+        let want = Set(cands.map(menuNorm))
+        guard let hit = level.first(where: { el in
+            guard let t = str(el, kAXTitleAttribute) else { return false }
+            return want.contains(menuNorm(t))
+        }) else {
+            let have = level.compactMap { str($0, kAXTitleAttribute) }.filter { !$0.isEmpty }
+            try fail("菜单里找不到「\(cands.joined(separator: "|"))」。这一级有：\(have.joined(separator: "、"))", code: 4)
+        }
+        picked.append(str(hit, kAXTitleAttribute) ?? "")
+        if i == path.count - 1 {
+            // AXEnabled 可能是上次打开菜单时的旧状态（应用不在前台时尤其如此），所以只记录、仍然尝试按下
+            if let en = attr(hit, kAXEnabledAttribute) as? Bool, !en { lastMenuWasDisabled = true } else { lastMenuWasDisabled = false }
+            let r = AXUIElementPerformAction(hit, kAXPressAction as CFString)
+            guard r == .success else { try fail("按下菜单项失败: AXError \(r.rawValue)") }
+        } else {
+            // 菜单栏项 / 子菜单项的唯一子元素是 AXMenu，里面才是菜单项
+            level = children(hit).flatMap { c -> [AXUIElement] in str(c, kAXRoleAttribute) == kAXMenuRole ? children(c) : [c] }
+        }
+    }
+    return picked
+}
+func parseMenuPath(_ s: String) -> [[String]] {
+    s.components(separatedBy: ">").map { $0.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
+        .filter { !$0.isEmpty }
+}
+let menuPaste: [[String]] = [["编辑", "Edit"], ["粘贴", "Paste"]]
+let menuSelectAll: [[String]] = [["编辑", "Edit"], ["全选", "Select All"]]
+
+/// 用辅助功能直接写文字。replaceAll=false 写 AXSelectedText（在光标处插入 / 替换选中），true 写 AXValue（整体替换）
+/// 写完读回 AXValue 核对；返回 nil 表示这条路走不通
+func axWrite(_ el: AXUIElement, _ text: String, replaceAll: Bool) -> [String: Any]? {
+    let a = replaceAll ? kAXValueAttribute : kAXSelectedTextAttribute
+    guard axSettable(el, a) else { return nil }
+    let before = axStringValue(el)
+    let selLen = (attr(el, kAXSelectedTextAttribute) as? String)?.utf16.count ?? 0
+    guard AXUIElementSetAttributeValue(el, a as CFString, text as CFString) == .success else { return nil }
+    let after = axStringValue(el)
+    let verified: Bool
+    if replaceAll { verified = after == text }
+    else if let a2 = after {
+        verified = a2.contains(text) && a2.utf16.count == (before?.utf16.count ?? 0) - selLen + text.utf16.count
+    } else { verified = false }
+    return ["method": replaceAll ? "ax-value" : "ax-selected-text", "verified": verified, "length": (after ?? "").count]
+}
+/// 剪贴板 + 菜单「编辑>粘贴」：不用 cmd+v，不经过键盘事件；结束后恢复剪贴板
+func pasteWrite(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceAll: Bool) throws -> [String: Any] {
+    let snap = snapshotPasteboard()
+    defer { restorePasteboard(snap) }
+    let before = el.flatMap(axStringValue)
+    if replaceAll { _ = try pressMenu(appName, menuSelectAll); sleepMs(50) }
+    let pb = NSPasteboard.general
+    pb.clearContents(); pb.setString(text, forType: .string)
+    _ = try pressMenu(appName, menuPaste)
+    // 等应用真正读走剪贴板再恢复，否则会粘贴成旧内容
+    var verified = false
+    if let el = el {
+        let t0 = Date()
+        while Date().timeIntervalSince(t0) < 2 {
+            if let v = axStringValue(el), v != before, v.contains(text) { verified = true; break }
+            sleepMs(30)
+        }
+    } else { sleepMs(300) }
+    return ["method": "paste-menu", "verified": verified, "length": (el.flatMap(axStringValue) ?? "").count, "clipboardRestored": true]
+}
+
+/// 先试辅助功能写值，不行（或 --via paste）再走剪贴板 + 菜单粘贴
+func writeText(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceAll: Bool, via: String) throws -> [String: Any] {
+    if via != "paste", let el = el {
+        let before = axStringValue(el)
+        if let r = axWrite(el, text, replaceAll: replaceAll) {
+            // 已核对成功，或者值确实变了（不重复粘贴，避免写两遍）
+            if (r["verified"] as? Bool) == true || via == "ax" || axStringValue(el) != before { return r }
+        } else if via == "ax" {
+            try fail("这个元素不支持用辅助功能写入（\(replaceAll ? "AXValue" : "AXSelectedText") 不可写），试试 --via paste")
+        }
+    }
+    if via == "ax" { try fail("没有可写入的焦点元素") }
+    // 菜单「粘贴」要靠应用处理事件队列；键盘事件流卡住时按了也不会生效，还可能排队到以后才执行，所以自动模式下不走这条路
+    if via == "auto", !blockingKeyboardTaps().isEmpty {
+        try fail("辅助功能写入不可用，且检测到卡住的键盘监听（xyzlcu taps），剪贴板 + 菜单粘贴也不会生效。如确实要试，加 --via paste", code: 4)
+    }
+    return try pasteWrite(appName, el, text, replaceAll: replaceAll)
+}
 // MARK: - 截图
 func activeDisplays() -> [CGDirectDisplayID] {
     var n: UInt32 = 0
@@ -434,7 +591,10 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   screenshot [path] [--scale 0.5] [--display N] [--format png|jpg] [--quality 0.7] [--fast] [--cli]
              [--window "App" [--title 标题]] [--region x,y,w,h]      （--fast = jpg、质量 0.6、缩放 0.5）
   click x y [--right] [--double] | move x y | drag x1 y1 x2 y2 | scroll dx dy
-  type "文字" | key cmd+shift+4   （都可加 --app "App"：直接投递给该应用）
+  type "文字" [--via auto|events|ax|paste] | key cmd+shift+4   （都可加 --app "App"：直接投递给该应用）
+  insert "App" "文字" | settext "App" [--role R] [--title T|--id I] [--window 窗口] "文字" | value "App" [...]
+                        （辅助功能直接写值，不经过键盘事件；--via paste = 剪贴板 + 菜单「粘贴」，会恢复剪贴板）
+  menu "App" "文件>存储"   按菜单路径按下菜单项（每级可写 文件|File），键盘被卡住时代替快捷键
   apps | open "App" | activate "App" | hide "App" | windows [--all]
   displays | movewin "App" x y [--w W --h H] [--title 标题]
   ax ["App"] [--depth N] [--menu] | press "App" "按钮标题"
@@ -448,7 +608,7 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   通用选项: --delay N  事件间隔毫秒（默认 2，也可用环境变量 XYZLCU_DELAY）
   环境变量: XYZLCU_DAEMON=0 不用守护进程；=1 必须用守护进程
 """
-let version = "0.3.0"
+let version = "0.3.1"
 var inBatch = false
 let startedAt = Date()
 
@@ -463,7 +623,8 @@ case "help", "-h", "--help": emit(usage)
 case "version", "--version", "-v": emit("xyzlcu \(version)")
 case "check":
     out(["accessibility": axTrusted(), "screenRecording": screenTrusted(), "screenLocked": screenLocked(), "binary": pathOf(getpid()),
-         "responsibleProcess": responsiblePid(getpid()).map { pathOf($0) } ?? "unknown", "daemon": daemonMode])
+         "responsibleProcess": responsiblePid(getpid()).map { pathOf($0) } ?? "unknown", "daemon": daemonMode,
+         "keyboardBlockedBy": blockingKeyboardTaps()])
 case "request":
     let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     let ax = AXIsProcessTrustedWithOptions(opts)
@@ -522,14 +683,74 @@ case "scroll":
 case "type", "key":
     try guardUnlocked()
     // --app "App"：直接投递给该应用进程，不经过系统 HID 事件流（应用必须已在前台，焦点在要输入的位置）
-    if let a = option("--app") {
+    let appOpt = option("--app")
+    // --via events|ax|paste|auto：auto = 平时用键盘事件；检测到卡住的键盘监听时改用辅助功能写值（不行再剪贴板 + 菜单粘贴）
+    let via = (option("--via") ?? ProcessInfo.processInfo.environment["XYZLCU_TYPE_VIA"] ?? "auto").lowercased()
+    guard ["auto", "events", "ax", "paste"].contains(via) else { try fail("--via 只能是 auto、events、ax、paste") }
+    if cmd == "type" {
+        try need(1, "type \"文字\" [--app App] [--via auto|events|ax|paste]")
+        let text = args.joined(separator: " ")
+        var mode = via
+        var blocked: [[String: Any]] = []
+        if mode == "auto" { blocked = blockingKeyboardTaps(); mode = blocked.isEmpty ? "events" : "auto-ax" }
+        if mode != "events" {
+            let (root, app) = try axRoot(appOpt)
+            let el = axElement(attr(root, kAXFocusedUIElementAttribute))
+            if el == nil && mode != "paste" && mode != "auto-ax" { try fail("\(app.localizedName ?? "应用") 没有焦点元素，无法用辅助功能输入", code: 4) }
+            var r = try writeText(appOpt ?? app.bundleIdentifier, el, text, replaceAll: false, via: mode == "auto-ax" ? "auto" : mode)
+            if !blocked.isEmpty { r["reason"] = "检测到卡住的键盘监听: " + blocked.compactMap { ($0["process"] as? String)?.split(separator: "/").last.map(String.init) }.joined(separator: ", ") }
+            emit("ok via=\(r["method"] ?? "?") verified=\(r["verified"] ?? false)\((r["reason"] as? String).map { "（\($0)）" } ?? "")")
+            break
+        }
+    }
+    if let a = appOpt {
         guard let app = findApp(a) else { try fail("找不到应用: \(a)") }
         keyTargetPid = app.processIdentifier
     }
     defer { keyTargetPid = nil }
-    if cmd == "type" { try need(1, "type \"文字\" [--app App]"); typeText(args.joined(separator: " ")) }
-    else { try need(1, "key cmd+shift+4 [--app App]"); for (i, c) in args.enumerated() { if i > 0 { sleepMs(stepDelay) }; try pressCombo(c) } }
+    if cmd == "type" { typeText(args.joined(separator: " ")) }
+    else { try need(1, "key cmd+shift+4 [--app App]（键盘被卡住时用 menu \"App\" \"文件>存储\" 代替快捷键）"); for (i, c) in args.enumerated() { if i > 0 { sleepMs(stepDelay) }; try pressCombo(c) } }
     emit("ok")
+case "insert", "settext":
+    // insert：在焦点处插入（写 AXSelectedText）；settext：整体替换（写 AXValue）。都不经过键盘事件
+    try guardUnlocked()
+    let replaceAll = cmd == "settext"
+    let via = (option("--via") ?? "auto").lowercased()
+    guard ["auto", "ax", "paste"].contains(via) else { try fail("--via 只能是 auto、ax、paste") }
+    let role = option("--role"), subrole = option("--subrole"), title = option("--title") ?? option("--id"), win = option("--window")
+    let idx = Int(try option("--index").map(dbl) ?? 1)
+    try need(2, "\(cmd) \"App\" [--role R] [--title T|--id I] [--window 窗口标题] [--via auto|ax|paste] \"文字\"")
+    let t0 = Date()
+    let appName = args[0], text = args.dropFirst().joined(separator: " ")
+    let (el, app) = try inputTarget(appName, role: role, subrole: subrole, title: title, window: win, index: idx)
+    var r = try writeText(appName, el, text, replaceAll: replaceAll, via: via)
+    r["app"] = app.localizedName ?? ""; r["role"] = str(el, kAXRoleAttribute) ?? ""; r["window"] = windowTitle(of: el) ?? ""
+    r["ms"] = Int(Date().timeIntervalSince(t0) * 1000)
+    out(r)
+    if (r["verified"] as? Bool) != true { try fail("写入后读回的内容和预期不一致（verified=false），请用 xyzlcu value 检查", code: 1) }
+case "value":
+    // 读回元素的值（默认焦点元素），用来核对 insert / settext / type 的结果
+    let role = option("--role"), subrole = option("--subrole"), title = option("--title") ?? option("--id"), win = option("--window")
+    let idx = Int(try option("--index").map(dbl) ?? 1)
+    try need(1, "value \"App\" [--role R] [--title T|--id I] [--window 窗口标题]")
+    let (el, app) = try inputTarget(args[0], role: role, subrole: subrole, title: title, window: win, index: idx)
+    var o: [String: Any] = ["app": app.localizedName ?? "", "role": str(el, kAXRoleAttribute) ?? "", "window": windowTitle(of: el) ?? ""]
+    if let v = attr(el, kAXValueAttribute) { o["value"] = (v as? String) ?? (v as? NSNumber)?.stringValue ?? "\(v)" }
+    if let s = attr(el, kAXSelectedTextAttribute) as? String { o["selectedText"] = s }
+    out(o)
+case "menu":
+    // 按菜单路径按下菜单项（AXPress），代替 cmd+s / cmd+w 等快捷键；每级可写多个候选：编辑|Edit>粘贴|Paste
+    try guardUnlocked()
+    try need(2, "menu \"App\" \"文件>存储\"   （每级可写 文件|File）")
+    let t0 = Date()
+    let path = parseMenuPath(args.dropFirst().joined(separator: " "))
+    guard !path.isEmpty else { try fail("菜单路径为空，例如 \"文件>存储\" 或 \"File>Save\"") }
+    let picked = try pressMenu(args[0], path)
+    var o: [String: Any] = ["app": findApp(args[0])?.localizedName ?? args[0], "pressed": picked.joined(separator: ">"), "ms": Int(Date().timeIntervalSince(t0) * 1000)]
+    if lastMenuWasDisabled { o["note"] = "按下前该菜单项显示为不可用（可能是旧状态），请确认效果" }
+    let blocked = blockingKeyboardTaps()
+    if !blocked.isEmpty { o["warning"] = "检测到卡住的键盘监听，应用可能处理不了菜单动作（会排队到事件流恢复后才执行）。请确认效果" }
+    out(o)
 case "cursor":
     let p = CGEvent(source: nil)?.location ?? .zero; out(["x": Int(p.x), "y": Int(p.y)])
 case "sleep":

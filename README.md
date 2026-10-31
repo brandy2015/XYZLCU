@@ -102,7 +102,11 @@ xyzlcu whoami
 | `drag x1 y1 x2 y2` | 按住左键拖动 | `xyzlcu drag 100 100 400 400` |
 | `scroll dx dy` | 滚动，单位是行，正 dy 向上 | `xyzlcu scroll 0 -5` |
 | `cursor` | 当前鼠标位置 | `xyzlcu cursor` |
-| `type "文字" [--app "App"]` | 输入 Unicode 文本 | `xyzlcu type "你好 Hello 😀"` |
+| `type "文字" [--app "App"] [--via auto\|events\|ax\|paste]` | 输入 Unicode 文本。默认 auto：平时用键盘事件，检测到键盘被卡住时改用辅助功能写值 | `xyzlcu type "你好 Hello 😀"` |
+| `insert "App" [定位] "文字"` | 用辅助功能在焦点处插入文字（写 AXSelectedText），不经过键盘事件，写完读回核对 | `xyzlcu insert TextEdit --window 笔记 "你好"` |
+| `settext "App" [定位] "文字"` | 用辅助功能整体替换文本框内容（写 AXValue），写完读回核对 | `xyzlcu settext Safari --role AXTextField --title 搜索 "XYZLCU"` |
+| `value "App" [定位]` | 读回元素的值（默认焦点元素），用来核对输入结果 | `xyzlcu value TextEdit` |
+| `menu "App" "菜单>菜单项"` | 按菜单路径按下菜单项，代替快捷键；每级可写多个候选 `文件\|File` | `xyzlcu menu TextEdit "文件>存储"` |
 | `key 组合… [--app "App"]` | 按键 / 组合键，可以一次多个 | `xyzlcu key cmd+s` · `xyzlcu key cmd+c cmd+v` |
 | `apps` | 正在运行的图形界面应用 | `xyzlcu apps` |
 | `open "App"` | 打开应用 | `xyzlcu open "TextEdit"` |
@@ -133,6 +137,30 @@ xyzlcu whoami
 - **`run` / `batch`**：引号规则和 shell 一样（`"…"`、`'…'`、`\` 转义），`#` 开头的行是注释。默认遇到第一个出错的命令就停止，退出码同那条命令，错误信息会写明是第几步；加 `--continue-on-error` 则继续执行后面的步骤，最后返回最后一个出错步骤的退出码（全部成功为 0）。里面可以混用 `find`、`click-el`、`wait`、`sleep`。
 - **`--delay N`**：鼠标/键盘事件之间的间隔（毫秒，默认 2）。个别应用反应慢、丢字时调大，例如 `xyzlcu --delay 20 type …` 或 `XYZLCU_DELAY=20`。
 - **截图**：macOS 14+ 走 ScreenCaptureKit（进程内截图，直接按 `--scale` 输出目标尺寸；`--window` 只截那个窗口，被挡住也能截到；`--region` 只截那块区域），否则或加 `--cli` 时退回系统 `screencapture`。输出里的 `method` 字段会告诉你走的哪条路，`originX/originY` 是图片左上角的全局点坐标。
+
+## 键盘被卡住时
+
+有时系统里某个进程的键盘事件监听（event tap）卡住了：`xyzlcu type` / `key` 返回 ok，但应用里什么也没出现，连 `--app` 直接投递也没用。鼠标通常还正常。
+
+**怎么确认**：`xyzlcu check` 的 `keyboardBlockedBy` 会列出卡住的监听（主动拦截、关心按键、平均延迟超过 1 秒）。`xyzlcu taps` 显示全部细节。延迟数字一直不变，说明事件没在消化，旧按键也没有在补发。
+
+**绕开键盘事件的输入方式**（都不经过键盘事件流）：
+
+```bash
+xyzlcu insert TextEdit --window 我的笔记 "在光标处插入"         # 写 AXSelectedText
+xyzlcu settext TextEdit --role AXTextArea --window 我的笔记 "整体替换"   # 写 AXValue
+xyzlcu value TextEdit --window 我的笔记                         # 读回核对
+xyzlcu type "你好"          # 默认 --via auto：检测到键盘被卡住时自动改用辅助功能写值
+```
+
+- 定位：默认是应用当前的焦点元素；也可以用 `--role` / `--subrole` / `--title`（或 `--id`）/ `--index` 指定。`--window 标题` 会检查元素所在窗口，不对就拒绝写入，避免写错文档。
+- 每次写完都会读回 `AXValue` 核对，输出里 `verified: true` 才算成功；不一致时退出码为 1。
+- 应用不必在前台，也不会动键盘焦点以外的东西。原生 Cocoa 文本框（文本编辑、备忘录、大多数输入框）都支持；有些网页和自绘界面不支持写值，这时会报错。
+- `--via paste`：把文字放进剪贴板，再按菜单「编辑>粘贴」，结束后恢复原来的剪贴板。
+
+**快捷键的替代**：用 `menu` 按菜单项，例如 `xyzlcu menu TextEdit "文件>存储"`、`"File>Close"`、`"编辑|Edit>全选|Select All"`。找不到时会列出这一级所有菜单项。
+
+**限制**：菜单动作（`menu`、`press`、`--via paste`）要靠应用自己处理事件队列。如果事件流整体卡住，应用不处理这些动作：命令返回成功，但没有效果，并且可能排队到事件流恢复后才执行。所以检测到卡住的监听时，`menu` 输出里会带 `warning`，`--via auto` 也不会退回到粘贴。这种情况下只有 `insert` / `settext` / `type --via ax` 能立刻生效。要真正修好，需要重启卡住的进程（`xyzlcu taps` 里延迟巨大的那个）或者注销/重启。XYZLCU 不会替你结束系统进程。
 
 ## 守护进程
 
