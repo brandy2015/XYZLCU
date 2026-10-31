@@ -2,11 +2,41 @@
 
 [中文](README.md) | **English**
 
+[![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#requirements) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest)
+
 **XYZLCU (XYZ Local Computer Use)** is a dependency-free macOS GUI control CLI. Anything that can run shell commands, whether an AI agent (Claude Code, Codex, any shell-capable agent) or your own script, can use it to see the screen, click, type, press shortcuts, read the UI structure and press buttons. It is one Swift source file (built as `xyzlcu-core`) plus a tiny C client (`xyzlcu`): no Python, no Node, no Homebrew, no third-party libraries.
 
 > **General-purpose, not tied to any agent.** XYZLCU is a plain command-line program: any agent that can run shell commands and read JSON output can use it directly (Grok Bot, Claude Code, Codex CLI, Cursor, Gemini CLI, Cline / Roo, Aider, OpenClaw, OpenCode, Trae, …), with no plugin or adapter layer. MCP-only clients can use the built-in `xyzlcu mcp`. It works without an agent too: shell scripts, Shortcuts, cron / launchd. See [Supported agents](#supported-agents).
 
 > Inspired by and borrows ideas from [LCU (Local Computer Use)](https://github.com/amontlabs/lcu) by Amont Labs, with thanks (see [Acknowledgements](#acknowledgements)). XYZLCU is an **independent implementation**: it copies no LCU code and does **not** need the ChatGPT / Codex desktop app or its runtime. For a speed and usability comparison with LCU, see [Benchmark](#benchmark-vs-lcu).
+
+## Why XYZLCU (highlights)
+
+All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see [Benchmark](#benchmark-vs-lcu) for the method and full data. The LCU numbers come from the 0.4.2 round on the same machine (LCU 0.13.4). LCU does some things better than XYZLCU too, and those are listed in [Benchmark](#benchmark-vs-lcu) as well.
+
+- ⚡ **Fast**: with the daemon running, `xyzlcu` is a tiny C program, about **3 ms** per call.
+
+  | Operation | XYZLCU | LCU |
+  |---|---:|---:|
+  | Click | **6 ms** | 140 ms |
+  | Type `abc` | **5 ms** | 43 ms |
+  | Type Chinese `你好abc` | **7 ms** | ~9 s |
+  | Key press | **4 ms** | 14 ms |
+  | Window screenshot | **6 ms** (first one ~25 ms) | 51 ms |
+  | List apps | **3 ms** | 17 ms |
+
+- 🧠 **In-memory and diff screenshots**: `--base64` / `--stdout` produce the image in memory, with no file written, and a `--fast` half-size JPEG takes about **9 ms**. `--diff` returns only the region that changed; if nothing changed you get a short JSON reply (3–4 ms, no image), which suits agents that keep taking a quick look.
+- 🛣 **Typing works even when the keyboard is stuck**: the event stream is probed for real every time. If it is stuck, typing falls back automatically: AX value write → posting to the process → paste via the menu. Shortcuts first look for the matching menu-bar item. Every path is **read back and verified**, and the next path is tried only if nothing landed. If the field cannot be read back, it stays on the current path, so **the same text is never typed twice**. The output says which path was actually used.
+- 🔌 **Works with any agent**: anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node programs, and shell scripts. See [Supported agents](#supported-agents).
+- 🪙 **Saves tokens**: `ax --compact` lists only actionable controls, one per line with a number and a center point; `click-el --ref N` then presses by number. Finder's control tree with the menu bar goes from **13.7 KB to 0.4 KB**, and a TextEdit window from 740 to 243 bytes.
+- 🧰 **Full feature set**: mouse position and movement, drag, scroll, full-screen / window / region screenshots, the window list, moving and resizing windows, the display list, pressing menus in the background, the control tree and pressing controls, waiting for a control to appear, and record / replay. LCU on the Mac has no mouse position or movement, no full-screen screenshots and no window list.
+- 🔒 **Safety**:
+  - Mouse and keyboard actions are refused while the screen is locked, so nothing gets typed into the lock-screen password field.
+  - The recorder only listens and never intercepts input; it skips keystrokes while Secure Input (password fields) is on or the screen is locked.
+  - No anti-detection: it does not pretend to be a human and does not get around CAPTCHAs or bot detection.
+- 🏠 **Privacy**: local only, with **no network access and no telemetry**. The only socket in the code is the daemon's local Unix socket, and the only programs it runs are the system's own `screencapture` (the macOS 13 fallback) and `open` (to launch apps). Recordings are saved locally with permissions 0600.
+- 📦 **No dependencies**: two files (`xyzlcu` + `xyzlcu-core`), universal binaries for Apple Silicon and Intel, macOS 13+. No ChatGPT desktop app, Python, Node, Homebrew or third-party libraries needed.
+- 📖 **Open source**: MIT licensed, with Chinese and English docs and the benchmark scripts in `scripts/`, so you can reproduce the results.
 
 ## Features
 
@@ -440,6 +470,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 - When the client asks whether to allow a tool, decide by how much you trust it; the action tools (`click`, `type_text`, `key`, …) really operate your computer.
 
 ## Benchmark (vs LCU)
+
+**Where LCU still has the edge** (up front):
+
+- **Background operation**: LCU clicks and types without moving the real mouse or bringing the app to the front, so you can keep using the computer. XYZLCU's `click` / `type` really move the mouse and need the app in front. XYZLCU's paths that leave the foreground alone are `click-el` (AXPress), `type --app`, `menu` and `insert` / `settext`, but not every app supports them.
+- **Working with the model**: LCU sits on ChatGPT's CUA runtime, organizes actions per app, and is more tightly integrated with ChatGPT / Codex. The tables below compare single-operation latency only, not the ability to finish a whole task.
 
 ### 0.6.0 vs 0.5.0
 

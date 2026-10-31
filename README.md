@@ -2,11 +2,41 @@
 
 **中文** | [English](README.en.md)
 
+[![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#系统要求) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#系统要求) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest)
+
 **XYZLCU（XYZ Local Computer Use）** 是一个零依赖的 macOS 图形界面控制命令行工具。只要能执行 shell 命令，不管是 AI 智能体（Claude Code、Codex、任何会跑命令的 Agent）还是你自己写的脚本，就能看屏幕、点鼠标、打字、按快捷键、读取界面结构并按下按钮。整个工具是一个 Swift 源文件（编译成 `xyzlcu-core`）加一个几十行的 C 小客户端（`xyzlcu`），不用 Python、Node、Homebrew，也不需要任何第三方库。
 
 > **通用，不绑定任何智能体。** XYZLCU 就是一个普通的命令行程序：任何能执行 shell 命令、能读 JSON 输出的智能体都能直接用（Grok Bot、Claude Code、Codex CLI、Cursor、Gemini CLI、Cline / Roo、Aider、OpenClaw、OpenCode、Trae……），不需要专门的插件或适配层；只支持 MCP 的客户端可以用内置的 `xyzlcu mcp`。不用智能体也行：shell 脚本、快捷指令、cron / launchd 一样能调。见[支持的智能体](#支持的智能体)。
 
 > 借鉴自 Amont Labs 的 [LCU（Local Computer Use）](https://github.com/amontlabs/lcu)，在此致谢（见[致谢](#致谢)）。XYZLCU 是**独立实现**：没有复制 LCU 的代码，也**不需要 ChatGPT / Codex** 桌面应用或其运行时。和 LCU 的速度、用法对比见[性能对比](#性能对比与-lcu)。
+
+## 为什么选 XYZLCU（核心优势）
+
+下面的数字都是在同一台 Apple Silicon Mac（macOS 26+）上实测的中位数，测法和完整数据见[性能对比](#性能对比与-lcu)。LCU 的数字是 0.4.2 那一轮在同一台机器上测的（LCU 0.13.4）。LCU 也有比 XYZLCU 强的地方，同样写在[性能对比](#性能对比与-lcu)里。
+
+- ⚡ **快**：开着守护进程时，`xyzlcu` 是一个很小的 C 程序，一次调用约 **3 毫秒**。
+
+  | 操作 | XYZLCU | LCU |
+  |---|---:|---:|
+  | 点击 | **6 毫秒** | 140 毫秒 |
+  | 输入英文 `abc` | **5 毫秒** | 43 毫秒 |
+  | 输入中文 `你好abc` | **7 毫秒** | 约 9 秒 |
+  | 按键 | **4 毫秒** | 14 毫秒 |
+  | 窗口截图 | **6 毫秒**（第一次约 25 毫秒） | 51 毫秒 |
+  | 列出应用 | **3 毫秒** | 17 毫秒 |
+
+- 🧠 **截图不落盘、只看变化**：`--base64` / `--stdout` 直接在内存里出图，`--fast` 半尺寸 JPEG 约 **9 毫秒**。`--diff` 只返回变化的那一块，画面没变时只回一小段 JSON（3–4 毫秒，没有图片），适合智能体反复「看一眼」。
+- 🛣 **键盘卡住也能打字**：每次先实测事件流。卡住时自动换路：辅助功能写值 → 直接投递给进程 → 菜单粘贴；快捷键先找菜单栏里对应的菜单项。每条路都**读回核对**，没生效才换下一条。读不到内容、没法核对时就停在当前这条路，**不会把同一段文字打两遍**。输出里写明实际走的是哪条路。
+- 🔌 **不挑智能体**：能跑 shell 命令就能用，只认 MCP 的客户端用内置的 `xyzlcu mcp`。已实测：Grok Bot、Codex CLI、OpenCode、MCP 客户端（完整握手）、Python / Node 程序、shell 脚本。见[支持的智能体](#支持的智能体)。
+- 🪙 **省 token**：`ax --compact` 只列可以操作的控件，一行一个，带编号和中心点；再用 `click-el --ref N` 按编号点。访达加菜单栏的控件树 **13.7 KB → 0.4 KB**，文本编辑窗口 740 → 243 字节。
+- 🧰 **功能全**：鼠标位置和移动、拖拽、滚动、整屏 / 窗口 / 区域截图、窗口列表、移动和调整窗口、显示器列表、后台按菜单、控件树和按控件、等控件出现、录制和回放。LCU 在 Mac 上没有鼠标位置 / 移动、整屏截图和窗口列表这几项。
+- 🔒 **安全**：
+  - 锁屏时拒绝键鼠操作，防止把字打进锁屏密码框。
+  - 录制器只监听、不拦截输入；安全输入（密码框）开启时和锁屏时不录按键。
+  - 不做反检测：不伪装成真人，不绕过验证码或机器人检测。
+- 🏠 **隐私**：只在本机运行，**不联网、没有遥测**。代码里唯一的套接字是守护进程本机的 Unix 套接字；只会调用系统自带的 `screencapture`（macOS 13 退回用）和 `open`（打开应用）。录制文件权限 0600，只存本机。
+- 📦 **零依赖**：两个文件（`xyzlcu` + `xyzlcu-core`），通用二进制，Apple Silicon 和 Intel 都能跑，macOS 13+。不需要 ChatGPT 桌面应用，也不需要 Python、Node、Homebrew 或任何第三方库。
+- 📖 **开源**：MIT 许可，中英文文档，测速脚本在 `scripts/`，结果可以自己复现。
 
 ## 功能
 
@@ -440,6 +470,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 - 客户端问是否允许调用某个工具时，按你对它的信任来选；操作类工具（`click`、`type_text`、`key` 等）会真的操作你的电脑。
 
 ## 性能对比（与 LCU）
+
+**LCU 仍然占优的地方**（先说清楚）：
+
+- **后台操作**：LCU 点击和输入不移动真实鼠标、不把应用切到前台，用户可以同时用电脑。XYZLCU 的 `click` / `type` 会真的移动鼠标、需要应用在前台；不抢前台的路有 `click-el`（AXPress）、`type --app`、`menu`、`insert` / `settext`，但不是每个应用都支持。
+- **和模型的配合**：LCU 背后是 ChatGPT 的 CUA 运行时，按应用组织操作，和 ChatGPT / Codex 配合得更紧。下面的表只比单个操作的延迟，不代表完成整个任务的能力。
 
 ### 0.6.0 对比 0.5.0
 
