@@ -142,15 +142,66 @@ func typeText(_ text: String) {
 }
 
 // MARK: - 应用 / 窗口
-func findAppOnce(_ name: String) -> NSRunningApplication? {
-    let l = name.lowercased()
-    let apps = NSWorkspace.shared.runningApplications
-    func fileName(_ a: NSRunningApplication) -> String { a.bundleURL?.deletingPathExtension().lastPathComponent.lowercased() ?? "" }
-    return apps.first { $0.localizedName?.lowercased() == l || $0.bundleIdentifier?.lowercased() == l || fileName($0) == l }
-        ?? apps.first { ($0.localizedName?.lowercased().contains(l) ?? false) && $0.activationPolicy == .regular }
+/// NSWorkspace.runningApplications 每次（runloop 转过之后）都返回新的 NSRunningApplication 对象，
+/// 对每个对象读第一个属性（连 processIdentifier 都算）都要向 LaunchServices 发一次同步 XPC：140 个进程约 8–15 毫秒。
+/// 所以守护进程自己维护一张应用表：最多 10 秒整体刷新一次，中间靠启动 / 退出 / 激活 / 隐藏通知更新。
+/// 表里找不到时（比如刚启动的后台进程）再整体扫一遍。
+struct AppMeta { let name: String?; let bid: String?; let lname: String; let lbid: String; let file: String }
+struct AppEntry { let app: NSRunningApplication; let pid: pid_t; let meta: AppMeta; var regular: Bool; var hidden: Bool; let order: Int }
+var appTable: [pid_t: AppEntry] = [:], appTableAt = Date.distantPast, appOrder = 0
+var appObservers: [NSObjectProtocol] = []
+func makeMeta(_ a: NSRunningApplication) -> AppMeta {
+    let n = a.localizedName, b = a.bundleIdentifier
+    return AppMeta(name: n, bid: b, lname: n?.lowercased() ?? "", lbid: b?.lowercased() ?? "",
+                   file: a.bundleURL?.deletingPathExtension().lastPathComponent.lowercased() ?? "")
 }
-func appInfo(_ a: NSRunningApplication) -> [String: Any] {
-    ["name": a.localizedName ?? "", "bundleId": a.bundleIdentifier ?? "", "pid": Int(a.processIdentifier), "active": a.isActive, "hidden": a.isHidden]
+func makeEntry(_ a: NSRunningApplication) -> AppEntry {
+    let r = a.activationPolicy == .regular
+    appOrder += 1
+    return AppEntry(app: a, pid: a.processIdentifier, meta: makeMeta(a), regular: r, hidden: r && a.isHidden, order: appOrder)
+}
+/// 当前所有进程（守护进程里走缓存表；force 时整体刷新）
+func appEntries(force: Bool = false) -> [AppEntry] {
+    if !daemonMode { appOrder = 0; return NSWorkspace.shared.runningApplications.map(makeEntry) }
+    if force || Date().timeIntervalSince(appTableAt) > 10 {
+        appOrder = 0; var t: [pid_t: AppEntry] = [:]
+        for a in NSWorkspace.shared.runningApplications { let e = makeEntry(a); if e.pid > 0 { t[e.pid] = e } }
+        appTable = t; appTableAt = Date()
+    }
+    return appTable.values.sorted { $0.order < $1.order }
+}
+func appMeta(_ a: NSRunningApplication) -> AppMeta {
+    if daemonMode, let e = appTable[a.processIdentifier] { return e.meta }
+    return makeMeta(a)
+}
+extension NSRunningApplication {
+    var xName: String? { appMeta(self).name }
+    var xBundleId: String? { appMeta(self).bid }
+}
+/// 守护进程启动时调用：用 NSWorkspace 通知维护应用表
+func watchApps() {
+    let nc = NSWorkspace.shared.notificationCenter
+    func app(_ n: Notification) -> NSRunningApplication? { n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
+    func upsert(_ n: Notification) { if let a = app(n) { let e = makeEntry(a); if e.pid > 0 { appTable[e.pid] = e } } }
+    appObservers.append(nc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil) { n in
+        if let a = app(n) { appTable[a.processIdentifier] = nil } })
+    // 启动、激活（菜单栏应用打开窗口变成普通应用通常伴随激活）：重新读这一个应用
+    appObservers.append(nc.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: nil, using: upsert))
+    appObservers.append(nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil, using: upsert))
+    appObservers.append(nc.addObserver(forName: NSWorkspace.didHideApplicationNotification, object: nil, queue: nil) { n in
+        if let a = app(n) { appTable[a.processIdentifier]?.hidden = true } })
+    appObservers.append(nc.addObserver(forName: NSWorkspace.didUnhideApplicationNotification, object: nil, queue: nil) { n in
+        if let a = app(n) { appTable[a.processIdentifier]?.hidden = false } })
+}
+func findAppOnce(_ name: String, force: Bool = false) -> NSRunningApplication? {
+    let l = name.lowercased()
+    let es = appEntries(force: force)
+    if let e = es.first(where: { $0.meta.lname == l || $0.meta.lbid == l || $0.meta.file == l }) { return e.app }
+    if let e = es.first(where: { $0.regular && $0.meta.lname.contains(l) }) { return e.app }
+    return nil
+}
+func appInfo(_ e: AppEntry, front: pid_t) -> [String: Any] {
+    ["name": e.meta.name ?? "", "bundleId": e.meta.bid ?? "", "pid": Int(e.pid), "active": e.pid == front, "hidden": e.hidden]
 }
 
 // MARK: - 辅助功能树
@@ -174,18 +225,69 @@ func label(_ el: AXUIElement) -> String {
     [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, "AXIdentifier", kAXHelpAttribute]
         .compactMap { str(el, $0) }.first ?? ""
 }
+/// 一次 IPC 取一个节点要显示的全部属性（原来每个属性一次，一个节点 9 次）
+let dumpAttrs = [kAXRoleAttribute, kAXSubroleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, "AXIdentifier",
+                 kAXPositionAttribute, kAXSizeAttribute, kAXChildrenAttribute] as CFArray
+struct AXNode { var role: String; var sub: String?; var texts: [String?]; var frame: [String: Int]?; var kids: [AXUIElement] }
+func axNode(_ el: AXUIElement) -> AXNode? {
+    var raw: CFArray?
+    guard AXUIElementCopyMultipleAttributeValues(el, dumpAttrs, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
+          let v = raw as? [AnyObject], v.count == 9 else { return nil }
+    var f: [String: Int]? = nil
+    if let pv = v[6] as AnyObject?, let sv = v[7] as AnyObject?, CFGetTypeID(pv) == AXValueGetTypeID(), CFGetTypeID(sv) == AXValueGetTypeID(),
+       AXValueGetType(pv as! AXValue) == .cgPoint, AXValueGetType(sv as! AXValue) == .cgSize {
+        var p = CGPoint.zero, z = CGSize.zero
+        AXValueGetValue(pv as! AXValue, .cgPoint, &p); AXValueGetValue(sv as! AXValue, .cgSize, &z)
+        f = ["x": Int(p.x), "y": Int(p.y), "w": Int(z.width), "h": Int(z.height)]
+    }
+    return AXNode(role: axs(clean(v[0])) ?? "?", sub: axs(clean(v[1])), texts: [v[2], v[3], v[4], v[5]].map { axs(clean($0)) },
+                  frame: f, kids: (clean(v[8]) as? [AXUIElement]) ?? [])
+}
+func short(_ s: String, _ n: Int = 80) -> String {
+    let t = s.replacingOccurrences(of: "\n", with: " ")
+    return t.count > n ? String(t.prefix(n)) + "…" : t
+}
 func dump(_ el: AXUIElement, depth: Int, max: Int, indent: String = "", count: inout Int) {
     if count > 3000 { return }
     count += 1
-    let role = str(el, kAXRoleAttribute) ?? "?"
-    var line = indent + role
-    if let sub = str(el, kAXSubroleAttribute) { line += "(\(sub))" }
-    for (k, a) in [("title", kAXTitleAttribute), ("desc", kAXDescriptionAttribute), ("value", kAXValueAttribute), ("id", "AXIdentifier")] {
-        if var s = str(el, a) { if s.count > 80 { s = String(s.prefix(80)) + "…" }; line += " \(k)=\"\(s.replacingOccurrences(of: "\n", with: " "))\"" }
-    }
-    if let f = frame(el) { line += " [\(f["x"]!),\(f["y"]!) \(f["w"]!)x\(f["h"]!)]" }
+    guard let n = axNode(el) else { emit(indent + "?"); return }
+    var line = indent + n.role
+    if let sub = n.sub { line += "(\(sub))" }
+    for (k, t) in zip(["title", "desc", "value", "id"], n.texts) { if let s = t { line += " \(k)=\"\(short(s))\"" } }
+    if let f = n.frame { line += " [\(f["x"]!),\(f["y"]!) \(f["w"]!)x\(f["h"]!)]" }
     emit(line)
-    if depth < max { for c in children(el) { dump(c, depth: depth + 1, max: max, indent: indent + "  ", count: &count) } }
+    if depth < max { for c in n.kids { dump(c, depth: depth + 1, max: max, indent: indent + "  ", count: &count) } }
+}
+// MARK: - 精简树：只列可以操作的控件，每个带编号；click-el --ref 编号 直接按（编号在守护进程里保留到下一次 ax --compact）
+let interactiveRoles: Set<String> = ["AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXComboBox", "AXTextField",
+    "AXTextArea", "AXSearchField", "AXSecureTextField", "AXSlider", "AXLink", "AXMenuItem", "AXMenuBarItem", "AXTab", "AXDisclosureTriangle",
+    "AXIncrementor", "AXStepper", "AXColorWell", "AXSwitch", "AXToggle", "AXDateField", "AXRow"]
+var axRefs: [AXUIElement] = []
+var axRefsPid: pid_t = 0
+func compactDump(_ roots: [AXUIElement], maxDepth: Int, maxItems: Int, withText: Bool = false) -> (lines: [String], visited: Int) {
+    var lines: [String] = [], visited = 0
+    var stack: [(AXUIElement, Int)] = roots.reversed().map { ($0, 0) }
+    while let (el, d) = stack.popLast(), visited < 5000, lines.count < maxItems {
+        visited += 1
+        guard let n = axNode(el) else { continue }
+        // 隐藏 / 零尺寸的控件不列（看不见也点不到）
+        let visible = n.frame.map { $0["w"]! > 0 && $0["h"]! > 0 } ?? false
+        let hasText = n.texts.contains { $0 != nil }
+        if visible && interactiveRoles.contains(n.role) && (n.role != "AXRow" || hasText) {
+            axRefs.append(el)
+            var line = "[\(axRefs.count)] \(n.role.dropFirst(2))"
+            if let sub = n.sub, sub != "AXStandardWindow" { line += "(\(sub.dropFirst(2)))" }
+            let label = n.texts[0] ?? n.texts[1] ?? n.texts[3]
+            if let l = label { line += " \"\(short(l, 60))\"" }
+            if let v = n.texts[2], v != label { line += " =\"\(short(v, 40))\"" }
+            if let f = n.frame { line += " @\(f["x"]! + f["w"]! / 2),\(f["y"]! + f["h"]! / 2)" }
+            lines.append(line)
+        } else if withText && visible && n.role == "AXStaticText", let t = n.texts[2] ?? n.texts[0] {
+            lines.append("  \"\(short(t, 80))\"")
+        }
+        if d < maxDepth && !(n.role == "AXMenuBarItem" || n.role == "AXMenuItem") { for c in n.kids.reversed() { stack.append((c, d + 1)) } }
+    }
+    return (lines, visited)
 }
 func axRoot(_ appName: String?) throws -> (AXUIElement, NSRunningApplication) {
     guard axTrusted() else { try fail("没有辅助功能权限，先运行 xyzlcu check / xyzlcu request", code: 2) }
@@ -195,15 +297,6 @@ func axRoot(_ appName: String?) throws -> (AXUIElement, NSRunningApplication) {
     let ax = AXUIElementCreateApplication(app.processIdentifier)
     AXUIElementSetMessagingTimeout(ax, 3)
     return (ax, app)
-}
-func findElement(_ el: AXUIElement, _ target: String, depth: Int = 0) -> AXUIElement? {
-    if depth > 40 { return nil }
-    let t = target.lowercased()
-    for a in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute, "AXIdentifier"] {
-        if let s = str(el, a), s.lowercased() == t { return el }
-    }
-    for c in children(el) { if let r = findElement(c, target, depth: depth + 1) { return r } }
-    return nil
 }
 
 /// 守护进程里应用列表靠主 runloop 更新；找不到时让 runloop 转一下再找一次
@@ -217,7 +310,7 @@ func drainRunLoop() {
 }
 func findApp(_ name: String) -> NSRunningApplication? {
     if let a = findAppOnce(name) { return a }
-    if daemonMode { pumpRunLoop(); return findAppOnce(name) }
+    if daemonMode { pumpRunLoop(); return findAppOnce(name, force: true) }
     return nil
 }
 
@@ -295,7 +388,7 @@ func axFind(_ appName: String?, _ q: Query) throws -> (matches: [[String: Any]],
     return (matches, els, visited, app)
 }
 func findOutput(_ r: (matches: [[String: Any]], els: [AXUIElement], visited: Int, app: NSRunningApplication), all: Bool, t0: Date, extra: [String: Any] = [:]) {
-    var o: [String: Any] = ["app": r.app.localizedName ?? "", "pid": Int(r.app.processIdentifier), "visited": r.visited, "ms": Int(Date().timeIntervalSince(t0) * 1000)]
+    var o: [String: Any] = ["app": r.app.xName ?? "", "pid": Int(r.app.processIdentifier), "visited": r.visited, "ms": Int(Date().timeIntervalSince(t0) * 1000)]
     if all { o["matches"] = r.matches } else { o.merge(r.matches[0]) { a, _ in a } }
     o.merge(extra) { a, _ in a }
     out(o)
@@ -425,7 +518,7 @@ func inputTarget(_ appName: String?, role: String?, subrole: String?, title: Str
     }
     let (root, app) = try axRoot(appName)
     guard let el = axElement(attr(root, kAXFocusedUIElementAttribute)) else {
-        try fail("\(app.localizedName ?? "应用") 没有焦点元素。先 click-el 点进输入框，或用 --role/--title 指定", code: 4)
+        try fail("\(app.xName ?? "应用") 没有焦点元素。先 click-el 点进输入框，或用 --role/--title 指定", code: 4)
     }
     if let w = window {
         let wt = windowTitle(of: el) ?? ""
@@ -577,7 +670,7 @@ func typeChain(_ appOpt: String?, _ text: String, via: String, window: String? =
         let wt = el.flatMap(windowTitle(of:)) ?? ""
         guard el != nil, wt.localizedCaseInsensitiveContains(w) else { try fail("焦点元素在窗口「\(wt)」里，不是「\(w)」，已拒绝输入", code: 4) }
     }
-    let appKey = app.bundleIdentifier ?? app.localizedName ?? ""
+    let appKey = app.xBundleId ?? app.xName ?? ""
     var order: [String]
     if via == "auto" {
         order = []
@@ -587,7 +680,7 @@ func typeChain(_ appOpt: String?, _ text: String, via: String, window: String? =
     } else { order = [via] }
     var tried: [[String: Any]] = []
     func result(_ path: String, _ verified: Any, _ extra: [String: Any] = [:]) -> [String: Any] {
-        var o: [String: Any] = ["ok": true, "path": path, "verified": verified, "app": app.localizedName ?? "", "pid": Int(app.processIdentifier),
+        var o: [String: Any] = ["ok": true, "path": path, "verified": verified, "app": app.xName ?? "", "pid": Int(app.processIdentifier),
                                 "role": role, "eventsHealthy": h.keyboardOK, "tried": tried]
         if let el = el, let w = windowTitle(of: el) { o["window"] = w }
         if !h.keyboardOK { o["blockedBy"] = h.blockerNames }
@@ -600,7 +693,7 @@ func typeChain(_ appOpt: String?, _ text: String, via: String, window: String? =
         switch p {
         case "ax":
             guard let el = el else {
-                if via == "ax" { try fail("\(app.localizedName ?? "应用") 没有焦点元素，无法用辅助功能输入", code: 4) }
+                if via == "ax" { try fail("\(app.xName ?? "应用") 没有焦点元素，无法用辅助功能输入", code: 4) }
                 tried.append(["path": "ax", "result": "没有焦点元素"]); continue
             }
             if let r = axWrite(el, text, replaceAll: false) {
@@ -696,7 +789,7 @@ func keyChain(_ appOpt: String?, _ combos: [String], via: String) throws -> [Str
                     let r = AXUIElementPerformAction(el, kAXPressAction as CFString)
                     if r == .success { done = ["key": c, "path": "menu", "menuItem": path, "enabledBefore": enabled] }
                     else { tried.append(["path": "menu", "menuItem": path, "result": "AXPress 失败: AXError \(r.rawValue)"]) }
-                } else { tried.append(["path": "menu", "result": "\(app.localizedName ?? "应用") 的菜单栏里没有快捷键为 \(c) 的菜单项"]) }
+                } else { tried.append(["path": "menu", "result": "\(app.xName ?? "应用") 的菜单栏里没有快捷键为 \(c) 的菜单项"]) }
             case "pid":
                 keyTargetPid = app.processIdentifier
                 postCombo(k, f); keyTargetPid = nil
@@ -711,7 +804,7 @@ func keyChain(_ appOpt: String?, _ combos: [String], via: String) throws -> [Str
         if !tried.isEmpty { d["tried"] = tried }
         results.append(d)
     }
-    var o: [String: Any] = ["ok": true, "app": app.localizedName ?? "", "pid": Int(app.processIdentifier), "eventsHealthy": h.keyboardOK, "keys": results]
+    var o: [String: Any] = ["ok": true, "app": app.xName ?? "", "pid": Int(app.processIdentifier), "eventsHealthy": h.keyboardOK, "keys": results]
     if !h.keyboardOK { o["blockedBy"] = h.blockerNames }
     if let ov = h.override { o["healthOverride"] = ov }
     return o
@@ -721,7 +814,7 @@ func setMainWindow(_ appName: String, _ title: String) throws -> String {
     let (root, app) = try axRoot(appName)
     let wins = (attr(root, kAXWindowsAttribute) as? [AXUIElement]) ?? []
     guard let w = wins.first(where: { (str($0, kAXTitleAttribute) ?? "").localizedCaseInsensitiveContains(title) }) else {
-        try fail("\(app.localizedName ?? appName) 没有标题含「\(title)」的窗口", code: 4)
+        try fail("\(app.xName ?? appName) 没有标题含「\(title)」的窗口", code: 4)
     }
     AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
     AXUIElementSetAttributeValue(w, kAXFocusedAttribute as CFString, kCFBooleanTrue)
@@ -1296,22 +1389,63 @@ func captureCLI(_ extra: [String], tmp: String) -> CGImage? {
     // 立即解码，否则 defer 删掉临时文件后图像会是全黑
     return CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
 }
-/// 找应用最前面的普通窗口（可按标题过滤）
+/// 找应用最前面的普通窗口（可按标题过滤）。appName 是 "#窗口号" 时按 windows 列出的 id 找。
+/// 顺便判断窗口有没有被别的窗口挡住（lastWindowClear）：没挡住就能直接从主屏常驻流里裁出来，不用单独截窗口
+var lastWindowClear = false
 func appWindow(_ appName: String, title: String?) throws -> (CGWindowID, CGRect, String) {
-    guard let app = findApp(appName) else { try fail("找不到应用: \(appName)") }
-    let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
-    for w in list where (w[kCGWindowOwnerPID as String] as? Int) == Int(app.processIdentifier) && (w[kCGWindowLayer as String] as? Int ?? 0) == 0 {
-        let t = w[kCGWindowName as String] as? String ?? ""
-        if let want = title, !t.localizedCaseInsensitiveContains(want) { continue }
-        let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
-        let r = CGRect(x: b["X"] as? Double ?? 0, y: b["Y"] as? Double ?? 0, width: b["Width"] as? Double ?? 0, height: b["Height"] as? Double ?? 0)
-        if r.width < 2 || r.height < 2 { continue }
-        return (CGWindowID(w[kCGWindowNumber as String] as? Int ?? 0), r, t)
+    lastWindowClear = false
+    let byId: Int? = appName.hasPrefix("#") ? Int(appName.dropFirst()) : nil
+    var pid: Int = -1, label = appName
+    if byId == nil {
+        guard let app = findApp(appName) else { try fail("找不到应用: \(appName)") }
+        pid = Int(app.processIdentifier); label = app.xName ?? appName
     }
-    try fail("\(app.localizedName ?? appName) 没有可见窗口" + (title.map { "（标题含 \($0)）" } ?? ""))
+    let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+    func bounds(_ w: [String: Any]) -> CGRect {
+        let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
+        return CGRect(x: b["X"] as? Double ?? 0, y: b["Y"] as? Double ?? 0, width: b["Width"] as? Double ?? 0, height: b["Height"] as? Double ?? 0)
+    }
+    for (i, w) in list.enumerated() {
+        let num = w[kCGWindowNumber as String] as? Int ?? 0
+        if let id = byId { if num != id { continue } }
+        else {
+            guard (w[kCGWindowOwnerPID as String] as? Int) == pid && (w[kCGWindowLayer as String] as? Int ?? 0) == 0 else { continue }
+            if let want = title, !(w[kCGWindowName as String] as? String ?? "").localizedCaseInsensitiveContains(want) { continue }
+        }
+        let t = w[kCGWindowName as String] as? String ?? ""
+        let r = bounds(w)
+        if r.width < 2 || r.height < 2 { if byId != nil { break }; continue }
+        // 前面（列表里更靠前）的窗口和它有重叠就算挡住；铺满整块屏幕的非普通层窗口（程序坞、全屏透明覆盖层）不算
+        let screens = activeDisplays().map { CGDisplayBounds($0) }
+        lastWindowClear = !list.prefix(i).contains { o in
+            let ob = bounds(o)
+            guard ob.width >= 1, ob.height >= 1, ob.intersects(r), (o[kCGWindowAlpha as String] as? Double ?? 1) > 0.01 else { return false }
+            if (o[kCGWindowLayer as String] as? Int ?? 0) != 0 && screens.contains(ob) { return false }
+            return true
+        }
+        return (CGWindowID(num), r, t)
+    }
+    if let id = byId { try fail("没有 id 为 \(id) 的可见窗口（见 xyzlcu windows）") }
+    try fail("\(label) 没有可见窗口" + (title.map { "（标题含 \($0)）" } ?? ""))
+}
+/// 窗口没被挡住、整个在某块屏幕里、那块屏幕有常驻流：直接从流的最新一帧裁出窗口（几毫秒，不用另开窗口流）。
+/// 和单独截窗口的差别：圆角外面是桌面而不是透明。XYZLCU_WINDOW_CROP=0 关闭。
+func cropFromDisplayStream(_ r: CGRect) -> CGImage? {
+    guard #available(macOS 14.0, *), lastWindowClear, streamsEnabled, ProcessInfo.processInfo.environment["XYZLCU_WINDOW_CROP"] != "0" else { return nil }
+    guard let did = activeDisplays().first(where: { CGDisplayBounds($0).contains(r) }) else { return nil }
+    let b = CGDisplayBounds(did), key = liveKeyOf(.display(did)).0
+    guard liveStreams[key] != nil, let img = liveFrame(key, rect: b) else { return nil }
+    let pps = Double(img.width) / b.width
+    let px = CGRect(x: ((r.minX - b.minX) * pps).rounded(), y: ((r.minY - b.minY) * pps).rounded(),
+                    width: (r.width * pps).rounded(), height: (r.height * pps).rounded())
+    return img.cropping(to: px)
 }
 func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, window: (String, String?)?, format: ImgFormat, quality: Double, forceCLI: Bool,
                 base64: Bool = false, toStdout: Bool = false, timing: Bool = false, diff: Bool = false) throws {
+    // 一次回复只有一段二进制：run / batch 里第二张 --stdout 图会把第一张覆盖掉，明确报错
+    if toStdout && inBatch && (binOut != nil || binMeta != nil) {
+        try fail("一次 run / batch 只能有一张 --stdout 图像；多张请给每张 -o 文件，或用 MCP 的 batch 工具（每张图分开返回）")
+    }
     let t0 = Date(); var marks: [String: Int] = [:]
     func mark(_ k: String) { marks[k] = Int(Date().timeIntervalSince(t0) * 1000) }
     let displays = activeDisplays()
@@ -1338,7 +1472,10 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
     var img: CGImage? = nil
     lastCaptureMethod = nil
     mark("resolved")
-    if !forceCLI && screenTrusted(), let (i, _) = captureSCK(target, scale: s) { img = i; method = lastCaptureMethod ?? method }
+    if !forceCLI, case .window(_, let wr) = target, screenTrusted(), let c = cropFromDisplayStream(wr) {
+        img = abs(s - 1) > 0.001 ? scaled(c, s) : c; method = "display-stream-crop"
+    }
+    if img == nil && !forceCLI && screenTrusted(), let (i, _) = captureSCK(target, scale: s) { img = i; method = lastCaptureMethod ?? method }
     if img == nil {
         method = "screencapture"
         img = captureCLI(cliArgs, tmp: NSTemporaryDirectory() + "xyzlcu-raw-\(getpid()).png")
@@ -1435,7 +1572,7 @@ let usage = """
 xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   check [--probe] | request | whoami
   screenshot [path] [--scale 0.5] [--display N] [--format png|jpg|heic] [--quality 0.7] [--fast] [--cli]
-             [--window "App" [--title 标题]] [--region x,y,w,h]      （--fast = jpg、质量 0.6、缩放 0.5，给智能体用最快）
+             [--window "App" [--title 标题] | --window-id N] [--region x,y,w,h]   （N 来自 windows 的 id）      （--fast = jpg、质量 0.6、缩放 0.5，给智能体用最快）
              [--base64 | --stdout] [--out path] [--timing]   --base64/--stdout 在内存里出图（默认 jpg），不写文件
              [--diff]  只返回和上一次 --diff 截图相比变了的区域（没变就不出图；需要守护进程）
   click x y [--right] [--double] | move x y | drag x1 y1 x2 y2 | scroll dx dy
@@ -1449,8 +1586,10 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   apps | open "App" | activate "App" | hide "App" | windows [--all]
   displays | movewin "App" x y [--w W --h H] [--title 标题]
   ax ["App"] [--depth N] [--menu] | press "App" "按钮标题"
+  ax ["App"] --compact [--menu] [--text] [--max 300]   只列可操作控件：[编号] 角色 "标题" ="值" @中心x,y（给智能体，省 token）
   find "App" [--role AXButton] [--title 保存] [--contains] [--index N|--all] [--window 标题] [--menu]
   click-el "App" --role AXButton --title 保存 [--click] [--right] [--double]
+  click-el --ref N ["App"]   按上一次 ax --compact 的编号点（需要守护进程）
   wait "App" --title X [--role R] [--timeout 5] [--gone]   |   wait 毫秒 | sleep 毫秒
   cursor | version | taps（诊断输入卡顿） | check（权限 + 各输入路径健康状态）
   batch [--continue-on-error] [脚本文件]  （从 stdin 或文件逐行读取命令，一次启动执行多步）
@@ -1464,10 +1603,12 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
             XYZLCU_PREWARM=0 守护进程启动时不预开主屏截图流；XYZLCU_PREWARM_SCALES 预开哪些缩放（默认 1,0.5）
             XYZLCU_PREWARM_IDLE 预开的流闲置多少秒关闭（默认 600）
             XYZLCU_STREAM=0 不用常驻截图流；XYZLCU_STREAM_IDLE 闲置多少秒关闭（默认 20）
+            XYZLCU_WINDOW_CROP=0 截窗口时不从主屏常驻流里裁（窗口没被挡住时默认裁，最快）
+            XYZLCU_AUTO_RESTART=0 守护进程版本比客户端旧时不自动重启它
             XYZLCU_PNG=imageio 用系统 PNG 编码器；XYZLCU_PNG_LEVEL 压缩级别 1–9（默认 1）
             XYZLCU_CONNECT_WAIT_MS 守护进程正在启动时最多等多久（默认 3000）；XYZLCU_CORE 客户端调用的主程序路径
 """
-let version = "0.5.0"
+let version = "0.6.0"
 var inBatch = false
 let startedAt = Date()
 
@@ -1525,7 +1666,7 @@ case "screenshot":
     let fmtOpt = try option("--format").map(ImgFormat.parse)
     let quality = try option("--quality").map(dbl) ?? (fast ? 0.6 : 0.7)
     let forceCLI = flag("--cli")
-    let winApp = option("--window"), winTitle = option("--title")
+    let winApp = option("--window") ?? option("--window-id").map { "#" + $0 }, winTitle = option("--title")
     var region: CGRect? = nil
     if let r = option("--region") {
         let v = try r.split(separator: ",").map { try dbl(String($0).trimmingCharacters(in: .whitespaces)) }
@@ -1590,7 +1731,7 @@ case "insert", "settext":
     let appName = args[0], text = args.dropFirst().joined(separator: " ")
     let (el, app) = try inputTarget(appName, role: role, subrole: subrole, title: title, window: win, index: idx)
     var r = try writeText(appName, el, text, replaceAll: replaceAll, via: via)
-    r["app"] = app.localizedName ?? ""; r["role"] = str(el, kAXRoleAttribute) ?? ""; r["window"] = windowTitle(of: el) ?? ""
+    r["app"] = app.xName ?? ""; r["role"] = str(el, kAXRoleAttribute) ?? ""; r["window"] = windowTitle(of: el) ?? ""
     r["ms"] = Int(Date().timeIntervalSince(t0) * 1000)
     out(r)
     if (r["verified"] as? Bool) != true { try fail("写入后读回的内容和预期不一致（verified=false），请用 xyzlcu value 检查", code: 1) }
@@ -1600,7 +1741,7 @@ case "value":
     let idx = Int(try option("--index").map(dbl) ?? 1)
     try need(1, "value \"App\" [--role R] [--title T|--id I] [--window 窗口标题]")
     let (el, app) = try inputTarget(args[0], role: role, subrole: subrole, title: title, window: win, index: idx)
-    var o: [String: Any] = ["app": app.localizedName ?? "", "role": str(el, kAXRoleAttribute) ?? "", "window": windowTitle(of: el) ?? ""]
+    var o: [String: Any] = ["app": app.xName ?? "", "role": str(el, kAXRoleAttribute) ?? "", "window": windowTitle(of: el) ?? ""]
     if let v = attr(el, kAXValueAttribute) { o["value"] = (v as? String) ?? (v as? NSNumber)?.stringValue ?? "\(v)" }
     if let s = attr(el, kAXSelectedTextAttribute) as? String { o["selectedText"] = s }
     out(o)
@@ -1626,7 +1767,7 @@ case "menu":
     let path = parseMenuPath(args.dropFirst().joined(separator: " "))
     guard !path.isEmpty else { try fail("菜单路径为空，例如 \"文件>存储\" 或 \"File>Save\"") }
     let picked = try pressMenu(args[0], path)
-    var o: [String: Any] = ["app": findApp(args[0])?.localizedName ?? args[0], "pressed": picked.joined(separator: ">"), "ms": Int(Date().timeIntervalSince(t0) * 1000),
+    var o: [String: Any] = ["app": findApp(args[0])?.xName ?? args[0], "pressed": picked.joined(separator: ">"), "ms": Int(Date().timeIntervalSince(t0) * 1000),
                             "path": "ax-menu", "activated": activated, "appWasActive": wasActive]
     if let w = mainWin { o["window"] = w }
     if lastMenuWasDisabled {
@@ -1671,6 +1812,22 @@ case "click-el":
     let t0 = Date()
     try guardUnlocked()
     let forceClick = flag("--click"), right = flag("--right"), double = flag("--double")
+    if let ref = option("--ref") {
+        guard daemonMode else { try fail("--ref 需要守护进程（xyzlcu serve --background），编号来自上一次 ax --compact") }
+        guard let i = Int(ref), i >= 1, i <= axRefs.count else { try fail("没有编号 \(ref)（上一次 ax --compact 共 \(axRefs.count) 个）", code: 4) }
+        let el = axRefs[i - 1]
+        if let a = args.first, let app = findApp(a), app.processIdentifier != axRefsPid { try fail("编号 \(ref) 属于另一个应用（pid \(axRefsPid)），先对 \(a) 运行 ax --compact", code: 4) }
+        guard let n = axNode(el) else { try fail("编号 \(ref) 的控件已经不在了，重新 ax --compact", code: 4) }
+        var how = "AXPress"
+        if forceClick || right || double || AXUIElementPerformAction(el, kAXPressAction as CFString) != .success {
+            guard let f = n.frame else { try fail("元素没有位置信息，无法点击") }
+            click(CGPoint(x: f["x"]! + f["w"]! / 2, y: f["y"]! + f["h"]! / 2), right: right, double: double); how = "click"
+        }
+        var o: [String: Any] = ["ref": i, "role": n.role, "title": n.texts.compactMap { $0 }.first.map { short($0) } ?? "", "action": how, "pid": Int(axRefsPid),
+                                "ms": Int(Date().timeIntervalSince(t0) * 1000)]
+        if let f = n.frame { o["frame"] = f }
+        out(o); break
+    }
     var q = try parseQuery(); q.all = false
     let r = try axFind(args.first, q)
     guard let el = r.els.first else { try fail("找不到元素（搜索了 \(r.visited) 个节点）", code: 4) }
@@ -1682,7 +1839,8 @@ case "click-el":
     findOutput(r, all: false, t0: t0, extra: ["action": how])
 case "apps":
     drainRunLoop()
-    out(NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }.map(appInfo))
+    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    out(appEntries().filter { $0.regular }.map { appInfo($0, front: front ?? -1) })
 case "open":
     try need(1, "open \"App\"")
     let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/open"); p.arguments = ["-a", args[0]]
@@ -1713,7 +1871,7 @@ case "movewin":
         win = (attr(root, kAXFocusedWindowAttribute) as! AXUIElement?) ?? (attr(root, kAXMainWindowAttribute) as! AXUIElement?)
             ?? ((attr(root, kAXWindowsAttribute) as? [AXUIElement]) ?? []).first
     }
-    guard let w = win else { try fail("找不到 \(app.localizedName ?? args[0]) 的窗口") }
+    guard let w = win else { try fail("找不到 \(app.xName ?? args[0]) 的窗口") }
     var pt = CGPoint(x: try dbl(args[1]), y: try dbl(args[2]))
     if let v = AXValueCreate(.cgPoint, &pt) { AXUIElementSetAttributeValue(w, kAXPositionAttribute as CFString, v) }
     if wOpt != nil || hOpt != nil {
@@ -1723,7 +1881,7 @@ case "movewin":
     }
     AXUIElementPerformAction(w, kAXRaiseAction as CFString)
     app.activate(options: [])
-    var res: [String: Any] = ["app": app.localizedName ?? "", "title": str(w, kAXTitleAttribute) ?? ""]
+    var res: [String: Any] = ["app": app.xName ?? "", "title": str(w, kAXTitleAttribute) ?? ""]
     if let f = frame(w) { res["frame"] = f }
     out(res)
 case "windows":
@@ -1739,23 +1897,39 @@ case "windows":
     }
     out(rows)
 case "ax":
-    let depth = Int(option("--depth") ?? "12") ?? 12
-    let withMenu = flag("--menu")
+    let compact = flag("--compact") || flag("-c"), withMenu = flag("--menu")
+    let depth = Int(option("--depth") ?? "") ?? (compact ? 30 : 12)
     let (root, app) = try axRoot(args.first)
-    emit("# \(app.localizedName ?? "?") pid=\(app.processIdentifier)")
-    let win = (attr(root, kAXFocusedWindowAttribute) as! AXUIElement?) ?? (attr(root, kAXMainWindowAttribute) as! AXUIElement?)
+    let win = axElement(attr(root, kAXFocusedWindowAttribute)) ?? axElement(attr(root, kAXMainWindowAttribute))
+    if compact {
+        // 只列可操作的控件：[编号] 角色 "标题" ="值" @中心x,y（全局点坐标）
+        axRefs = []; axRefsPid = app.processIdentifier
+        var roots = [win ?? root]
+        if withMenu, let mb = axElement(attr(root, kAXMenuBarAttribute)) { roots.append(mb) }
+        let maxItems = Int(option("--max") ?? "") ?? 300
+        let r = compactDump(roots, maxDepth: depth, maxItems: maxItems, withText: flag("--text"))
+        let wt = win.flatMap { str($0, kAXTitleAttribute) } ?? ""
+        emit("# \(app.xName ?? "?") pid=\(app.processIdentifier) window=\"\(wt)\" \(r.lines.count) controls (click-el --ref N)")
+        r.lines.forEach { emit($0) }
+        if r.lines.count >= maxItems { emit("# 只列了前 \(maxItems) 个（--max 调整）") }
+        if !daemonMode { emit("# 注意：没有守护进程，编号不会保留，--ref 用不了") }
+        break
+    }
+    emit("# \(app.xName ?? "?") pid=\(app.processIdentifier)")
     var n = 0
     if let w = win { dump(w, depth: 0, max: depth, count: &n) } else { dump(root, depth: 0, max: depth, count: &n) }
     if let mb = attr(root, kAXMenuBarAttribute), withMenu { dump(mb as! AXUIElement, depth: 0, max: 3, count: &n) }
 case "press":
     try need(2, "press \"App\" \"按钮标题\"")
     try guardUnlocked()
-    let (root, _) = try axRoot(args[0])
-    guard let el = findElement(root, args[1]) else { try fail("找不到元素: \(args[1])") }
-    let r = AXUIElementPerformAction(el, kAXPressAction as CFString)
-    if r != .success {
+    // 和 click-el 一样走广度优先的批量属性查找（先焦点窗口，再其它窗口，最后菜单栏），标题 / 描述 / 值 / 标识符完全相等（不分大小写）
+    var q = Query(); q.title = args[1]; q.menu = true
+    let r = try axFind(args[0], q)
+    guard let el = r.els.first else { try fail("找不到元素: \(args[1])") }
+    let pr = AXUIElementPerformAction(el, kAXPressAction as CFString)
+    if pr != .success {
         if let f = frame(el) { click(CGPoint(x: f["x"]! + f["w"]! / 2, y: f["y"]! + f["h"]! / 2), right: false, double: false); emit("ok (AXPress 失败，已改为点击中心)") }
-        else { try fail("AXPress 失败: \(r.rawValue)") }
+        else { try fail("AXPress 失败: \(pr.rawValue)") }
     } else { emit("ok") }
 case "taps":
     // 诊断：列出系统里的事件监听（event tap）。主动拦截型（listenOnly=false）且延迟很高的 tap 会让键盘/鼠标输入卡住或丢失
@@ -1960,12 +2134,44 @@ func daemonRequest(_ argv: [String], stdin: String? = nil, wait: Bool = true) ->
     let resp = readAll(fd)
     if let r = decodeFrame(resp) { return r }
     // JSON 回复：版本不一致（98）或者旧版本守护进程
-    if let j = try? JSONSerialization.jsonObject(with: resp) as? [String: Any], let code = j["code"] as? Int, code != 98 {
+    if let j = try? JSONSerialization.jsonObject(with: resp) as? [String: Any], let code = j["code"] as? Int {
+        if code == 98 { daemonVersionSeen = j["version"] as? String ?? "0"; return nil }
         return RunResult(code: Int32(code), out: j["out"] as? String ?? "", err: j["err"] as? String ?? "",
                          bin: (j["bin"] as? String).flatMap { Data(base64Encoded: $0) })
     }
     if resp.isEmpty { return RunResult(code: 1, out: "", err: "error: 守护进程没有回复（可能在执行中退出了）\n", bin: nil) }
     return nil
+}
+/// 守护进程回 98（版本不一致）时带回的它的版本
+var daemonVersionSeen: String? = nil
+/// 已经读掉的标准输入（转发失败改为进程内执行时用，不能再读一次）
+var consumedStdin: String? = nil
+func versionLess(_ a: String, _ b: String) -> Bool {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) { let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0; if p != q { return p < q } }
+    return false
+}
+/// 守护进程比自己旧（升级后没重启）：停掉它、用当前版本重新启动，再发一次。
+/// 守护进程更新（旧客户端）时不动它，改为进程内执行。XYZLCU_AUTO_RESTART=0 关闭。
+/// 多个客户端同时发现时用 ~/.xyzlcu/sock.restart 上的文件锁排队，拿到锁后先重试一次，已经被别人重启好了就直接用。
+func requestRestartingStale(_ argv: [String], stdin: String?) -> RunResult? {
+    daemonVersionSeen = nil
+    if let r = daemonRequest(argv, stdin: stdin) { return r }
+    guard let old = daemonVersionSeen, versionLess(old, version), ProcessInfo.processInfo.environment["XYZLCU_AUTO_RESTART"] != "0" else { return nil }
+    let lfd = open(socketPath() + ".restart", O_CREAT | O_RDWR, 0o600)
+    if lfd >= 0 { flock(lfd, LOCK_EX) }
+    defer { if lfd >= 0 { flock(lfd, LOCK_UN); close(lfd) } }
+    daemonVersionSeen = nil
+    if let r = daemonRequest(argv, stdin: stdin) { return r }
+    guard let again = daemonVersionSeen, versionLess(again, version) else { return nil }
+    // 新守护进程的权限跟着启动它的进程走：自己没有辅助功能 + 录屏权限就不重启，免得把守护进程的权限降下来
+    guard AXIsProcessTrusted(), CGPreflightScreenCaptureAccess() else {
+        FileHandle.standardError.write("xyzlcu: 守护进程是旧版本 \(again)；当前进程权限不全，不自动重启，请在有权限的终端里 xyzlcu serve --stop && xyzlcu serve --background\n".data(using: .utf8)!)
+        return nil
+    }
+    FileHandle.standardError.write("xyzlcu: 守护进程是旧版本 \(again)，自动重启为 \(version)\n".data(using: .utf8)!)
+    guard stopDaemon(quiet: true) == 0, serveBackground(quiet: true) == 0 else { return nil }
+    return daemonRequest(argv, stdin: stdin)
 }
 /// 客户端：把整条命令转发给守护进程。守护进程不在或版本不一致时返回 nil（改为进程内执行）
 func forward(_ top: [String]) -> Int32? {
@@ -1975,8 +2181,9 @@ func forward(_ top: [String]) -> Int32? {
         guard let fd = connectDaemonWaiting(socketPath()) else { return nil }
         close(fd)
         stdin = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        consumedStdin = stdin
     }
-    guard let r = daemonRequest(top, stdin: stdin) else { return nil }
+    guard let r = requestRestartingStale(top, stdin: stdin) else { return nil }
     if !r.out.isEmpty { FileHandle.standardOutput.write(Data(r.out.utf8)) }
     if let b = r.bin { FileHandle.standardOutput.write(b) }
     if !r.err.isEmpty { FileHandle.standardError.write(Data(r.err.utf8)) }
@@ -2046,6 +2253,7 @@ func serve() throws -> Never {
     guard listen(fd, 64) == 0 else { try fail("listen 失败") }
     ftruncate(lockFd, 0); let pidLine = "\(getpid())\n"; _ = pidLine.withCString { write(lockFd, $0, strlen($0)) }
     daemonMode = true
+    watchApps()
     // 客户端提前断开（比如只是探测守护进程在不在）时，写回复会触发 SIGPIPE，不忽略的话守护进程会直接退出
     signal(SIGPIPE, SIG_IGN)
     for sig in [SIGINT, SIGTERM, SIGHUP] {
@@ -2081,9 +2289,9 @@ func serve() throws -> Never {
 }
 var signalSources: [DispatchSourceSignal] = []
 /// serve --background：在新会话里启动守护进程（不随终端 / 工具调用结束而退出），等它能接受连接再返回
-func serveBackground() -> Int32 {
+func serveBackground(quiet: Bool = false) -> Int32 {
     let path = socketPath()
-    if let fd = connectDaemonWaiting(path) { close(fd); FileHandle.standardError.write("守护进程已经在运行：\(path)\n".data(using: .utf8)!); return 0 }
+    if let fd = connectDaemonWaiting(path) { close(fd); if !quiet { FileHandle.standardError.write("守护进程已经在运行：\(path)\n".data(using: .utf8)!) }; return 0 }
     let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
     let dir = (path as NSString).deletingLastPathComponent
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -2103,17 +2311,19 @@ func serveBackground() -> Int32 {
     guard rc == 0 else { FileHandle.standardError.write("启动失败: \(String(cString: strerror(rc)))\n".data(using: .utf8)!); return 1 }
     let deadline = Date(timeIntervalSinceNow: 8)
     while Date() < deadline {
-        if let fd = connectDaemon(path) { close(fd); out(["running": true, "pid": Int(lockHolder(path) ?? pid), "socket": path, "log": log]); return 0 }
+        if let fd = connectDaemon(path) { close(fd); if !quiet { out(["running": true, "pid": Int(lockHolder(path) ?? pid), "socket": path, "log": log]) }; return 0 }
         var st: Int32 = 0
         if waitpid(pid, &st, WNOHANG) == pid { break }   // 退出了（比如已经有一个在运行）
         usleep(10000)
     }
-    if let fd = connectDaemon(path) { close(fd); out(["running": true, "socket": path, "log": log]); return 0 }
+    if let fd = connectDaemon(path) { close(fd); if !quiet { out(["running": true, "socket": path, "log": log]) }; return 0 }
     FileHandle.standardError.write("守护进程没有启动起来，见 \(log)\n".data(using: .utf8)!)
     return 1
 }
+/// 等守护进程真正退出（锁释放），免得马上启动的新守护进程拿不到锁
+func waitSocketGone(_ path: String) { for _ in 0..<150 where lockHolder(path) != nil { usleep(10000) } }
 /// serve --stop：新版本直接停；版本不一致的旧守护进程（不认 __stop）按 socket 对端 pid 发 SIGTERM
-func stopDaemon() -> Int32 {
+func stopDaemon(quiet: Bool = false) -> Int32 {
     let path = socketPath()
     guard let fd = connectDaemonWaiting(path) else { FileHandle.standardError.write("守护进程没有运行\n".data(using: .utf8)!); return 1 }
     let pid = peerPid(fd)
@@ -2121,11 +2331,11 @@ func stopDaemon() -> Int32 {
     if let body = try? JSONSerialization.data(withJSONObject: req) { _ = writeAll(fd, body) }
     shutdown(fd, SHUT_WR)
     let resp = readAll(fd); close(fd)
-    if let r = decodeFrame(resp), r.code == 0 { print("ok"); return 0 }
+    if let r = decodeFrame(resp), r.code == 0 { if !quiet { print("ok") }; waitSocketGone(path); return 0 }
     if let p = pid, (pathOf(p) as NSString).lastPathComponent.hasPrefix("xyzlcu") {
         kill(p, SIGTERM)
         for _ in 0..<100 { if kill(p, 0) != 0 { break }; usleep(20000) }
-        print("ok（停掉了旧版本的守护进程 pid \(p)）"); return 0
+        if !quiet { print("ok（停掉了旧版本的守护进程 pid \(p)）") }; return 0
     }
     FileHandle.standardError.write("停不掉：守护进程没有正常回复\n".data(using: .utf8)!)
     return 1
@@ -2135,7 +2345,7 @@ func stopDaemon() -> Int32 {
 /// 执行一条 xyzlcu 命令并拿回输出：守护进程在就直接发给它（不起新进程），不在就在本进程里执行
 var mcpUseDaemon = true
 func mcpRunSelf(_ argv: [String]) -> RunResult {
-    if mcpUseDaemon, ProcessInfo.processInfo.environment["XYZLCU_DAEMON"] != "0", let r = daemonRequest(argv) { return r }
+    if mcpUseDaemon, ProcessInfo.processInfo.environment["XYZLCU_DAEMON"] != "0", let r = requestRestartingStale(argv, stdin: nil) { return r }
     return runCaptured(argv)
 }
 
@@ -2150,15 +2360,16 @@ func mcpTools() -> [[String: Any]] {
     return [
         t("check", "Permissions, screen lock and input-path health. Call first; stop if screenLocked is true or permissions are missing.", readOnly: true),
         t("screenshot", "Screenshot returned as a JPEG image (in memory, no file). Whole display (default scale 0.5), one app window (window, optional title), or a region \"x,y,w,h\" in global points. The text part has originX/originY/pixelsPerPoint: global point = origin + pixel / pixelsPerPoint. diff=true compares with the previous diff screenshot of the same target: returns no image if nothing changed, otherwise only the changed area (origin adjusted, diff.rects in global points).",
-          ["window": s, "title": s, "region": s, "display": n, "scale": n, "quality": n, "diff": b], readOnly: true),
+          ["window": s, "title": s, "window_id": n, "region": s, "display": n, "scale": n, "quality": n, "diff": b], readOnly: true),
         t("apps", "Running GUI apps; the one with active=true is frontmost.", readOnly: true),
         t("windows", "On-screen windows with owner, title and bounds (global points).", readOnly: true),
         t("cursor", "Current pointer position.", readOnly: true),
-        t("ax", "Dump an app's accessibility tree: role title value [x,y wxh] per line.", ["app": s, "depth": n], ["app"], readOnly: true),
+        t("ax", "Dump an app's accessibility tree: role title value [x,y wxh] per line. compact=true lists only actionable controls, one short line each: [N] Role \"title\" =\"value\" @centerX,centerY — far fewer tokens; press one with click_element ref=N.",
+          ["app": s, "depth": n, "compact": b, "menu": b, "text": b, "max": n], ["app"], readOnly: true),
         t("find", "Find a control by role/title; returns frame and center (global points).",
           ["app": s, "role": s, "title": s, "contains": b, "window": s], ["app"], readOnly: true),
-        t("click_element", "Find a control and press it (AXPress, falling back to clicking its center).",
-          ["app": s, "role": s, "title": s, "window": s], ["app"]),
+        t("click_element", "Press a control (AXPress, falling back to clicking its center). Either ref=N from the last ax compact=true listing, or find it by app + role/title.",
+          ["app": s, "role": s, "title": s, "window": s, "ref": n]),
         t("click", "Click at global point coordinates (moves the real pointer).", ["x": n, "y": n, "right": b, "double": b], ["x", "y"]),
         t("type_text", "Type Unicode text into the focused element. Pass app and window so it refuses to type anywhere else.",
           ["text": s, "app": s, "window": s], ["text"]),
@@ -2233,16 +2444,21 @@ func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
     case "screenshot":
         argv = ["screenshot", "--stdout", "--format", "jpg", "--quality", str("quality") ?? "0.7"]
         if let w = str("window") { argv += ["--window", w]; if let t = str("title") { argv += ["--title", t] } }
+        else if let w = str("window_id") { argv += ["--window-id", w] }
         if let r = str("region") { argv += ["--region", r] }
         if let d = str("display") { argv += ["--display", d] }
         if on("diff") { argv.append("--diff") }
-        argv += ["--scale", str("scale") ?? (str("window") != nil || str("region") != nil ? "1" : "0.5")]
+        argv += ["--scale", str("scale") ?? (str("window") != nil || str("window_id") != nil || str("region") != nil ? "1" : "0.5")]
         let r = mcpRunSelf(argv)
         guard r.code == 0 else { return text((r.err.isEmpty ? r.out : r.err) + "\nexit code \(r.code)", true) }
         return ["content": mcpImageContent(r), "isError": false]
     case "batch":
         return mcpBatch((a["steps"] as? [String]) ?? [], continueOnError: on("continue_on_error"))
-    case "ax": argv = ["ax", str("app") ?? ""] + (str("depth").map { ["--depth", $0] } ?? [])
+    case "ax":
+        argv = ["ax", str("app") ?? ""] + (str("depth").map { ["--depth", $0] } ?? []) + (str("max").map { ["--max", $0] } ?? [])
+        for k in ["compact", "menu", "text"] where on(k) { argv.append("--\(k)") }
+    case "click_element" where str("ref") != nil:
+        argv = ["click-el", "--ref", str("ref")!] + (str("app").map { [$0] } ?? [])
     case "find", "click_element":
         argv = [name == "find" ? "find" : "click-el", str("app") ?? ""]
         for k in ["role", "title", "window"] { if let v = str(k) { argv += ["--\(k)", v] } }
@@ -2280,7 +2496,7 @@ func mcpServe() -> Never {
     }
     // MCP 服务器本身就是常驻进程：没有守护进程时它自己当守护进程用（缓存、常驻截图流都生效）
     if connectDaemon(socketPath()).map({ close($0); return true }) != true {
-        daemonMode = true; envOverlay = ProcessInfo.processInfo.environment
+        daemonMode = true; envOverlay = ProcessInfo.processInfo.environment; watchApps()
     }
     func handleLine(_ line: String) {
         guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return }
@@ -2337,4 +2553,4 @@ if daemonEnv != "0", !top.isEmpty, !["help", "-h", "--help", "record", "replay"]
     if let code = forward(top) { exit(code) }
     if daemonEnv == "1" { errOut("error: 守护进程没有运行（先执行 xyzlcu serve --background）"); exit(5) }
 }
-exit(runMain(top, stdinText: { String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? "" }, err: errOut))
+exit(runMain(top, stdinText: { consumedStdin ?? String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? "" }, err: errOut))

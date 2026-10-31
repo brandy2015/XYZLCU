@@ -13,6 +13,7 @@
 - 📸 **Screenshots**: a whole display, a single window (`--window`) or a region (`--region`), optional downscaling, `--fast` for a small JPEG in one flag; prints the point/pixel mapping
 - 🧠 **In-memory screenshots** (v0.4.2): `--base64` / `--stdout` produce the image in memory without writing a file; the daemon keeps capture streams on demand, so repeated captures of the same window take about 20 ms
 - 🚀 **Faster in v0.5.0**: a tiny C client (~3 ms per call), the main display stream pre-opened at daemon start (`--fast` ~9 ms), parallel PNG encoding (full-size PNG 171 → 31 ms), JPEG / HEIC, `--diff` returns only what changed, and an MCP `batch` tool
+- ⚡ **v0.6.0**: the daemon keeps its own app table (`apps` 10 → 3 ms, `ax` 27 → 5 ms, `find` 21 → 8 ms), uncovered windows are cropped straight from the display stream (first window shot 114 → 25 ms), `ax --compact` + `click-el --ref` to save tokens, and a stale daemon restarts itself after an upgrade
 - 🖱 **Mouse**: click, right-click, double-click, move, drag, scroll
 - ⌨️ **Keyboard**: types Unicode text directly (Chinese, emoji; bypasses the input method), key combos like `cmd+shift+4`
 - 🌳 **Accessibility tree**: dumps any app window's control tree (role, title, value, frame); `find` returns a control's frame and center by role/title, `click-el` finds and presses in one call, `wait` waits for a control to appear or disappear
@@ -106,6 +107,7 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `screenshot [path] [--scale S] [--display N] [--format png\|jpg\|heic] [--quality Q]` | Screenshot. Format: `--format`, else the file extension, else PNG (JPEG for `--fast` and in-memory output) | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
 | `screenshot … --fast` | Fast screenshot: JPEG, quality 0.6, scale 0.5 | `xyzlcu screenshot --fast` |
 | `screenshot … --window "App" [--title T]` | Capture just one app window (its frontmost window by default) | `xyzlcu screenshot /tmp/w.png --window Safari` |
+| `screenshot … --window-id N` | Capture a window by the id from `windows` | `xyzlcu screenshot /tmp/w.png --window-id 1234` |
 | `screenshot … --region x,y,w,h` | Capture just a region (global points) | `xyzlcu screenshot /tmp/r.png --region 100,100,400,300` |
 | `screenshot … --base64` | No file: the image is base64 in the JSON `base64` field (JPEG by default when no path is given) | `xyzlcu screenshot --fast --base64` |
 | `screenshot … --stdout` | No file: raw image bytes on stdout, metadata JSON on stderr | `xyzlcu screenshot --window Safari --stdout > w.jpg` |
@@ -130,8 +132,10 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `windows [--all]` | On-screen windows (owner, title, bounds) | `xyzlcu windows` |
 | `movewin "App" x y [--w W --h H] [--title T]` | Move / resize a window and raise it | `xyzlcu movewin "Safari" 200 100 --w 1200 --h 800` |
 | `ax ["App"] [--depth N] [--menu]` | Dump the UI control tree | `xyzlcu ax TextEdit --depth 6` |
+| `ax ["App"] --compact [--menu] [--text] [--max 300]` | Only actionable controls: `[N] Role "title" ="value" @centerX,centerY`, for agents, few tokens | `xyzlcu ax TextEdit --compact` |
 | `find "App" [--role R] [--title T] [--contains] [--index N\|--all] [--window T] [--menu]` | Find a control; returns role, title, frame, center; stops at the first hit | `xyzlcu find TextEdit --role AXButton --title Save` |
 | `click-el "App" --role R --title T [--click] [--right] [--double]` | Find a control and press it (AXPress, falling back to a center click) | `xyzlcu click-el TextEdit --role AXButton --title Save` |
+| `click-el --ref N ["App"]` | Press control number N from the last `ax --compact` (needs the daemon) | `xyzlcu click-el --ref 3` |
 | `press "App" "title"` | Find a control by title and press it (older form; prefer `click-el` in new scripts) | `xyzlcu press TextEdit "Cancel"` |
 | `wait "App" --title T [--role R] [--timeout sec] [--gone]` | Wait for a control to appear (or, with `--gone`, disappear); 5 s timeout by default | `xyzlcu wait TextEdit --role AXSheet --timeout 3` |
 | `wait ms` / `sleep ms` | Fixed wait | `xyzlcu sleep 300` |
@@ -248,12 +252,15 @@ xyzlcu serve --stop     # stop it
 - `XYZLCU_DAEMON=0`: never use the daemon. `XYZLCU_DAEMON=1`: require it; exits with code 5 if it can't be reached.
 - **Only one daemon** (v0.5.0): `serve` first takes a file lock on `~/.xyzlcu/sock.lock`. If a daemon is already running it says so and exits 0, so running it again is harmless; a stale socket left by `kill -9` is detected and replaced. While a daemon is starting but not yet accepting, clients wait up to 3 s (`XYZLCU_CONNECT_WAIT_MS`) instead of concluding there is no daemon.
 - **Protocol** (v0.5.0): images travel between client and daemon as raw length-prefixed bytes, not base64. The `--base64` JSON output and MCP still use base64. A client of a different version falls back to running in-process; `serve --stop` can stop an older daemon.
+- **Stale daemon auto-restart** (v0.6.0): after an upgrade, a client that finds an older daemon stops it, restarts it in the background with the new version, and runs the command (once, about 1 s). Concurrent clients queue on a file lock at `~/.xyzlcu/sock.restart`. The new daemon inherits permissions from the process that starts it, so the restart only happens when the current process has both Accessibility and Screen Recording; otherwise you get a hint to restart it from a terminal that has them. Disable with `XYZLCU_AUTO_RESTART=0`. A client older than the daemon leaves the daemon alone and runs in-process.
 - The socket is `~/.xyzlcu/sock` (directory 0700, socket 0600) and only accepts connections from the **same user** (checked with `getpeereid`). No network port is opened. Override the path with `XYZLCU_SOCKET`.
 - The daemon keeps the lock-screen guard and permission checks; relative paths resolve against the caller's working directory.
 - **Permissions (TCC)**: the daemon runs with the permissions of **the app that started it**, so run `xyzlcu serve --background` from the agent's or terminal's own shell; the responsible app is then the same as for direct commands. Check `responsibleProcess` in `xyzlcu serve --status`.
 - **Capture streams (v0.4.2)**: the first time the daemon captures a window / display / region, it opens a ScreenCaptureKit stream for it in the background; later screenshots take the latest frame (`method: "screencapturekit-stream"`) instead of capturing again. Since v0.5.0 each scale has its own stream, scaled on the GPU (until a new scale's stream has a frame, an existing stream's frame is scaled on the CPU once). At most 4 streams at a time; a stream unused for 20 s is stopped (`XYZLCU_STREAM_IDLE=seconds`). A screenshot right after a click or typing waits for a newer frame (up to 0.12 s), so it never returns the pre-action picture. While a stream is open, macOS shows its screen-recording indicator in the menu bar; that is expected. `XYZLCU_STREAM=0` disables streams. `liveStreams` in `xyzlcu serve --status` lists the open streams.
 - **Prewarm the main display (v0.5.0)**: at start-up the daemon opens full-size and half-size streams for the main display (`XYZLCU_PREWARM_SCALES=1,0.5`), so even the first screenshot takes 25–35 ms instead of 170–210 ms. **Trade-off**: while the daemon runs, the menu bar shows the screen-recording indicator; the two streams use about 45 MB of memory and the GPU does a little scaling whenever the screen changes. Prewarmed streams close after 600 s unused (`XYZLCU_PREWARM_IDLE=seconds`) and reopen on demand. To opt out: `XYZLCU_PREWARM=0 xyzlcu serve --background`.
 - **PNG encoding (v0.5.0)**: a built-in multi-threaded PNG encoder (zlib level 1, bands compressed in parallel) keeps the capture's color space and embeds its ICC profile. Pixels are identical to ImageIO's output; files are somewhat larger. `XYZLCU_PNG=imageio` switches back to the system encoder, `XYZLCU_PNG_LEVEL=0-9` sets the compression level.
+- **Window shots cropped from the display stream (v0.6.0)**: when a window is not covered by other windows, lies inside one display, and that display's stream is running, `--window` crops it from the stream's latest frame (`method: "display-stream-crop"`), so even the first shot of a window takes about 25 ms. The area outside the rounded corners is desktop, not transparent. Disable with `XYZLCU_WINDOW_CROP=0`.
+- **App table (v0.6.0)**: the daemon keeps its own list of running apps (updated from launch / terminate / activate / hide notifications, fully refreshed at most every 10 s), so `apps` and app lookups no longer query LaunchServices process by process.
 - To start it at login you can write your own LaunchAgent (`~/Library/LaunchAgents/*.plist` with `ProgramArguments` = `xyzlcu serve`). In that case the responsible process is the launchd-started xyzlcu binary itself, which then needs its own permissions in System Settings: grant them to the `xyzlcu-core` binary (and put `xyzlcu-core serve` in `ProgramArguments`). XYZLCU never installs a LaunchAgent for you.
 
 ## Worked example: write Chinese text in TextEdit and save it
@@ -332,6 +339,7 @@ Common commands (output is JSON or `ok`)
 - Screenshot: `xyzlcu screenshot --fast --base64` (whole screen, image in the JSON `base64` field, no file),
   `xyzlcu screenshot --window "App" --base64`, `xyzlcu screenshot /tmp/s.jpg --region x,y,w,h`
 - Press a control: `xyzlcu click-el "App" --role AXButton --title Save`
+- Token-cheap look: `xyzlcu ax "App" --compact` lists only actionable controls (`[3] Button "Save" @612,340`), then `xyzlcu click-el --ref 3` presses by number
 - Click a point: `xyzlcu click x y` (global points; convert screenshot pixels with pixelsPerPoint and originX/originY)
 - Type: `xyzlcu type --app "App" --window "Window title" "text"` (check `path` and `verified` in the output)
 - Keys: `xyzlcu key --app "App" cmd+s`
@@ -433,6 +441,44 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 ## Benchmark (vs LCU)
 
+### 0.6.0 vs 0.5.0
+
+Same machine, with a 0.5.0 daemon and a 0.6.0 daemon running at the same time on different sockets and called **alternately**, 21 runs each, **median / p90** in ms. Alternating removes system-load drift (two rounds of the same version can differ by 20%).
+
+| Operation | 0.5.0 | **0.6.0** |
+|---|---:|---:|
+| List apps (`apps`) | 9.5 / 9.9 | **3.2 / 3.5** |
+| List windows (`windows`) | 3.4 / 7.0 | 3.3 / 4.4 |
+| Control tree (`ax TextEdit`, focused window) | 26.9 / 28.1 | **5.3 / 7.5** |
+| Control tree with menus (`ax Finder --menu`) | 52.1 / 53.7 | **23.0 / 23.9** |
+| `find` hits the text area | 20.6 / 23.3 | **7.9 / 11.0** |
+| `find` miss (searches the whole tree) | 26.9 / 30.9 | **12.9 / 14.9** |
+| Window shot (covered window, stream open) | 14.7 / 16.0 | **6.2 / 6.8** |
+| Window shot (frontmost window, stream open) | 17.2 / 38.6 | **6.4 / 19.9** |
+| Full screen `--fast` | 8.9 / 25.8 | 8.9 / 18.5 |
+| **First** shot of a window (not covered, main display prewarmed; 8 runs) | 113.6 / 128.1 | **25.3 / 31.2** |
+| **First** shot of a window (covered; 8 runs) | 98.3 / 120.6 | 82.1 / 88.6 |
+
+Size of `ax --compact` output (same windows):
+
+| | `ax` | `ax --compact` |
+|---|---:|---:|
+| TextEdit window | 740 bytes / 11 lines | **243 bytes / 4 lines** |
+| TextEdit window + menu bar (`--menu`) | 9209 bytes / 153 lines | **513 bytes / 12 lines** |
+| Finder + menu bar (`--menu`) | 13680 bytes / 224 lines | **401 bytes / 11 lines** |
+
+**Where the time went and what changed (honestly)**
+
+- **The biggest bottleneck was NSRunningApplication**: sampling the daemon showed `apps` spending almost all of its time in synchronous `_LSCopyApplicationInformation` XPCs. `NSWorkspace.runningApplications` returns fresh objects every time, and the first property read on each one (even `processIdentifier`) asks LaunchServices, about 8–15 ms for 140 processes. A per-pid cache does not help (reading the pid is the slow part), so the daemon now keeps its own app table. `find`, `ax` and window screenshots all look up the app first, so they all got faster.
+- **Control tree**: 6–8 IPCs per control became one `AXUIElementCopyMultipleAttributeValues`.
+- **First window capture**: it used to take an `SCScreenshotManager` grab (~55 ms) and then open a window stream. Now, if the window is not covered, lies inside one display, and that display's stream is running (the daemon prewarms the main display by default), the window is cropped from the latest display frame. Covered windows keep the old path (~80 ms), since a crop would include whatever is in front. The coverage check ignores non-normal-layer windows that fill a whole display (the Dock, full-screen transparent overlays); otherwise every window would count as covered.
+- **Not changed**:
+  - The ~13 ms fixed cost of an in-process call (no daemon) is loading the Swift runtime and AppKit and friends; code cannot remove it. The answer is the daemon + C client (3 ms).
+  - `--fast` already gets small frames straight from the GPU, ~9 ms, mostly encoding and transfer.
+  - Prewarmed streams stay at 60 fps: idle, the daemon uses about 1.9% of one core and 9.6 MB (only for 10 minutes after the last screenshot). A lower frame rate would make post-click screenshots wait longer; not worth it.
+  - Multiple `--stdout` images in one `run` are not returned together (stdout can carry only one binary blob); this is now a clear error. Use `-o` files or MCP `batch` for several images.
+
+### 0.5.0 vs 0.4.2 and LCU
 **Setup**: Apple Silicon Mac (macOS 26+). XYZLCU 0.5.0 vs 0.4.2 and [LCU](https://github.com/amontlabs/lcu) 0.13.4 (the CUA runtime 0.0.35 shipped with ChatGPT). 15 runs per operation; the table shows **median / p90** in milliseconds. The LCU column comes from the 0.4.2 round on the same machine (LCU was not reinstalled this time).
 
 | Operation | 0.5.0 in-process | **0.5.0 daemon** | 0.4.2 daemon | LCU (MCP `js` call) |
@@ -658,6 +704,8 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 - `press` matches the title, description, value or identifier exactly (case-insensitive) and takes the first match; use `find` / `click-el` with `--role`, `--index` and `--window` to be more precise.
 - `type` bypasses the input method, so it doesn't suit cases that need IME suggestions.
 - No management of windows on other Spaces (desktops).
+- The daemon's app table is refreshed at most every 10 s: a background process that becomes a regular app without being activated can take up to 10 s to show up in `apps` (looking an app up by name rescans immediately on a miss, so that is not affected).
+- A window shot cropped from the display stream shows the desktop outside the rounded corners instead of transparency. Covered windows, windows spanning displays, or displays without a running stream fall back to capturing the window on its own.
 
 ## Uninstall
 
@@ -673,6 +721,13 @@ Then, in System Settings > Privacy & Security, turn off or remove any apps you n
 
 ## Changelog
 
+- **0.6.0**: faster daemon queries and a far smaller control listing for agents.
+  - **App table**: the daemon keeps its own table of running apps (updated from launch / terminate / activate / hide notifications, fully refreshed at most every 10 s) instead of asking LaunchServices about every process on every call. `apps` 9.5 → 3.2 ms; `ax` / `find` / `click-el` / `press` / window screenshots each save 6–10 ms.
+  - **Batched AX reads**: `ax` fetches all attributes of a control in one IPC (TextEdit window 27 → 5 ms, `ax Finder --menu` 52 → 23 ms).
+  - **`ax --compact`**: lists only actionable controls, one line each with a number and center point; `click-el --ref N` presses by number (needs the daemon). `ax Finder --menu` 13.7 KB → 0.4 KB. The MCP `ax` tool gains `compact` / `menu` / `text` / `max`, and `click_element` gains `ref`.
+  - **Window shots cropped from the display stream**: when the window is not covered, crop it from the latest frame of the always-on display stream; first capture of a window 114 → 25 ms (`method: "display-stream-crop"`, disable with `XYZLCU_WINDOW_CROP=0`). New `--window-id N` (MCP `window_id`).
+  - **Stale daemon auto-restart**: after an upgrade, a client that finds an older daemon stops it and restarts it with the new version (only when the current process has both Accessibility and Screen Recording; `XYZLCU_AUTO_RESTART=0` disables). The first call takes about 1 s longer.
+  - Fixes: when a version mismatch fell back to in-process execution, a `batch` script read from stdin was lost; in `run` / `batch`, a second `--stdout` image silently overwrote the first, now it is a clear error.
 - **0.5.0**: a speed overhaul.
   - **Tiny C client**: `xyzlcu` is now a small C program that forwards straight to the daemon (empty call 8 → 3 ms) and otherwise `exec`s `xyzlcu-core` from the same directory. Permission attribution is unchanged (still the app that launched it). Installs now have one more file, `xyzlcu-core`.
   - **Screenshot encoding**: parallel PNG encoding (full size 171 → 31 ms, ICC profile kept), new `--format heic`; format is `--format` > file extension > default (JPEG for `--fast` / in-memory, PNG otherwise).

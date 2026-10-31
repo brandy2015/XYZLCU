@@ -13,6 +13,7 @@
 - 📸 **截屏**：截整块屏、单个窗口（`--window`）或一块区域（`--region`），可缩小；`--fast` 一键出小 JPEG；会输出点坐标与像素的换算关系
 - 🧠 **内存截图**（v0.4.2）：`--base64` / `--stdout` 直接在内存里出图，不写文件；守护进程按需保持截图流，重复截同一个窗口约 20 毫秒
 - 🚀 **v0.5.0 更快**：C 小客户端（空调用约 3 毫秒）、守护进程启动时预开主屏截图流（`--fast` 约 9 毫秒）、并行 PNG 编码（全尺寸 PNG 171 → 31 毫秒）、JPEG / HEIC、`--diff` 只返回变化的区域、MCP `batch` 一次多步
+- ⚡ **v0.6.0**：守护进程自己维护应用表（`apps` 10 → 3 毫秒，`ax` 27 → 5 毫秒，`find` 21 → 8 毫秒）、没被挡住的窗口直接从主屏流里裁（第一次截窗口 114 → 25 毫秒）、`ax --compact` + `click-el --ref` 省 token、升级后自动重启旧守护进程
 - 🖱 **鼠标**：单击、右键、双击、移动、拖拽、滚动
 - ⌨️ **键盘**：直接输入 Unicode 文字（中文、emoji 都行，不经过输入法），支持组合键（`cmd+shift+4`）
 - 🌳 **辅助功能树**：导出任意应用窗口的控件树（角色、标题、值、坐标）；`find` 按角色/标题直接返回坐标和中心点，`click-el` 一步找到并按下，`wait` 等控件出现或消失
@@ -106,6 +107,7 @@ xyzlcu whoami
 | `screenshot [path] [--scale S] [--display N] [--format png\|jpg\|heic] [--quality Q]` | 截屏。格式看 `--format`，没给就看文件扩展名，都没有时 PNG（`--fast` 和只在内存里出图时 JPEG） | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
 | `screenshot … --fast` | 快速截图：JPEG、质量 0.6、缩放 0.5 | `xyzlcu screenshot --fast` |
 | `screenshot … --window "App" [--title T]` | 只截某个应用的窗口（默认它最前面的窗口） | `xyzlcu screenshot /tmp/w.png --window Safari` |
+| `screenshot … --window-id N` | 按 `windows` 列出的 id 截某个窗口 | `xyzlcu screenshot /tmp/w.png --window-id 1234` |
 | `screenshot … --region x,y,w,h` | 只截一块区域（全局点坐标） | `xyzlcu screenshot /tmp/r.png --region 100,100,400,300` |
 | `screenshot … --base64` | 不写文件，图片以 base64 放在 JSON 的 `base64` 字段（没给路径时默认 JPEG） | `xyzlcu screenshot --fast --base64` |
 | `screenshot … --stdout` | 不写文件，图片原始字节写到 stdout，元数据 JSON 写到 stderr | `xyzlcu screenshot --window Safari --stdout > w.jpg` |
@@ -130,8 +132,10 @@ xyzlcu whoami
 | `windows [--all]` | 屏幕上的窗口（所属应用、标题、位置） | `xyzlcu windows` |
 | `movewin "App" x y [--w W --h H] [--title T]` | 移动 / 缩放窗口并置前 | `xyzlcu movewin "Safari" 200 100 --w 1200 --h 800` |
 | `ax ["App"] [--depth N] [--menu]` | 导出界面控件树 | `xyzlcu ax TextEdit --depth 6` |
+| `ax ["App"] --compact [--menu] [--text] [--max 300]` | 只列可操作的控件：`[编号] 角色 "标题" ="值" @中心x,y`，给智能体用，省 token | `xyzlcu ax TextEdit --compact` |
 | `find "App" [--role R] [--title T] [--contains] [--index N\|--all] [--window T] [--menu]` | 找控件，返回 role、title、frame、center；找到就停 | `xyzlcu find TextEdit --role AXButton --title 保存` |
 | `click-el "App" --role R --title T [--click] [--right] [--double]` | 找到控件并按下（AXPress，不行就点中心） | `xyzlcu click-el TextEdit --role AXButton --title 保存` |
+| `click-el --ref N ["App"]` | 按上一次 `ax --compact` 的编号按下控件（需要守护进程） | `xyzlcu click-el --ref 3` |
 | `press "App" "标题"` | 按标题找到控件并按下（旧写法；新脚本建议用 `click-el`） | `xyzlcu press TextEdit "取消"` |
 | `wait "App" --title T [--role R] [--timeout 秒] [--gone]` | 等控件出现（或 `--gone` 消失），默认 5 秒超时 | `xyzlcu wait TextEdit --role AXSheet --timeout 3` |
 | `wait 毫秒` / `sleep 毫秒` | 等待固定时间 | `xyzlcu sleep 300` |
@@ -248,12 +252,15 @@ xyzlcu serve --stop     # 停止
 - `XYZLCU_DAEMON=0`：不用守护进程；`XYZLCU_DAEMON=1`：必须用守护进程，连不上就返回退出码 5。
 - **只会有一个守护进程**（v0.5.0）：`serve` 启动时先拿 `~/.xyzlcu/sock.lock` 的文件锁，已经有守护进程在跑就直接说明并返回 0（可以放心重复运行）；被 `kill -9` 留下的旧套接字会被识别并替换。守护进程刚启动、还没开始接受连接时，客户端最多等 3 秒（`XYZLCU_CONNECT_WAIT_MS`），不会误判成没有守护进程。
 - **协议**（v0.5.0）：客户端和守护进程之间图片走原始二进制（长度前缀），不再 base64；`--base64` 的 JSON 输出和 MCP 仍然是 base64。版本不同的客户端会自动退回进程内执行；`serve --stop` 能停掉旧版本的守护进程。
+- **旧守护进程自动重启**（v0.6.0）：升级后，客户端发现守护进程比自己旧，就停掉它、用新版本在后台重启，再执行这条命令（只发生一次，约 1 秒）。多个客户端同时发现时用 `~/.xyzlcu/sock.restart` 的文件锁排队。新守护进程的权限跟着启动它的进程走，所以只有当前进程同时有辅助功能和屏幕录制权限时才会自动重启，否则提示你在有权限的终端里手动重启。`XYZLCU_AUTO_RESTART=0` 关闭。客户端比守护进程旧时不动守护进程，退回进程内执行。
 - 套接字在 `~/.xyzlcu/sock`（目录权限 0700，套接字 0600），只接受**同一用户**的连接（`getpeereid` 校验），不监听网络端口。可以用 `XYZLCU_SOCKET` 改路径。
 - 守护进程里同样有锁屏保护和权限检查，相对路径按调用方的当前目录解析。
 - **权限（TCC）**：守护进程使用的是**启动它的那个 App** 的权限，所以要在智能体或终端自己的 shell 里运行 `xyzlcu serve --background`，这样负责 App 和直接运行命令时一样。用 `xyzlcu serve --status` 看 `responsibleProcess`。
 - **截图流（v0.4.2）**：守护进程第一次截某个窗口 / 屏幕 / 区域时，会在后台为它开一个 ScreenCaptureKit 截图流，之后的截图直接取最新一帧（输出 `method: "screencapturekit-stream"`），不用每次重新截。v0.5.0 起每个缩放比例单独一个流，由 GPU 直接缩放（新缩放比例的流还没出帧时，先用已有的流在 CPU 上缩一张）。最多同时 4 个流；某个流 20 秒没人用就自动关掉（`XYZLCU_STREAM_IDLE=秒` 可改）。刚点击 / 打字之后的截图会等到新的一帧（最多 0.12 秒），不会拿到操作前的旧画面。截图流开着时，菜单栏会显示系统的录屏指示，这是正常的；`XYZLCU_STREAM=0` 关闭截图流，每次单独截。`xyzlcu serve --status` 里 `liveStreams` 列出当前开着的流。
 - **预热主屏（v0.5.0）**：守护进程一启动就为主屏开好原尺寸和半尺寸两个截图流（`XYZLCU_PREWARM_SCALES=1,0.5` 可改），这样第一次截图也只要 25–35 毫秒，而不是 170–210 毫秒。**代价**：只要守护进程在跑，菜单栏就一直有录屏指示；两个流大约占 45 MB 内存，GPU 在屏幕变化时持续做一点缩放。预热的流 600 秒没人用才关（`XYZLCU_PREWARM_IDLE=秒`），关了之后下次截图再按需重开。不想要就 `XYZLCU_PREWARM=0 xyzlcu serve --background`。
 - **PNG 编码（v0.5.0）**：自己写的多线程 PNG 编码器（zlib 级别 1，按条带并行压缩），保持截图原来的色彩空间并嵌入 ICC 描述文件，和系统 ImageIO 编出来的像素完全一致，只是文件稍大。`XYZLCU_PNG=imageio` 改回系统编码器，`XYZLCU_PNG_LEVEL=0-9` 调压缩级别。
+- **窗口截图从主屏流里裁（v0.6.0）**：窗口没被别的窗口挡住、整个在某块屏幕里、那块屏幕的截图流开着时，`--window` 直接从流的最新一帧裁出窗口（`method: "display-stream-crop"`），第一次截某个窗口也只要 25 毫秒左右。圆角外面是桌面而不是透明。`XYZLCU_WINDOW_CROP=0` 关闭。
+- **应用表（v0.6.0）**：守护进程自己维护运行中的应用（启动 / 退出 / 激活 / 隐藏通知更新，最多 10 秒整体刷新一次），`apps`、找应用都不用再挨个问 LaunchServices。
 - 想开机自动启动，可以自己写一个 LaunchAgent（`~/Library/LaunchAgents/*.plist`，`ProgramArguments` 为 `xyzlcu serve`）。注意这时负责进程是 launchd 启动的 xyzlcu 本身，要在系统设置里单独给 `xyzlcu-core` 这个二进制授权（`ProgramArguments` 也建议直接写 `xyzlcu-core serve`）。XYZLCU 不会替你安装 LaunchAgent。
 
 ## 完整示例：用文本编辑写一段中文并保存
@@ -332,6 +339,7 @@ XYZLCU 是**通用的**：它不依赖任何智能体框架，也不需要插件
 - 截图：`xyzlcu screenshot --fast --base64`（整屏，图片在 JSON 的 base64 字段，不写文件）、
   `xyzlcu screenshot --window "App" --base64`、`xyzlcu screenshot /tmp/s.jpg --region x,y,w,h`
 - 按控件：`xyzlcu click-el "App" --role AXButton --title 保存`
+- 省 token 的看法：`xyzlcu ax "App" --compact` 只列可操作的控件（`[3] Button "保存" @612,340`），再 `xyzlcu click-el --ref 3` 按编号点
 - 点坐标：`xyzlcu click x y`（全局点坐标；截图像素要按 pixelsPerPoint 和 originX/originY 换算）
 - 打字：`xyzlcu type --app "App" --window "窗口标题" "文字"`（看输出的 path 和 verified）
 - 按键：`xyzlcu key --app "App" cmd+s`
@@ -433,6 +441,44 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 ## 性能对比（与 LCU）
 
+### 0.6.0 对比 0.5.0
+
+同一台机器，两个守护进程（0.5.0 和 0.6.0）同时跑在不同的套接字上，**交替**调用，每项 21 次，**中位数 / p90**，单位毫秒。交替测是为了排除系统负载波动（同一版本前后两轮能差 20%）。
+
+| 操作 | 0.5.0 | **0.6.0** |
+|---|---:|---:|
+| 列出应用（`apps`） | 9.5 / 9.9 | **3.2 / 3.5** |
+| 列出窗口（`windows`） | 3.4 / 7.0 | 3.3 / 4.4 |
+| 控件树（`ax 文本编辑`，焦点窗口） | 26.9 / 28.1 | **5.3 / 7.5** |
+| 控件树带菜单（`ax Finder --menu`） | 52.1 / 53.7 | **23.0 / 23.9** |
+| `find` 找到文本区域 | 20.6 / 23.3 | **7.9 / 11.0** |
+| `find` 找不到（搜完整棵树） | 26.9 / 30.9 | **12.9 / 14.9** |
+| 窗口截图（被挡住的窗口，流已开） | 14.7 / 16.0 | **6.2 / 6.8** |
+| 窗口截图（最前面的窗口，流已开） | 17.2 / 38.6 | **6.4 / 19.9** |
+| 整屏 `--fast` | 8.9 / 25.8 | 8.9 / 18.5 |
+| **第一次**截某个窗口（没被挡住，主屏流预热中；8 次） | 113.6 / 128.1 | **25.3 / 31.2** |
+| **第一次**截某个窗口（被挡住；8 次） | 98.3 / 120.6 | 82.1 / 88.6 |
+
+`ax --compact` 的输出大小（同样的窗口）：
+
+| | `ax` | `ax --compact` |
+|---|---:|---:|
+| 文本编辑窗口 | 740 字节 / 11 行 | **243 字节 / 4 行** |
+| 文本编辑窗口 + 菜单栏（`--menu`） | 9209 字节 / 153 行 | **513 字节 / 12 行** |
+| 访达 + 菜单栏（`--menu`） | 13680 字节 / 224 行 | **401 字节 / 11 行** |
+
+**慢在哪、改了什么（实话实说）**
+
+- **最大的瓶颈是 NSRunningApplication**：用 `sample` 看守护进程，`apps` 的时间几乎全花在 `_LSCopyApplicationInformation` 的同步 XPC 上。`NSWorkspace.runningApplications` 每次都返回新对象，读每个对象的第一个属性（连 `processIdentifier` 都算）都要问一次 LaunchServices，140 个进程约 8–15 毫秒。按 pid 缓存没用（读 pid 本身就慢），所以改成守护进程自己维护应用表。`find`、`ax`、窗口截图都要先找应用，所以一起变快。
+- **控件树**：原来每个控件 6–8 次 IPC，改成一次 `AXUIElementCopyMultipleAttributeValues`。
+- **第一次截窗口**：原来要先用 `SCScreenshotManager` 截一张（约 55 毫秒）再开窗口流。现在窗口没被挡住、整个在一块屏幕里、那块屏幕的流开着（守护进程默认预热主屏），就直接裁主屏的最新一帧。被挡住的窗口仍然走原来的路（约 80 毫秒），因为裁出来会带上前面的窗口。判断「挡住」时忽略铺满整块屏幕的非普通层窗口（程序坞、全屏透明覆盖层），否则所有窗口都会被判成挡住。
+- **没改的**：
+  - 进程内（不开守护进程）调用约 13 毫秒的固定开销是加载 Swift 运行时和 AppKit 等框架，代码里省不掉；解决办法就是守护进程 + C 客户端（3 毫秒）。
+  - `--fast` 已经是 GPU 直接出小图，约 9 毫秒，主要是编码和传输。
+  - 预热的流保持 60 fps：空闲时守护进程约占 1.9% 的一个核、9.6 MB 内存（只在最后一次截图后的 10 分钟内）。降帧率会让点击后的截图等更久，不划算。
+  - `run` 里多张 `--stdout` 图没有做成一次返回多张（命令行的标准输出只能放一段二进制），改成明确报错；要多张图用 `-o` 文件或 MCP `batch`。
+
+### 0.5.0 对比 0.4.2 和 LCU
 **环境**：Apple Silicon Mac（macOS 26+）。XYZLCU 0.5.0 对比 0.4.2 和 [LCU](https://github.com/amontlabs/lcu) 0.13.4（ChatGPT 自带的 CUA 运行时 0.0.35）。每项跑 15 次，表里是**中位数 / p90**，单位毫秒。LCU 一列是 0.4.2 那一轮在同一台机器上测的（这次没有重装 LCU）。
 
 | 操作 | 0.5.0 进程内 | **0.5.0 守护进程** | 0.4.2 守护进程 | LCU（MCP `js` 调用） |
@@ -658,6 +704,8 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 - `press` 只按完全匹配（不区分大小写）的标题、描述、值或 identifier 找控件，返回第一个匹配项；需要更精确时用 `find` / `click-el` 的 `--role`、`--index`、`--window`。
 - `type` 不经过输入法，需要输入法联想的场景不适用。
 - 不支持其他桌面（Space）上的窗口的切换管理。
+- 守护进程的应用表最多 10 秒刷新一次：后台进程刚变成普通应用、又没有被激活时，`apps` 最多晚 10 秒看到它（按名字找应用时找不到会立刻整体重扫，不受影响）。
+- 从主屏流里裁出来的窗口截图，圆角外面是桌面而不是透明；窗口被别的窗口挡住、跨屏或主屏流没开时，会自动改回单独截窗口。
 
 ## 卸载
 
@@ -673,6 +721,13 @@ rm -rf ~/.xyzlcu
 
 ## 更新记录
 
+- **0.6.0**：守护进程查询更快，给智能体的控件列表更省 token。
+  - **应用表**：守护进程自己维护运行中应用的表（启动 / 退出 / 激活 / 隐藏通知更新，最多 10 秒整体刷新一次），不再每次向 LaunchServices 逐个问。`apps` 9.5 → 3.2 毫秒，`ax` / `find` / `click-el` / `press` / 窗口截图都省掉 6–10 毫秒。
+  - **控件树批量读**：`ax` 每个控件一次 IPC 取全部属性（文本编辑窗口 27 → 5 毫秒，`ax Finder --menu` 52 → 23 毫秒）。
+  - **`ax --compact`**：只列可操作的控件，一行一个，带编号和中心点；`click-el --ref N` 按编号点（需要守护进程）。`ax Finder --menu` 13.7 KB → 0.4 KB。MCP 的 `ax` 工具加 `compact` / `menu` / `text` / `max`，`click_element` 加 `ref`。
+  - **窗口截图从主屏流里裁**：窗口没被挡住时直接裁主屏常驻流的最新一帧，第一次截某个窗口 114 → 25 毫秒（`method: "display-stream-crop"`，`XYZLCU_WINDOW_CROP=0` 关闭）。新增 `--window-id N`（MCP `window_id`）。
+  - **旧守护进程自动重启**：升级后客户端发现守护进程版本更旧，会停掉它并用新版本重启（只在当前进程有辅助功能 + 录屏权限时做，`XYZLCU_AUTO_RESTART=0` 关闭）；第一次调用多 1 秒左右。
+  - 修复：版本不一致退回进程内执行时，`batch` 从标准输入读的脚本会丢失；`run` / `batch` 里有两张 `--stdout` 图时第二张会悄悄覆盖第一张，现在明确报错。
 - **0.5.0**：速度大改。
   - **C 小客户端**：`xyzlcu` 变成一个很小的 C 程序，有守护进程时直接转发（空调用 8 → 3 毫秒），没有就 `exec` 同目录的 `xyzlcu-core`。权限归属不变（还是启动它的 App）。安装多了一个文件 `xyzlcu-core`。
   - **截图编码**：并行 PNG 编码（全尺寸 171 → 31 毫秒，保留 ICC 色彩描述），新增 `--format heic`，格式按 `--format` > 文件扩展名 > 默认（`--fast` / 内存里 JPEG，其余 PNG）决定。
