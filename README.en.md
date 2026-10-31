@@ -91,7 +91,7 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `request` | Bring up the system permission prompts | `xyzlcu request` |
 | `whoami` | Process chain and responsible app | `xyzlcu whoami` |
 | `version` | Version | `xyzlcu version` |
-| `screenshot [path] [--scale S] [--display N]` | PNG screenshot | `xyzlcu screenshot /tmp/s.png --scale 0.5` |
+| `screenshot [path] [--scale S] [--display N] [--format png\|jpg] [--quality Q]` | Screenshot (PNG by default; JPEG is faster and smaller) | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
 | `displays` | Displays and their coordinate ranges | `xyzlcu displays` |
 | `click x y [--right] [--double]` | Click | `xyzlcu click 500 300 --double` |
 | `move x y` | Move the pointer | `xyzlcu move 800 600` |
@@ -109,6 +109,9 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `ax ["App"] [--depth N] [--menu]` | Dump the UI control tree | `xyzlcu ax TextEdit --depth 6` |
 | `press "App" "title"` | Find a control by title and press it | `xyzlcu press TextEdit "Cancel"` |
 | `wait ms` | Wait | `xyzlcu wait 500` |
+| `taps` | List system event taps (diagnose stuck or dropped input) | `xyzlcu taps` |
+| `run 'cmd; cmd; …'` | Run several commands in one launch (split on `;` or newlines) | `xyzlcu run 'click 500 300; type hello; key return'` |
+| `batch [file]` | Run commands line by line from a file or stdin | `printf 'type a\nkey return\n' \| xyzlcu batch` |
 
 Notes:
 
@@ -116,6 +119,9 @@ Notes:
 - **Key names**: `a–z`, `0–9`, common symbols, `return`/`enter`, `tab`, `space`, `delete`/`backspace`, `forwarddelete`, `esc`, `up`/`down`/`left`/`right`, `home`/`end`/`pageup`/`pagedown`, `f1–f12`. Modifiers: `cmd`, `shift`, `opt`/`alt`, `ctrl`, `fn`.
 - **`ax` output format**: `Role(Subrole) title="…" desc="…" value="…" id="…" [x,y WxH]`. The brackets hold point coordinates; the center is `(x + W/2, y + H/2)`.
 - **`press`** tries AXPress first and clicks the control's center if that fails.
+- **`run` / `batch`**: quoting works like the shell (`"…"`, `'…'`, `\` escapes); lines starting with `#` are comments. Execution stops at the first failing command, with that command's exit code.
+- **`--delay N`**: gap between synthesized mouse/keyboard events in ms (default 2). Raise it if a slow app drops input, e.g. `xyzlcu --delay 20 type …` or `XYZLCU_DELAY=20`.
+- **Screenshots**: on macOS 14+ capture goes through ScreenCaptureKit (in-process, rendered directly at the `--scale` size); otherwise, or with `--cli`, it falls back to the system `screencapture`. The `method` field in the output tells you which path ran.
 
 ## Worked example: write Chinese text in TextEdit and save it
 
@@ -161,7 +167,29 @@ You can control this Mac's GUI with `xyzlcu`. Rules:
 3. Before every `type` or `key`, run `xyzlcu activate "TargetApp"` and confirm with `xyzlcu apps` that it is frontmost (active: true). Keyboard input goes to the frontmost app.
 4. Ask the user before anything irreversible: payments, deletions, sending, submitting.
 5. Never use --force to bypass the lock-screen guard.
+6. Once the target is confirmed frontmost, chain several steps into one `xyzlcu run 'click 500 300; type hello; key return'`; it is several times faster than separate calls.
 ```
+
+## Performance
+
+v0.2.0 removes the fixed 15–60 ms sleeps (replaced by `--delay`, default 2 ms), reuses one event source, types in 20-unit UTF-16 chunks, captures screenshots with ScreenCaptureKit directly at the scaled size, adds JPEG output, builds with `-wmo`, and adds `run`/`batch` so multi-step actions pay the process start-up cost once.
+
+Medians from `scripts/bench.py` on an Apple Silicon Mac (macOS 26+):
+
+| Command | v0.1.0 | v0.2.0 | Speed-up |
+|---|---:|---:|---:|
+| `screenshot --scale 0.5` (PNG) | 750 ms | 251 ms | 3.0× |
+| `screenshot --scale 0.5 --format jpg` | — | 197 ms | 3.8× (vs v0.1.0 PNG) |
+| `screenshot` (full 4112×2658 PNG) | 555 ms | 501 ms | 1.1× |
+| `type` (128 chars, mixed Chinese/English) | 222 ms | 73 ms | 3.0× |
+| `type` (5 chars) | 84 ms | 58 ms | 1.4× |
+| `key right` | 102 ms | 68 ms | 1.5× |
+| `click` | 85 ms | 58 ms | 1.5× |
+| `move` | 60 ms | 51 ms | 1.2× |
+| 5 actions (alternating type/key) | ~310 ms (5 launches) | 76 ms (one `batch`) | 4× |
+| `check` / `apps` / `windows` / `cursor` / `ax` | 15–50 ms | 15–55 ms | unchanged (mostly process start-up) |
+
+Run it yourself: `python3 scripts/bench.py build/xyzlcu` (`--gui` also opens a temporary TextEdit document to time clicks and typing, and closes it afterwards).
 
 ## Coordinate system
 
@@ -190,6 +218,8 @@ You can control this Mac's GUI with `xyzlcu`. Rules:
 **Clicks or typing do nothing?**
 - Accessibility isn't granted to the right app. Run `xyzlcu whoami`, enable the app shown in `responsiblePath`, then restart that app.
 - After changing permissions or updating the app, you may need to toggle the switch off and on again.
+- Input shows up late or characters go missing: run `xyzlcu taps`. A process with `listenOnly: false` and a large `avgLatencyMs` (hundreds of ms or more) is holding up input events; common culprits are Screen Sharing (RFBEventHelperd), voice assistants or other computer-use tools. Quit or restart it and try again.
+- If an app can't keep up with fast input, widen the gap: `xyzlcu --delay 20 type …`.
 
 **Does a Chinese input method get in the way?**
 - `type` sends Unicode characters directly and bypasses the input method, so the right text comes out even with a Chinese IME active.

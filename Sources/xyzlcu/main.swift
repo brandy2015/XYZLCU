@@ -5,6 +5,8 @@ import Foundation
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import ImageIO
+import ScreenCaptureKit
 
 // MARK: - 工具函数
 func out(_ obj: Any) {
@@ -26,7 +28,10 @@ func option(_ name: String) -> String? {
     return nil
 }
 func need(_ n: Int, _ usage: String) { if args.count < n { fail("用法: xyzlcu \(usage)") } }
-func sleepMs(_ ms: Int) { usleep(useconds_t(ms * 1000)) }
+func sleepMs(_ ms: Int) { if ms > 0 { usleep(useconds_t(ms * 1000)) } }
+/// 事件之间的间隔（毫秒），可用 --delay N 或环境变量 XYZLCU_DELAY 调整
+var stepDelay: Int = Int(ProcessInfo.processInfo.environment["XYZLCU_DELAY"] ?? "") ?? 2
+let eventSource = CGEventSource(stateID: .hidSystemState)
 
 // MARK: - 权限
 func axTrusted() -> Bool { AXIsProcessTrusted() }
@@ -56,15 +61,15 @@ func pathOf(_ pid: pid_t) -> String {
 func mainDisplayHeight() -> CGFloat { CGDisplayBounds(CGMainDisplayID()).height }
 func post(_ e: CGEvent?) { e?.post(tap: .cghidEventTap) }
 func mouse(_ type: CGEventType, _ p: CGPoint, _ btn: CGMouseButton = .left, clicks: Int64 = 1) {
-    let e = CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState), mouseType: type, mouseCursorPosition: p, mouseButton: btn)
+    let e = CGEvent(mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: p, mouseButton: btn)
     e?.setIntegerValueField(.mouseEventClickState, value: clicks)
     post(e)
 }
 func click(_ p: CGPoint, right: Bool, double: Bool) {
     let (down, up, btn): (CGEventType, CGEventType, CGMouseButton) = right ? (.rightMouseDown, .rightMouseUp, .right) : (.leftMouseDown, .leftMouseUp, .left)
-    mouse(.mouseMoved, p); sleepMs(30)
+    mouse(.mouseMoved, p); sleepMs(stepDelay)
     mouse(down, p, btn, clicks: 1); mouse(up, p, btn, clicks: 1)
-    if double { sleepMs(60); mouse(down, p, btn, clicks: 2); mouse(up, p, btn, clicks: 2) }
+    if double { sleepMs(stepDelay); mouse(down, p, btn, clicks: 2); mouse(up, p, btn, clicks: 2) }
 }
 
 // MARK: - 键盘
@@ -91,16 +96,16 @@ func pressCombo(_ combo: String) {
         else { fail("未知按键: \(p)") }
     }
     guard let k = key else { fail("组合键里没有主键: \(combo)") }
-    let src = CGEventSource(stateID: .hidSystemState)
+    let src = eventSource
     let d = CGEvent(keyboardEventSource: src, virtualKey: k, keyDown: true); d?.flags = flags; post(d)
     let u = CGEvent(keyboardEventSource: src, virtualKey: k, keyDown: false); u?.flags = flags; post(u)
 }
 func typeText(_ text: String) {
-    let src = CGEventSource(stateID: .hidSystemState)
+    let src = eventSource
     let units = Array(text.utf16)
     var i = 0
     while i < units.count {
-        var end = min(i + 16, units.count)
+        var end = min(i + 20, units.count)
         if end < units.count, UTF16.isLeadSurrogate(units[end - 1]) { end -= 1 } // 不拆开代理对
         var chunk = Array(units[i..<end])
         for down in [true, false] {
@@ -109,7 +114,7 @@ func typeText(_ text: String) {
             e?.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
             post(e)
         }
-        sleepMs(15); i = end
+        i = end; if i < units.count { sleepMs(stepDelay) }
     }
 }
 
@@ -188,34 +193,72 @@ func activeDisplays() -> [CGDirectDisplayID] {
     let main = CGMainDisplayID()
     return ids.filter { $0 == main } + ids.filter { $0 != main }
 }
-func screenshot(path: String, scale: Double?, display: Int) {
+func writeImage(_ img: CGImage, to url: URL, jpeg: Bool, quality: Double) -> Bool {
+    let type = (jpeg ? "public.jpeg" : "public.png") as CFString
+    guard let dest = CGImageDestinationCreateWithURL(url as CFURL, type, 1, nil) else { return false }
+    let props: [CFString: Any] = jpeg ? [kCGImageDestinationLossyCompressionQuality: quality] : [:]
+    CGImageDestinationAddImage(dest, img, props as CFDictionary)
+    return CGImageDestinationFinalize(dest)
+}
+func scaled(_ img: CGImage, _ s: Double) -> CGImage {
+    let w = max(1, Int(Double(img.width) * s)), h = max(1, Int(Double(img.height) * s))
+    guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return img }
+    ctx.interpolationQuality = .medium
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return ctx.makeImage() ?? img
+}
+/// 快路径：ScreenCaptureKit（macOS 14+），在进程内截图，直接按目标尺寸输出
+func captureSCK(_ did: CGDirectDisplayID, pixelWidth: Int, pixelHeight: Int) -> CGImage? {
+    guard #available(macOS 14.0, *) else { return nil }
+    let sem = DispatchSemaphore(value: 0)
+    var result: CGImage?
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, _ in
+        guard let content = content, let d = content.displays.first(where: { $0.displayID == did }) else { sem.signal(); return }
+        let filter = SCContentFilter(display: d, excludingWindows: [])
+        let cfg = SCStreamConfiguration()
+        cfg.width = pixelWidth; cfg.height = pixelHeight
+        cfg.showsCursor = false
+        cfg.captureResolution = .best
+        SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg) { img, _ in
+            result = img; sem.signal()
+        }
+    }
+    return sem.wait(timeout: .now() + 5) == .timedOut ? nil : result
+}
+/// 慢路径：/usr/sbin/screencapture
+func captureCLI(display: Int, tmp: String) -> CGImage? {
+    let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+    p.arguments = ["-x", "-D", String(display), "-t", "png", tmp]
+    try? p.run(); p.waitUntilExit()
+    defer { try? FileManager.default.removeItem(atPath: tmp) }
+    guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: tmp) as CFURL, nil) else { return nil }
+    // 立即解码，否则 defer 删掉临时文件后图像会是全黑
+    return CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+}
+func screenshot(path: String, scale: Double?, display: Int, jpeg: Bool, quality: Double, forceCLI: Bool) {
     let displays = activeDisplays()
     guard display >= 1 && display <= displays.count else { fail("没有第 \(display) 块显示器（共 \(displays.count) 块，见 xyzlcu displays）") }
-    let b = CGDisplayBounds(displays[display - 1])
-    let url = URL(fileURLWithPath: path)
-    var method = "screencapture"
-    let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    p.arguments = ["-x", "-D", String(display), "-t", "png", path]
-    try? p.run(); p.waitUntilExit()
-    guard FileManager.default.fileExists(atPath: path), let img = NSImage(contentsOf: url),
-          let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+    let did = displays[display - 1]
+    let b = CGDisplayBounds(did)
+    let nativeW = CGDisplayCopyDisplayMode(did)?.pixelWidth ?? Int(b.width)
+    let nativeH = CGDisplayCopyDisplayMode(did)?.pixelHeight ?? Int(b.height)
+    let s = (scale ?? 1) > 0 ? (scale ?? 1) : 1
+    let tw = max(1, Int(Double(nativeW) * s)), th = max(1, Int(Double(nativeH) * s))
+    var method = "screencapturekit"
+    var img: CGImage? = (forceCLI || !screenTrusted()) ? nil : captureSCK(did, pixelWidth: tw, pixelHeight: th)
+    if img == nil {
+        method = "screencapture"
+        img = captureCLI(display: display, tmp: NSTemporaryDirectory() + "xyzlcu-raw-\(getpid()).png")
+        if let i = img, i.width != tw { img = scaled(i, Double(tw) / Double(i.width)); method += "+scaled" }
+    }
+    guard let cg = img, writeImage(cg, to: URL(fileURLWithPath: path), jpeg: jpeg, quality: quality) else {
         fail("截图失败（多半是没有屏幕录制权限）", code: 2)
     }
-    var w = cg.width, h = cg.height
-    if let s = scale, s > 0, s != 1 {
-        w = Int(Double(cg.width) * s); h = Int(Double(cg.height) * s)
-        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-        ctx.interpolationQuality = .high
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
-        let rep = NSBitmapImageRep(cgImage: ctx.makeImage()!)
-        try? rep.representation(using: .png, properties: [:])?.write(to: url)
-        method += "+scaled"
-    }
     // 锁屏时截图全黑；没有屏幕录制权限时只能拍到桌面和菜单栏
-    out(["path": path, "display": display, "pixelWidth": w, "pixelHeight": h,
+    out(["path": path, "display": display, "pixelWidth": cg.width, "pixelHeight": cg.height,
          "originX": Int(b.origin.x), "originY": Int(b.origin.y), "pointWidth": Int(b.width), "pointHeight": Int(b.height),
-         "pixelsPerPoint": Double(w) / Double(b.width), "method": method, "screenRecordingGranted": screenTrusted(), "screenLocked": screenLocked(),
+         "pixelsPerPoint": Double(cg.width) / Double(b.width), "method": method, "screenLocked": screenLocked(),
          "note": "全局点坐标 x = originX + x_pixel / pixelsPerPoint，y = originY + y_pixel / pixelsPerPoint"])
 }
 
@@ -223,16 +266,24 @@ func screenshot(path: String, scale: Double?, display: Int) {
 let usage = """
 xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   check | request | whoami
-  screenshot [path] [--scale 0.5] [--display N]
+  screenshot [path] [--scale 0.5] [--display N] [--format png|jpg] [--quality 0.7] [--cli]
   click x y [--right] [--double] | move x y | drag x1 y1 x2 y2 | scroll dx dy
   type "文字" | key cmd+shift+4
   apps | open "App" | activate "App" | hide "App" | windows [--all]
   displays | movewin "App" x y [--w W --h H] [--title 标题]
   ax ["App"] [--depth N] [--menu] | press "App" "按钮标题"
-  cursor | wait 毫秒
+  cursor | wait 毫秒 | version | taps（诊断输入卡顿）
+  batch [脚本文件]  （从 stdin 或文件逐行读取命令，一次启动执行多步）
+  run 'click 10 20; type 你好; key return'
+  通用选项: --delay N  事件间隔毫秒（默认 2，也可用环境变量 XYZLCU_DELAY）
 """
-let version = "0.1.0"
-guard !args.isEmpty else { print(usage); exit(0) }
+let version = "0.2.0"
+var inBatch = false
+
+func execute(_ argv: [String]) {
+args = argv
+if let d = option("--delay") { stepDelay = Int(dbl(d)) }
+guard !args.isEmpty else { return }
 let cmd = args.removeFirst()
 
 switch cmd {
@@ -258,8 +309,12 @@ case "whoami":
 case "screenshot":
     let scale = option("--scale").map(dbl)
     let display = Int(option("--display") ?? "1") ?? 1
-    let path = args.first ?? (NSTemporaryDirectory() + "xyzlcu-\(Int(Date().timeIntervalSince1970)).png")
-    screenshot(path: path, scale: scale, display: display)
+    let fmt = (option("--format") ?? "png").lowercased()
+    let quality = option("--quality").map(dbl) ?? 0.7
+    let forceCLI = flag("--cli")
+    let jpeg = fmt == "jpg" || fmt == "jpeg" || (args.first?.lowercased().hasSuffix(".jpg") ?? false) || (args.first?.lowercased().hasSuffix(".jpeg") ?? false)
+    let path = args.first ?? (NSTemporaryDirectory() + "xyzlcu-\(Int(Date().timeIntervalSince1970)).\(jpeg ? "jpg" : "png")")
+    screenshot(path: path, scale: scale, display: display, jpeg: jpeg, quality: quality, forceCLI: forceCLI)
 case "click":
     guardUnlocked(); let right = flag("--right"), double = flag("--double")
     need(2, "click x y [--right] [--double]")
@@ -274,8 +329,9 @@ case "drag":
     guardUnlocked()
     need(4, "drag x1 y1 x2 y2")
     let a = CGPoint(x: dbl(args[0]), y: dbl(args[1])), b = CGPoint(x: dbl(args[2]), y: dbl(args[3]))
-    mouse(.mouseMoved, a); sleepMs(50); mouse(.leftMouseDown, a); sleepMs(50)
-    for i in 1...20 { let t = CGFloat(i) / 20; mouse(.leftMouseDragged, CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)); sleepMs(15) }
+    let dd = max(stepDelay, 8)  // 拖拽需要一点时间让应用识别
+    mouse(.mouseMoved, a); sleepMs(dd); mouse(.leftMouseDown, a); sleepMs(dd)
+    for i in 1...12 { let t = CGFloat(i) / 12; mouse(.leftMouseDragged, CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)); sleepMs(dd) }
     mouse(.leftMouseUp, b); print("ok")
 case "scroll":
     guardUnlocked()
@@ -286,7 +342,7 @@ case "type":
     need(1, "type \"文字\""); typeText(args.joined(separator: " ")); print("ok")
 case "key":
     guardUnlocked()
-    need(1, "key cmd+shift+4"); for c in args { pressCombo(c); sleepMs(30) }; print("ok")
+    need(1, "key cmd+shift+4"); for (i, c) in args.enumerated() { if i > 0 { sleepMs(stepDelay) }; pressCombo(c) }; print("ok")
 case "cursor":
     let p = CGEvent(source: nil)?.location ?? .zero; out(["x": Int(p.x), "y": Int(p.y)])
 case "wait":
@@ -310,7 +366,7 @@ case "displays":
     out(activeDisplays().enumerated().map { (i, d) -> [String: Any] in
         let b = CGDisplayBounds(d)
         return ["index": i + 1, "id": Int(d), "main": d == CGMainDisplayID(), "x": Int(b.origin.x), "y": Int(b.origin.y),
-                "w": Int(b.width), "h": Int(b.height), "pixelWidth": CGDisplayPixelsWide(d), "pixelHeight": CGDisplayPixelsHigh(d)]
+                "w": Int(b.width), "h": Int(b.height), "pixelWidth": CGDisplayCopyDisplayMode(d)?.pixelWidth ?? 0, "pixelHeight": CGDisplayCopyDisplayMode(d)?.pixelHeight ?? 0]
     })
 case "movewin":
     let wOpt = option("--w").map(dbl), hOpt = option("--h").map(dbl), titleOpt = option("--title")
@@ -366,6 +422,61 @@ case "press":
         if let f = frame(el) { click(CGPoint(x: f["x"]! + f["w"]! / 2, y: f["y"]! + f["h"]! / 2), right: false, double: false); print("ok (AXPress 失败，已改为点击中心)") }
         else { fail("AXPress 失败: \(r.rawValue)") }
     } else { print("ok") }
+case "taps":
+    // 诊断：列出系统里的事件监听（event tap）。主动拦截型（listenOnly=false）且延迟很高的 tap 会让键盘/鼠标输入卡住或丢失
+    var n: UInt32 = 0; CGGetEventTapList(0, nil, &n)
+    var list = [CGEventTapInformation](repeating: CGEventTapInformation(), count: Int(n)); CGGetEventTapList(n, &list, &n)
+    out(list.prefix(Int(n)).map { t -> [String: Any] in
+        var buf = [CChar](repeating: 0, count: 4096); proc_pidpath(t.tappingProcess, &buf, 4096)
+        return ["process": String(cString: buf), "pid": Int(t.tappingProcess), "enabled": t.enabled,
+                "listenOnly": t.options == .listenOnly, "eventsMask": String(t.eventsOfInterest, radix: 16),
+                "avgLatencyMs": Double(t.avgUsecLatency) / 1000, "maxLatencyMs": Double(t.maxUsecLatency) / 1000]
+    })
+case "batch", "run":
+    fail("batch/run 不能嵌套")
 default:
-    print(usage); exit(1)
+    fail("未知命令: \(cmd)（xyzlcu help 查看用法）")
+}
+fflush(stdout)
+}
+
+/// 把脚本拆成命令：换行或不在引号内的 ; 分隔，支持 "…" '…' 和 \ 转义，# 开头为注释
+func parseScript(_ text: String) -> [[String]] {
+    var cmds: [[String]] = [], cur: [String] = [], tok = "", hasTok = false
+    var quote: Character? = nil, escape = false, comment = false
+    func endTok() { if hasTok { cur.append(tok) }; tok = ""; hasTok = false }
+    func endCmd() { endTok(); if !cur.isEmpty { cmds.append(cur) }; cur = [] }
+    for ch in text {
+        if comment { if ch == "\n" { comment = false; endCmd() }; continue }
+        if escape { tok.append(ch == "n" ? "\n" : ch); hasTok = true; escape = false; continue }
+        if let q = quote {
+            if ch == q { quote = nil } else if ch == "\\" && q == "\"" { escape = true } else { tok.append(ch) }
+            continue
+        }
+        switch ch {
+        case "\\": escape = true
+        case "\"", "'": quote = ch; hasTok = true
+        case " ", "\t": endTok()
+        case "\n", ";": endCmd()
+        case "#" where !hasTok && cur.isEmpty: comment = true
+        default: tok.append(ch); hasTok = true
+        }
+    }
+    endCmd()
+    return cmds
+}
+
+let top = Array(CommandLine.arguments.dropFirst())
+if top.isEmpty { print(usage); exit(0) }
+if top[0] == "batch" || top[0] == "run" {
+    inBatch = true
+    var rest = Array(top.dropFirst())
+    if let i = rest.firstIndex(of: "--delay"), i + 1 < rest.count { stepDelay = Int(dbl(rest[i + 1])); rest.removeSubrange(i...i+1) }
+    let text: String
+    if top[0] == "run" { text = rest.joined(separator: " ") }
+    else if let f = rest.first { guard let t = try? String(contentsOfFile: f, encoding: .utf8) else { fail("读不到脚本: \(f)") }; text = t }
+    else { text = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? "" }
+    for c in parseScript(text) { execute(c) }
+} else {
+    execute(top)
 }

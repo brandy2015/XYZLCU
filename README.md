@@ -91,7 +91,7 @@ xyzlcu whoami
 | `request` | 弹出系统授权窗口 | `xyzlcu request` |
 | `whoami` | 进程链与负责 App | `xyzlcu whoami` |
 | `version` | 版本号 | `xyzlcu version` |
-| `screenshot [path] [--scale S] [--display N]` | 截屏（PNG） | `xyzlcu screenshot /tmp/s.png --scale 0.5` |
+| `screenshot [path] [--scale S] [--display N] [--format png\|jpg] [--quality Q]` | 截屏（默认 PNG，JPEG 更快更小） | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
 | `displays` | 列出显示器及其坐标范围 | `xyzlcu displays` |
 | `click x y [--right] [--double]` | 点击 | `xyzlcu click 500 300 --double` |
 | `move x y` | 移动鼠标 | `xyzlcu move 800 600` |
@@ -109,6 +109,9 @@ xyzlcu whoami
 | `ax ["App"] [--depth N] [--menu]` | 导出界面控件树 | `xyzlcu ax TextEdit --depth 6` |
 | `press "App" "标题"` | 按标题找到控件并按下 | `xyzlcu press TextEdit "取消"` |
 | `wait 毫秒` | 等待 | `xyzlcu wait 500` |
+| `taps` | 列出系统事件监听（排查输入卡顿/丢失） | `xyzlcu taps` |
+| `run '命令; 命令; …'` | 一次启动执行多条命令（`;` 或换行分隔） | `xyzlcu run 'click 500 300; type 你好; key return'` |
+| `batch [文件]` | 从文件或 stdin 逐行读命令执行 | `printf 'type a\nkey return\n' \| xyzlcu batch` |
 
 补充：
 
@@ -116,6 +119,9 @@ xyzlcu whoami
 - **按键名**：`a–z`、`0–9`、常用符号、`return`/`enter`、`tab`、`space`、`delete`/`backspace`、`forwarddelete`、`esc`、`up`/`down`/`left`/`right`、`home`/`end`/`pageup`/`pagedown`、`f1–f12`。修饰键：`cmd`、`shift`、`opt`/`alt`、`ctrl`、`fn`。
 - **`ax` 输出格式**：`角色(子角色) title="…" desc="…" value="…" id="…" [x,y 宽x高]`。中括号里的就是点坐标，中心点 = `(x + 宽/2, y + 高/2)`。
 - **`press`** 优先执行 AXPress，按不了就点控件中心。
+- **`run` / `batch`**：引号规则和 shell 一样（`"…"`、`'…'`、`\` 转义），`#` 开头的行是注释。遇到第一个出错的命令就停止，退出码同单条命令。
+- **`--delay N`**：鼠标/键盘事件之间的间隔（毫秒，默认 2）。个别应用反应慢、丢字时调大，例如 `xyzlcu --delay 20 type …` 或 `XYZLCU_DELAY=20`。
+- **截图**：macOS 14+ 走 ScreenCaptureKit（进程内截图，直接按 `--scale` 输出目标尺寸），否则或加 `--cli` 时退回系统 `screencapture`。输出里的 `method` 字段会告诉你走的哪条路。
 
 ## 完整示例：用文本编辑写一段中文并保存
 
@@ -161,7 +167,29 @@ xyzlcu key cmd+w
 3. 每次 `type` 或 `key` 之前先 `xyzlcu activate "目标App"`，再用 `xyzlcu apps` 确认它是前台（active: true）。键盘输入会发给当前前台应用。
 4. 付款、删除、发送、提交这类不可撤销的操作，先征得用户同意。
 5. 不要用 --force 绕过锁屏保护。
+6. 已经确认过前台、要连续做几步时，可以合成一条 `xyzlcu run 'click 500 300; type 你好; key return'`，比分开调用快好几倍。
 ```
+
+## 性能
+
+v0.2.0 做了这些优化：去掉固定的 15–60 毫秒等待（改成 `--delay`，默认 2 毫秒）、复用同一个事件源、文字按 20 个 UTF-16 单元一段发送、截图改走 ScreenCaptureKit 并直接输出缩放后的尺寸、支持 JPEG、`-wmo` 编译，以及新增 `run`/`batch`，多步操作只启动一次进程。
+
+在 Apple Silicon Mac（macOS 26+）上用 `scripts/bench.py` 测得的中位数：
+
+| 命令 | v0.1.0 | v0.2.0 | 提升 |
+|---|---:|---:|---:|
+| `screenshot --scale 0.5`（PNG） | 750 ms | 251 ms | 3.0× |
+| `screenshot --scale 0.5 --format jpg` | — | 197 ms | 3.8×（对比 v0.1.0 PNG） |
+| `screenshot`（全尺寸 4112×2658 PNG） | 555 ms | 501 ms | 1.1× |
+| `type`（128 个字符，中英混合） | 222 ms | 73 ms | 3.0× |
+| `type`（5 个字符） | 84 ms | 58 ms | 1.4× |
+| `key right` | 102 ms | 68 ms | 1.5× |
+| `click` | 85 ms | 58 ms | 1.5× |
+| `move` | 60 ms | 51 ms | 1.2× |
+| 5 步操作（type/key 交替） | 约 310 ms（5 次调用） | 76 ms（一次 `batch`） | 4× |
+| `check` / `apps` / `windows` / `cursor` / `ax` | 15–50 ms | 15–55 ms | 持平（主要是进程启动开销） |
+
+自己测：`python3 scripts/bench.py build/xyzlcu`（加 `--gui` 会新建一个临时文本编辑文稿来测点击和输入，结束后自动关闭）。
 
 ## 坐标系
 
@@ -190,6 +218,8 @@ xyzlcu key cmd+w
 **点击、打字没反应？**
 - 「辅助功能」权限没授给正确的 App。运行 `xyzlcu whoami`，看 `responsiblePath` 是哪个 App，给它打开开关，然后重启那个 App。
 - 改过权限或更新过 App 之后，可能要把开关关掉再打开。
+- 输入很久之后才出现、或者丢字：运行 `xyzlcu taps`。如果有 `listenOnly: false` 且 `avgLatencyMs` 很大（几百毫秒以上）的进程，说明它拦着输入事件处理得很慢，常见于屏幕共享（RFBEventHelperd）、语音助手或其他「电脑操控」工具。退出或重启那个程序后再试。
+- 某些应用来不及处理快速输入时，加大间隔：`xyzlcu --delay 20 type …`。
 
 **中文输入法会干扰吗？**
 - `type` 直接发送 Unicode 字符，不经过输入法，中文输入法开着也能输入正确的文字。

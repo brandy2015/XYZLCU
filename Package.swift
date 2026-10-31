@@ -8,7 +8,7 @@ let package = Package(
         .executableTarget(
             name: "xyzlcu",
             path: "Sources/xyzlcu",
-            linkerSettings: [.linkedFramework("AppKit"), .linkedFramework("ApplicationServices")]
+            linkerSettings: [.linkedFramework("AppKit"), .linkedFramework("ApplicationServices"), .linkedFramework("ScreenCaptureKit")]
         )
     ]
 )
