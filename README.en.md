@@ -2,7 +2,7 @@
 
 [中文](README.md) | **English**
 
-**XYZLCU (XYZ Local Computer Use)** is a dependency-free macOS GUI control CLI. Anything that can run shell commands, whether an AI agent (Claude Code, Codex, any shell-capable agent) or your own script, can use it to see the screen, click, type, press shortcuts, read the UI structure and press buttons. It is a single Swift source file compiled into a single binary: no Python, no Node, no Homebrew, no third-party libraries.
+**XYZLCU (XYZ Local Computer Use)** is a dependency-free macOS GUI control CLI. Anything that can run shell commands, whether an AI agent (Claude Code, Codex, any shell-capable agent) or your own script, can use it to see the screen, click, type, press shortcuts, read the UI structure and press buttons. It is one Swift source file (built as `xyzlcu-core`) plus a tiny C client (`xyzlcu`): no Python, no Node, no Homebrew, no third-party libraries.
 
 > **General-purpose, not tied to any agent.** XYZLCU is a plain command-line program: any agent that can run shell commands and read JSON output can use it directly (Grok Bot, Claude Code, Codex CLI, Cursor, Gemini CLI, Cline / Roo, Aider, OpenClaw, OpenCode, Trae, …), with no plugin or adapter layer. MCP-only clients can use the built-in `xyzlcu mcp`. It works without an agent too: shell scripts, Shortcuts, cron / launchd. See [Supported agents](#supported-agents).
 
@@ -11,7 +11,8 @@
 ## Features
 
 - 📸 **Screenshots**: a whole display, a single window (`--window`) or a region (`--region`), optional downscaling, `--fast` for a small JPEG in one flag; prints the point/pixel mapping
-- 🧠 **In-memory screenshots** (v0.4.2): `--base64` / `--stdout` produce the image in memory without writing a file; the daemon keeps capture streams on demand, so repeated captures of the same window take about 20–35 ms
+- 🧠 **In-memory screenshots** (v0.4.2): `--base64` / `--stdout` produce the image in memory without writing a file; the daemon keeps capture streams on demand, so repeated captures of the same window take about 20 ms
+- 🚀 **Faster in v0.5.0**: a tiny C client (~3 ms per call), the main display stream pre-opened at daemon start (`--fast` ~9 ms), parallel PNG encoding (full-size PNG 171 → 31 ms), JPEG / HEIC, `--diff` returns only what changed, and an MCP `batch` tool
 - 🖱 **Mouse**: click, right-click, double-click, move, drag, scroll
 - ⌨️ **Keyboard**: types Unicode text directly (Chinese, emoji; bypasses the input method), key combos like `cmd+shift+4`
 - 🌳 **Accessibility tree**: dumps any app window's control tree (role, title, value, frame); `find` returns a control's frame and center by role/title, `click-el` finds and presses in one call, `wait` waits for a control to appear or disappear
@@ -20,7 +21,7 @@
 - ⏺ **Record / replay**: listen-only recording of keyboard and mouse (never intercepts input; no keys recorded in password fields or while locked), replayed with the original timing
 - 🔒 **Lock-screen guard**: refuses mouse and keyboard input while the screen is locked, so nothing gets typed into the password field
 - 📊 **Measured**: a per-operation speed comparison with LCU is in [Benchmark](#benchmark-vs-lcu), with a reproducible script
-- ⚡ **Resident daemon**: after `xyzlcu serve &`, commands are forwarded to it automatically, skipping process start-up and permission checks; most commands take 7–20 ms
+- ⚡ **Resident daemon**: after `xyzlcu serve --background`, commands are forwarded to it automatically, skipping process start-up and permission checks; most commands take 2–10 ms
 - 🔌 **MCP server** (v0.4.2): `xyzlcu mcp` over stdio for MCP-only clients (such as Claude Desktop); screenshots come back as images
 - 🧾 **Parseable output**: JSON or a plain `ok`, plus clear exit codes
 
@@ -31,7 +32,8 @@
 ```bash
 # A. Prebuilt universal binary (Apple Silicon + Intel)
 mkdir -p ~/.local/bin && curl -fsSL https://github.com/brandy2015/XYZLCU/releases/latest/download/xyzlcu-macos-universal.zip -o /tmp/xyzlcu.zip \
-  && unzip -o /tmp/xyzlcu.zip -d ~/.local/bin && chmod +x ~/.local/bin/xyzlcu && xattr -d com.apple.quarantine ~/.local/bin/xyzlcu 2>/dev/null; rm -f /tmp/xyzlcu.zip
+  && unzip -o /tmp/xyzlcu.zip -d ~/.local/bin && chmod +x ~/.local/bin/xyzlcu ~/.local/bin/xyzlcu-core \
+  && xattr -d com.apple.quarantine ~/.local/bin/xyzlcu ~/.local/bin/xyzlcu-core 2>/dev/null; rm -f /tmp/xyzlcu.zip
 
 # B. Build from source (needs Xcode or the Command Line Tools)
 git clone https://github.com/brandy2015/XYZLCU.git && cd XYZLCU && ./build.sh --install
@@ -54,7 +56,9 @@ xyzlcu check
 
 Once both are `true`, you're ready.
 
-Swift Package Manager works too: `swift build -c release`, which outputs `.build/release/xyzlcu`.
+Swift Package Manager works too: `swift build -c release`, which outputs into `.build/release/` (keep `xyzlcu-core` and `xyzlcu` in the same directory).
+
+> **Two files** (since v0.5.0): `xyzlcu` is a tiny C client that forwards the command straight to the daemon when one is running (~3 ms). With no daemon, or for `mcp` / `serve` / `record` / `replay` / help, it `exec`s `xyzlcu-core` from the same directory (the Swift program that does the work; override with `XYZLCU_CORE`). Put both in `~/.local/bin`. The `macctl` symlink still points at `xyzlcu`.
 
 ## Requirements
 
@@ -99,12 +103,13 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `request` | Bring up the system permission prompts | `xyzlcu request` |
 | `whoami` | Process chain and responsible app | `xyzlcu whoami` |
 | `version` | Version | `xyzlcu version` |
-| `screenshot [path] [--scale S] [--display N] [--format png\|jpg] [--quality Q]` | Screenshot (PNG by default; JPEG is faster and smaller) | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
+| `screenshot [path] [--scale S] [--display N] [--format png\|jpg\|heic] [--quality Q]` | Screenshot. Format: `--format`, else the file extension, else PNG (JPEG for `--fast` and in-memory output) | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
 | `screenshot … --fast` | Fast screenshot: JPEG, quality 0.6, scale 0.5 | `xyzlcu screenshot --fast` |
 | `screenshot … --window "App" [--title T]` | Capture just one app window (its frontmost window by default) | `xyzlcu screenshot /tmp/w.png --window Safari` |
 | `screenshot … --region x,y,w,h` | Capture just a region (global points) | `xyzlcu screenshot /tmp/r.png --region 100,100,400,300` |
 | `screenshot … --base64` | No file: the image is base64 in the JSON `base64` field (JPEG by default when no path is given) | `xyzlcu screenshot --fast --base64` |
 | `screenshot … --stdout` | No file: raw image bytes on stdout, metadata JSON on stderr | `xyzlcu screenshot --window Safari --stdout > w.jpg` |
+| `screenshot … --diff` | Return only what changed since the previous capture of the same target and scale: `diff.rects` (global points) and `changedPercent`, with the image cropped to the changed area; no image when nothing changed. Daemon / MCP only | `xyzlcu screenshot --fast --diff --base64` |
 | `screenshot … --out path` / `--timing` | `--out` also writes a file; `--timing` adds per-stage `timingMs` | `xyzlcu screenshot --fast --base64 --timing` |
 | `displays` | Displays and their coordinate ranges | `xyzlcu displays` |
 | `click x y [--right] [--double]` | Click | `xyzlcu click 500 300 --double` |
@@ -135,7 +140,7 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `replay f.jsonl [--speed N] [--no-keys] [--force]` | Replay a recording | `xyzlcu replay rec.jsonl --no-keys` |
 | `run [--continue-on-error] 'cmd; cmd; …'` | Run several commands at once (split on `;` or newlines) | `xyzlcu run 'click-el TextEdit --title Save; wait TextEdit --role AXSheet; key return'` |
 | `batch [--continue-on-error] [file]` | Run commands line by line from a file or stdin | `printf 'type a\nkey return\n' \| xyzlcu batch` |
-| `serve [--status\|--stop]` | Start / inspect / stop the resident daemon; see [Daemon](#daemon) | `xyzlcu serve &` |
+| `serve [--background\|--status\|--stop]` | Start / start in background / inspect / stop the resident daemon; see [Daemon](#daemon) | `xyzlcu serve --background` |
 | `mcp` | Run as a stdio MCP server; see [MCP server](#mcp-server) | `xyzlcu mcp` |
 
 Notes:
@@ -232,19 +237,24 @@ xyzlcu replay /tmp/demo.jsonl --speed 2 --no-keys  # 2x speed, mouse only
 Every `xyzlcu` run starts a process, checks permissions and connects to the window server, about 15–50 ms. The resident daemon pays that cost once:
 
 ```bash
-xyzlcu serve &          # start it from the agent's / terminal's own shell
-xyzlcu serve --status   # pid, version, uptime, permissions, responsible app
+xyzlcu serve --background   # start it from the agent's / terminal's own shell (log: ~/.xyzlcu/serve.log)
+xyzlcu serve &              # or keep it in the foreground like this
+xyzlcu serve --status       # pid, version, uptime, permissions, responsible app, capture streams
 xyzlcu check            # "daemon": true means commands go through the daemon
 xyzlcu serve --stop     # stop it
 ```
 
 - Once it's running, every command (including `run` and `batch`) is **forwarded automatically**, with identical usage and output. If the daemon can't be reached or its version differs, the command runs in-process instead.
 - `XYZLCU_DAEMON=0`: never use the daemon. `XYZLCU_DAEMON=1`: require it; exits with code 5 if it can't be reached.
+- **Only one daemon** (v0.5.0): `serve` first takes a file lock on `~/.xyzlcu/sock.lock`. If a daemon is already running it says so and exits 0, so running it again is harmless; a stale socket left by `kill -9` is detected and replaced. While a daemon is starting but not yet accepting, clients wait up to 3 s (`XYZLCU_CONNECT_WAIT_MS`) instead of concluding there is no daemon.
+- **Protocol** (v0.5.0): images travel between client and daemon as raw length-prefixed bytes, not base64. The `--base64` JSON output and MCP still use base64. A client of a different version falls back to running in-process; `serve --stop` can stop an older daemon.
 - The socket is `~/.xyzlcu/sock` (directory 0700, socket 0600) and only accepts connections from the **same user** (checked with `getpeereid`). No network port is opened. Override the path with `XYZLCU_SOCKET`.
 - The daemon keeps the lock-screen guard and permission checks; relative paths resolve against the caller's working directory.
-- **Permissions (TCC)**: the daemon runs with the permissions of **the app that started it**, so run `xyzlcu serve &` from the agent's or terminal's own shell; the responsible app is then the same as for direct commands. Check `responsibleProcess` in `xyzlcu serve --status`.
-- **Capture streams (v0.4.2)**: the first time the daemon captures a window / display / region, it opens a ScreenCaptureKit stream for it in the background; later screenshots take the latest frame (`method: "screencapturekit-stream"`) instead of capturing again. At most 3 streams at a time; a stream unused for 20 s is stopped (`XYZLCU_STREAM_IDLE=seconds`). A screenshot right after a click or typing waits for a newer frame (up to 0.12 s), so it never returns the pre-action picture. While a stream is open, macOS shows its screen-recording indicator in the menu bar; that is expected. `XYZLCU_STREAM=0` disables streams. `liveStreams` in `xyzlcu serve --status` is the number of open streams.
-- To start it at login you can write your own LaunchAgent (`~/Library/LaunchAgents/*.plist` with `ProgramArguments` = `xyzlcu serve`). In that case the responsible process is the launchd-started xyzlcu binary itself, which then needs its own permissions in System Settings. XYZLCU never installs a LaunchAgent for you.
+- **Permissions (TCC)**: the daemon runs with the permissions of **the app that started it**, so run `xyzlcu serve --background` from the agent's or terminal's own shell; the responsible app is then the same as for direct commands. Check `responsibleProcess` in `xyzlcu serve --status`.
+- **Capture streams (v0.4.2)**: the first time the daemon captures a window / display / region, it opens a ScreenCaptureKit stream for it in the background; later screenshots take the latest frame (`method: "screencapturekit-stream"`) instead of capturing again. Since v0.5.0 each scale has its own stream, scaled on the GPU (until a new scale's stream has a frame, an existing stream's frame is scaled on the CPU once). At most 4 streams at a time; a stream unused for 20 s is stopped (`XYZLCU_STREAM_IDLE=seconds`). A screenshot right after a click or typing waits for a newer frame (up to 0.12 s), so it never returns the pre-action picture. While a stream is open, macOS shows its screen-recording indicator in the menu bar; that is expected. `XYZLCU_STREAM=0` disables streams. `liveStreams` in `xyzlcu serve --status` lists the open streams.
+- **Prewarm the main display (v0.5.0)**: at start-up the daemon opens full-size and half-size streams for the main display (`XYZLCU_PREWARM_SCALES=1,0.5`), so even the first screenshot takes 25–35 ms instead of 170–210 ms. **Trade-off**: while the daemon runs, the menu bar shows the screen-recording indicator; the two streams use about 45 MB of memory and the GPU does a little scaling whenever the screen changes. Prewarmed streams close after 600 s unused (`XYZLCU_PREWARM_IDLE=seconds`) and reopen on demand. To opt out: `XYZLCU_PREWARM=0 xyzlcu serve --background`.
+- **PNG encoding (v0.5.0)**: a built-in multi-threaded PNG encoder (zlib level 1, bands compressed in parallel) keeps the capture's color space and embeds its ICC profile. Pixels are identical to ImageIO's output; files are somewhat larger. `XYZLCU_PNG=imageio` switches back to the system encoder, `XYZLCU_PNG_LEVEL=0-9` sets the compression level.
+- To start it at login you can write your own LaunchAgent (`~/Library/LaunchAgents/*.plist` with `ProgramArguments` = `xyzlcu serve`). In that case the responsible process is the launchd-started xyzlcu binary itself, which then needs its own permissions in System Settings: grant them to the `xyzlcu-core` binary (and put `xyzlcu-core serve` in `ProgramArguments`). XYZLCU never installs a LaunchAgent for you.
 
 ## Worked example: write Chinese text in TextEdit and save it
 
@@ -300,7 +310,7 @@ XYZLCU is **general-purpose**: it depends on no agent framework and needs no plu
 
 **Notes**
 
-- **Permissions follow the responsible app**: Accessibility and Screen & System Audio Recording must be granted to the app that launches `xyzlcu` (Terminal, Cursor, Claude.app, …). Check with `xyzlcu whoami`. Run `xyzlcu serve &` once in the agent's own shell; later commands and `xyzlcu mcp` are forwarded to that daemon and use its permissions.
+- **Permissions follow the responsible app**: Accessibility and Screen & System Audio Recording must be granted to the app that launches `xyzlcu` (Terminal, Cursor, Claude.app, …). Check with `xyzlcu whoami`. Run `xyzlcu serve --background` once in the agent's own shell; later commands and `xyzlcu mcp` are forwarded to that daemon and use its permissions.
 - **Codex CLI sandbox**: in the default sandbox, commands cannot reach the window server (`xyzlcu cursor` returns `0,0`, screenshots fail). Use full access (`--sandbox danger-full-access`), or allow the command to run outside the sandbox when asked. The same applies to other sandboxed agents.
 - XYZLCU cannot work when the agent runs in a sandbox or remote container that has no access to the local GUI session.
 
@@ -314,7 +324,7 @@ Copy this into your project's `AGENTS.md` (Codex, OpenCode, Gemini CLI, …), `C
 You can use the `xyzlcu` CLI to see the screen, click, type, press keys and read the UI tree.
 
 Start
-- Once per session run `xyzlcu serve &` (makes later commands faster), then `xyzlcu check`.
+- Once per session run `xyzlcu serve --background` (makes later commands faster; running it twice is fine), then `xyzlcu check`.
 - If `screenLocked` is true or a permission is missing: stop and tell the user.
 
 Common commands (output is JSON or `ok`)
@@ -328,6 +338,7 @@ Common commands (output is JSON or `ok`)
 - Apps: `xyzlcu apps`, `xyzlcu activate "App"`
 - Wait: `xyzlcu wait "App" --title T --timeout 5` (no fixed sleeps)
 - Several steps: `xyzlcu run 'click-el App --title Search; type hello; key return'`
+- Only what changed: `xyzlcu screenshot --fast --diff --base64` (no image when nothing changed)
 
 Exit codes
 - 0 ok; 1 bad arguments or app/element not found; 2 missing permission; 3 screen locked, action refused;
@@ -375,6 +386,8 @@ const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Bu
 
 - Read-only: `check`, `screenshot` (returns the image directly, JPEG by default), `apps`, `windows`, `cursor`, `ax`, `find`
 - Actions: `click_element`, `click`, `type_text`, `key`, `activate`
+- Batch: `batch` (`steps` is an array of command strings, e.g. `["click-el TextEdit --title Save", "wait TextEdit --role AXSheet", "screenshot --diff"]`; one call runs them in order and returns each step's output and images; `continue_on_error` keeps going after a failure). Saves round trips and model turns; screenshot steps default to half-size JPEG
+- `screenshot` accepts `diff: true` to return only the changed area
 - Generic: `xyzlcu` (an `args` array, runs any subcommand except `mcp`, `serve`, `record`, `replay`, `batch` and `--stdout`)
 
 When a daemon is running, every tool call is forwarded to it; otherwise `xyzlcu mcp` itself is the long-lived process (it keeps capture streams too), so no new process is started per call.
@@ -415,46 +428,68 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | xyzlcu mcp
 ```
 
-- The MCP server is launched by the client app, so the system permissions must be granted to **that app** (e.g. Claude.app, Cursor). Or run `xyzlcu serve &` first in an authorized terminal; MCP calls are then forwarded to it and use its permissions.
+- The MCP server is launched by the client app, so the system permissions must be granted to **that app** (e.g. Claude.app, Cursor). Or run `xyzlcu serve --background` first in an authorized terminal; MCP calls are then forwarded to it and use its permissions.
 - When the client asks whether to allow a tool, decide by how much you trust it; the action tools (`click`, `type_text`, `key`, …) really operate your computer.
 
 ## Benchmark (vs LCU)
 
-**Setup**: Apple Silicon Mac (macOS 26+). XYZLCU 0.4.2 vs [LCU](https://github.com/amontlabs/lcu) 0.13.4 (the CUA runtime 0.0.35 shipped with ChatGPT). 15 runs per operation; the table shows **median / p90** in milliseconds; the last column is the 0.4.1 daemon median on the same machine.
+**Setup**: Apple Silicon Mac (macOS 26+). XYZLCU 0.5.0 vs 0.4.2 and [LCU](https://github.com/amontlabs/lcu) 0.13.4 (the CUA runtime 0.0.35 shipped with ChatGPT). 15 runs per operation; the table shows **median / p90** in milliseconds. The LCU column comes from the 0.4.2 round on the same machine (LCU was not reinstalled this time).
 
-| Operation | XYZLCU in-process | XYZLCU daemon | LCU (MCP `js` call) | 0.4.1 daemon |
+| Operation | 0.5.0 in-process | **0.5.0 daemon** | 0.4.2 daemon | LCU (MCP `js` call) |
 |---|---:|---:|---:|---:|
-| Version (`version`, ~empty call) | 6 / 7 | 7 / 12 | — | 10 |
-| List apps (`apps` / `cua.listApps`) | 15 / 19 | **13 / 13** | 17 / 18 | 17 |
-| List windows (`windows`) | 44 / 52 | **9 / 18** | — (not on Mac) | 7 |
-| Pointer position (`cursor`) | 26 / 32 | **8 / 11** | — (not on Mac) | 6 |
-| Move pointer (`move`) | 55 / 73 | **9 / 19** | — (not on Mac) | 7 |
-| Full screenshot (full-size PNG, to file) | 352 / 361 | 180 / 200 | — (not on Mac) | 233 |
-| Full screenshot (`--fast`, half-size JPEG, to file) | 184 / 200 | **13 / 75** | — (not on Mac) | 60 |
-| Full screenshot (`--fast --base64`, in memory) | 192 / 208 | **21 / 23** | — (not on Mac) | — |
-| Window screenshot (TextEdit window, PNG to file) | 199 / 207 | **35 / 72** | 51 / 53 | 68 |
-| Window screenshot (`--window … --base64`, in memory) | 185 / 199 | **23 / 27** | 51 / 53 | — |
-| UI tree (`ax --depth 3` / `getAXState`) | 66 / 69 | **26 / 29** | 55 / 76 | 28 |
-| Click (`click`) | 56 / 74 | **12 / 19** | 140 / 166 | 12 |
-| Type ASCII `abc` | 82 / 93 | **13 / 17** | 43 / 48 | 12 |
-| Type Chinese `你好abc` | 82 / 116 | **13 / 18** | 9057 / 10541 | 14 |
-| Key (`cmd+right` / `super+Right`) | 78 / 98 | **10 / 13** | 14 / 19 | 8 |
+| Version (`version`, ~empty call) | 8 / 11 | **3 / 3** | 8 / 9 | — |
+| List apps (`apps` / `cua.listApps`) | 18 / 19 | **10 / 10** | 15 / 18 | 17 / 18 |
+| List windows (`windows`) | 57 / 68 | **3 / 3** | 7 / 11 | — (not on Mac) |
+| Pointer position (`cursor`) | 28 / 32 | **2 / 2** | 6 / 6 | — (not on Mac) |
+| Move pointer (`move`) | 68 / 75 | **2 / 4** | 7 / 10 | — (not on Mac) |
+| Full screenshot (full-size PNG, to file) | 223 / 248 | **31 / 34** | 171 / 180 | — (not on Mac) |
+| Full screenshot (full-size JPEG, to file) | 214 / 226 | **30 / 33** | 48 / 50 | — (not on Mac) |
+| Full screenshot (full-size HEIC, to file) | — | 98 / 103 | — | — (not on Mac) |
+| Full screenshot (half-size PNG, to file) | 199 / 212 | **12 / 15** | 50 / 52 | — (not on Mac) |
+| Full screenshot (`--fast`, half-size JPEG, to file) | 202 / 212 | **9 / 10** | 13 / 72 | — (not on Mac) |
+| Full screenshot (`--fast --base64`, in memory) | 192 / 199 | **10 / 10** | 20 / 24 | — (not on Mac) |
+| Full screenshot (`--fast --stdout`, in memory) | 194 / 206 | **9 / 9** | 18 / 20 | — (not on Mac) |
+| Full screenshot (`--fast --diff --base64`) | — | **9 / 15** | — | — (not on Mac) |
+| Window screenshot (TextEdit window, PNG to file) | 202 / 228 | **17 / 103** | 26 / 86 | 51 / 53 |
+| Window screenshot (`--window … --base64`, in memory) | 203 / 220 | **18 / 24** | 24 / 32 | 51 / 53 |
+| UI tree (`ax --depth 3` / `getAXState`) | 64 / 76 | **20 / 22** | 32 / 47 | 55 / 76 |
+| Click (`click`) | 59 / 69 | **6 / 9** | 11 / 16 | 140 / 166 |
+| Type ASCII `abc` | 85 / 113 | **5 / 9** | 10 / 14 | 43 / 48 |
+| Type Chinese `你好abc` | 109 / 121 | **7 / 10** | 10 / 14 | 9057 / 10541 |
+| Key (`cmd+right` / `super+Right`) | 71 / 87 | **4 / 11** | 10 / 14 | 14 / 19 |
+| 3 separate calls (`cursor`, `--fast` screenshot, `windows`) | 271 / 283 | 17 / 20 | 41 / 44 | — |
+| The same 3 steps in one `run` | 195 / 207 | **12 / 15** | 25 / 26 | — |
+
+**Other measurements** (0.5.0, daemon)
+
+| Item | 0.4.2 | 0.5.0 |
+|---|---:|---:|
+| First `--fast` screenshot 1.5 s after a daemon restart | 190–220 | **24–37** (prewarmed); 173–213 with `XYZLCU_PREWARM=0` |
+| One forwarded call (`cursor`, median of 30) | 6 (Swift client) | **3.1** (C client; `/usr/bin/true` alone is 1.6) |
+| MCP: `cursor` + `screenshot` + `windows` as 3 tool calls vs one `batch` | — | 16.1 vs 15.8 |
+| MCP `screenshot` (half-size JPEG, returned as an image) | — | 11–12 |
+| MCP `screenshot` with `diff: true`, screen unchanged | — | 3–4 (no image) |
 
 **Method**
 
 - **XYZLCU**: each sample is a full CLI invocation (process start → run → JSON output), which is what an agent actually pays when calling it from a shell. "In-process" = `XYZLCU_DAEMON=0`; "daemon" = after `xyzlcu serve`. In-process runs first, then the daemon is started (see the screenshot item under [Troubleshooting](#troubleshooting)).
 - **LCU**: installed into a temp directory (no system changes, no agent config changes) and driven through LCU's own `adapters/client.mjs` over stdio MCP. Each sample is one `js` tool call such as `await app.click([x, y])` or `await app.typeText("abc")`, timed as a round trip **on an already-connected client**. Connecting (~270 ms), the first call (~520 ms) and `getApp` (~70 ms) are excluded, as is the agent's own time to produce a tool call.
+- "3 separate calls" are three CLI invocations; "one `run`" is `xyzlcu run 'cursor; screenshot --fast; windows'`.
 - **GUI operations** all target a temporary TextEdit document. Before every input the script checks that TextEdit is frontmost and the document is its front window; at the end it reads the document back (both tools typed the right text), then closes and deletes it. LCU asks for approval the first time it touches TextEdit; the benchmark only answers "this session".
 
 **Reading the numbers (honestly)**
 
-- **XYZLCU now captures windows faster** (23 ms in memory vs LCU's 51 ms; with 0.4.1 it was 68 vs 47). Since 0.4.2 the daemon keeps a capture stream for windows it has captured, so repeated screenshots take the latest frame, and `--base64` / `--stdout` write no file. The first capture of a window still takes about 50 ms (stream set-up), which is why p90 is sometimes higher.
-- **Full-size PNG is bound by encoding**: the capture itself is ~50 ms; encoding a 4112×2658 PNG takes ~150 ms. For a model, use `--fast` or `--format jpg --scale 0.5`.
-- `--base64` is a little slower than `--fast` to a file (21 vs 13 ms): base64 carries a third more data through JSON; in exchange there is no file to clean up or read back.
-- **Without the daemon, XYZLCU types and presses keys more slowly than LCU** (82 / 78 ms vs 43 / 14 ms), mostly process start-up and permission checks. With the daemon running, these drop to 10–13 ms.
+- **Forwarding overhead is down to 2–3 ms**: with a daemon running, `xyzlcu` is a tiny C program that connects to the socket, sends the request, writes the reply out and exits, without loading the Swift runtime and system frameworks. Queries, clicks, typing and keys are roughly twice as fast as 0.4.2.
+- **Full-size PNG 171 → 31 ms**: the cost was encoding, not capturing. 0.4.2 used ImageIO, single-threaded and with a color-space conversion first; 0.5.0 compresses in parallel, keeps the original color space and embeds the ICC profile. Pixels are identical to ImageIO's; files are somewhat larger.
+- **`--fast` is ~9 ms, even the first time**: every scale gets its own ScreenCaptureKit stream scaled on the GPU, and the daemon pre-opens the main display at full and half size. Scaling a full-size frame on the CPU did not help: just reading a 4112×2658 IOSurface (44 MB) takes ~11 ms, so the GPU now produces the small image directly.
+- **HEIC is slower than JPEG** (98 vs 30 ms full size) but smaller. Use HEIC to save bandwidth / tokens, JPEG for speed.
+- **Window screenshot p90 is high (103 ms)**: the first capture of a window in each round sets up a stream; after that it is 17–18 ms.
+- **`run` / MCP `batch` save round trips**: on the CLI, 3 calls take 17 ms and one `run` 12 ms. MCP is already connected to the daemon, so 3 tool calls and one `batch` cost about the same (16.1 vs 15.8 ms). What MCP `batch` really saves is the model's turns between tool calls (typically hundreds of ms to seconds each), which this table does not include.
+- **`--diff`**: when nothing changed the reply is a small JSON (3–4 ms, no image); otherwise only the changed area is returned. That saves the most tokens for agents that keep "taking a look".
+- In-process (no daemon) is about the same as 0.4.2; the time goes to process start-up and connecting to the window server. It is 1–2 ms slower than 0.4.2 because the C client `exec`s `xyzlcu-core`.
 - **LCU's click is slower (140 ms) but it is background delivery**: it does not move the real pointer or bring the app to the front, so the user can keep working. XYZLCU's `click` really moves the pointer. For background work XYZLCU has `click-el` (AXPress), `type --app`, `menu`, and `insert` / `settext`.
 - **LCU types Chinese very slowly**: `你好abc` has a ~9 s median, while plain ASCII takes 43 ms. XYZLCU sends Unicode directly or writes via Accessibility, so both are equally fast.
-- **"—" means LCU has no such capability on Mac** (no pointer position/move, no full-screen screenshot, no window list; it works per app). It does not mean the test was skipped.
+- **"—" in the LCU column means LCU has no such capability on Mac** (no pointer position/move, no full-screen screenshot, no window list; it works per app). It does not mean the test was skipped.
 - This compares single-operation latency only, not the ability to finish whole tasks. LCU sits on ChatGPT's CUA runtime and has strengths in model integration and background operation.
 
 **Usability differences**
@@ -477,6 +512,31 @@ python3 scripts/bench.py ~/.local/bin/xyzlcu --runs 15 --gui \
 ```
 
 `--mode inproc|daemon` runs one mode only. Without `--lcu-allow-session`, the script declines LCU approval requests, so operations that need approval report no numbers; the script never chooses "always". For clean in-process screenshot numbers, run `xyzlcu serve --stop` first.
+
+<details>
+<summary>v0.4.2 comparison</summary>
+
+**Setup**: Apple Silicon Mac (macOS 26+). XYZLCU 0.4.2 vs [LCU](https://github.com/amontlabs/lcu) 0.13.4 (the CUA runtime 0.0.35 shipped with ChatGPT). 15 runs per operation; the table shows **median / p90** in milliseconds; the last column is the 0.4.1 daemon median on the same machine.
+
+| Operation | XYZLCU in-process | XYZLCU daemon | LCU (MCP `js` call) | 0.4.1 daemon |
+|---|---:|---:|---:|---:|
+| Version (`version`, ~empty call) | 6 / 7 | 7 / 12 | — | 10 |
+| List apps (`apps` / `cua.listApps`) | 15 / 19 | **13 / 13** | 17 / 18 | 17 |
+| List windows (`windows`) | 44 / 52 | **9 / 18** | — (not on Mac) | 7 |
+| Pointer position (`cursor`) | 26 / 32 | **8 / 11** | — (not on Mac) | 6 |
+| Move pointer (`move`) | 55 / 73 | **9 / 19** | — (not on Mac) | 7 |
+| Full screenshot (full-size PNG, to file) | 352 / 361 | 180 / 200 | — (not on Mac) | 233 |
+| Full screenshot (`--fast`, half-size JPEG, to file) | 184 / 200 | **13 / 75** | — (not on Mac) | 60 |
+| Full screenshot (`--fast --base64`, in memory) | 192 / 208 | **21 / 23** | — (not on Mac) | — |
+| Window screenshot (TextEdit window, PNG to file) | 199 / 207 | **35 / 72** | 51 / 53 | 68 |
+| Window screenshot (`--window … --base64`, in memory) | 185 / 199 | **23 / 27** | 51 / 53 | — |
+| UI tree (`ax --depth 3` / `getAXState`) | 66 / 69 | **26 / 29** | 55 / 76 | 28 |
+| Click (`click`) | 56 / 74 | **12 / 19** | 140 / 166 | 12 |
+| Type ASCII `abc` | 82 / 93 | **13 / 17** | 43 / 48 | 12 |
+| Type Chinese `你好abc` | 82 / 116 | **13 / 18** | 9057 / 10541 | 14 |
+| Key (`cmd+right` / `super+Right`) | 78 / 98 | **10 / 13** | 14 / 19 | 8 |
+
+</details>
 
 <details>
 <summary>v0.4.1 comparison</summary>
@@ -565,9 +625,9 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 
 **Daemon issues**
 - `daemon` stays false in `check`: the daemon isn't running, or it's an older version (on a version mismatch commands run in-process). Run `xyzlcu serve --status`.
-- Permissions are false inside the daemon: it was started from a different app. Run `xyzlcu serve --stop`, then `xyzlcu serve &` again from the authorized terminal / agent shell.
+- Permissions are false inside the daemon: it was started from a different app. Run `xyzlcu serve --stop`, then `xyzlcu serve --background` again from the authorized terminal / agent shell.
 - After updating xyzlcu, run `xyzlcu serve --stop` and start it again. (a version mismatch falls back to in-process automatically).
-- An in-process screenshot (`XYZLCU_DAEMON=0`) takes ~2 s and has a `warning`: while a daemon of the same xyzlcu binary is running, macOS does not deliver in-process ScreenCaptureKit callbacks, so XYZLCU waits 1.5 s and falls back to `screencapture`. Drop `XYZLCU_DAEMON=0` and go through the daemon (13–180 ms).
+- An in-process screenshot (`XYZLCU_DAEMON=0`) takes ~2 s and has a `warning`: while a daemon of the same xyzlcu binary is running, macOS does not deliver in-process ScreenCaptureKit callbacks, so XYZLCU waits 1.5 s and falls back to `screencapture`. Drop `XYZLCU_DAEMON=0` and go through the daemon (9–31 ms).
 - When replacing the binary yourself, write to a temp file and `mv` it into place (`build.sh --install` does this); overwriting a signed binary that is in use with `cp` can get new processes killed by the system (exit code 137).
 
 **Does a Chinese input method get in the way?**
@@ -603,7 +663,7 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 
 ```bash
 xyzlcu serve --stop 2>/dev/null
-rm -f ~/.local/bin/xyzlcu ~/.local/bin/macctl
+rm -f ~/.local/bin/xyzlcu ~/.local/bin/xyzlcu-core ~/.local/bin/macctl
 rm -rf ~/.xyzlcu
 ```
 
@@ -613,6 +673,15 @@ Then, in System Settings > Privacy & Security, turn off or remove any apps you n
 
 ## Changelog
 
+- **0.5.0**: a speed overhaul.
+  - **Tiny C client**: `xyzlcu` is now a small C program that forwards straight to the daemon (empty call 8 → 3 ms) and otherwise `exec`s `xyzlcu-core` from the same directory. Permission attribution is unchanged (still the app that launched it). Installs now have one more file, `xyzlcu-core`.
+  - **Screenshot encoding**: parallel PNG encoding (full size 171 → 31 ms, ICC profile kept), new `--format heic`; format is `--format` > file extension > default (JPEG for `--fast` / in-memory, PNG otherwise).
+  - **Prewarm**: the daemon pre-opens full- and half-size streams of the main display at start-up (first screenshot 190–220 → 24–37 ms); `XYZLCU_PREWARM=0` turns it off, `XYZLCU_PREWARM_SCALES` / `XYZLCU_PREWARM_IDLE` tune it. One stream per scale, scaled on the GPU.
+  - **Binary protocol**: images travel between client and daemon as raw length-prefixed bytes instead of base64; the external JSON / MCP output is unchanged.
+  - **Batching**: new MCP `batch` tool; a 3-step `run` went 25 → 12 ms.
+  - **`--diff`**: return only the changed area (CLI and MCP; needs the daemon or MCP).
+  - **Daemon start-up**: a file lock guarantees a single daemon, a repeated `serve` exits 0, a stale socket left by `kill -9` is handled, new `serve --background`; `serve --stop` can stop older versions.
+  - Fix: an unknown `--option` is no longer taken as the screenshot file name.
 - **0.4.2**: faster screenshots that can stay in memory: `--base64` / `--stdout` / `--out` / `--timing`; the daemon keeps ScreenCaptureKit capture streams on demand (window capture 68 → 23–35 ms, faster than LCU's 51 ms), caches the screen-recording permission check and the window content list, and input read-back polls every 5 ms. New `xyzlcu mcp` (stdio MCP server, 13 tools, screenshots returned as images). New [Supported agents](#supported-agents) section. Fix: the daemon no longer exits with SIGPIPE when a client connects and disconnects without sending a request (e.g. a liveness probe).
 - **0.4.1**: in-process screenshots pump the main run loop while waiting for ScreenCaptureKit; a callback timeout is waited out once (1.5 s), then it falls back to `screencapture` with a `warning` instead of stalling for 10+ s. `apps` in the daemon no longer waits a fixed 20 ms (42 → 17 ms). New LCU comparison benchmark (`scripts/bench.py --lcu`, `scripts/bench_lcu.mjs`).
 - **0.4.0**: multiple input paths (Accessibility writes, direct-to-process, menus, paste), event-stream health checks, `insert` / `settext` / `value` / `menu` / `taps`, listen-only record and replay.

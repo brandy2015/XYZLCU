@@ -3,7 +3,7 @@
 
 用法 / usage:
   python3 scripts/bench.py [path/to/xyzlcu] [--runs 10] [--mode both|daemon|inproc] [--gui]
-                           [--lcu /path/to/lcu [--lcu-allow-session]] [--json out.json]
+                           [--lcu /path/to/lcu [--lcu-allow-session]] [--json out.json] [--skip op1,op2]
 
   --mode     daemon = 经守护进程（没在跑就临时启动，测完停掉）；inproc = XYZLCU_DAEMON=0 进程内执行
   --gui      打开一个临时「文本编辑」文稿，测 click / type / key；每次输入前确认前台窗口就是这份文稿，
@@ -31,6 +31,7 @@ runs = int(opt("--runs", 10))
 mode = opt("--mode", "both")
 lcu = opt("--lcu")
 json_out = opt("--json")
+skip = set((opt("--skip") or "").split(","))   # 跳过某些操作（比如旧版本没有的选项）/ ops to skip, e.g. for older versions
 gui = flag("--gui")
 lcu_allow = flag("--lcu-allow-session")
 B = args[0] if args else (shutil.which("xyzlcu") or "xyzlcu")
@@ -40,8 +41,12 @@ DOC_NAME = "xyzlcu-bench.txt"
 DOC = os.path.join(TMP, DOC_NAME)
 
 def run(cmd, env_daemon="0", stdin=None):
-    return subprocess.run([B] + cmd, input=stdin, capture_output=True, text=True,
-                          env=dict(os.environ, XYZLCU_DAEMON=env_daemon))
+    r = subprocess.run([B] + cmd, input=stdin, capture_output=True,
+                       env=dict(os.environ, XYZLCU_DAEMON=env_daemon))
+    # --stdout 时标准输出是图像字节 / with --stdout, stdout carries raw image bytes
+    if "--stdout" not in cmd: r.stdout = r.stdout.decode("utf-8", "replace")
+    r.stderr = r.stderr.decode("utf-8", "replace")
+    return r
 
 def stats(ts):
     if not ts: return None
@@ -66,11 +71,18 @@ def rect(line):
 def bench_xyz(d, ops):
     out = {}
     for name, cmd, guard in ops:
+        if name in skip: continue
         ts = []
         for _ in range(runs):
             if guard and not focused_ok():
                 print(f"  {name}: 测试文稿不在前台，停止 / scratch doc lost focus, stopped"); ts = None; break
-            t = time.perf_counter(); r = run(cmd, d); ts.append((time.perf_counter() - t) * 1000)
+            # cmd 也可以是多条命令的列表：依次各起一次进程，计总时间（和 run 一次做完对比）
+            # cmd may be a list of commands run as separate calls; the total is timed
+            t = time.perf_counter()
+            for c in (cmd if isinstance(cmd[0], list) else [cmd]):
+                r = run(c, d)
+                if r.returncode != 0: break
+            ts.append((time.perf_counter() - t) * 1000)
             if r.returncode != 0:
                 print(f"  {name}: FAILED rc={r.returncode} {r.stderr.strip()[:200]}"); ts = None; break
         out[name] = stats(ts)
@@ -106,6 +118,13 @@ ops += [
     ("screenshot_full", ["screenshot", f"{TMP}/xyzlcu-bench.png"], False),
     ("screenshot_fast", ["screenshot", f"{TMP}/xyzlcu-bench.jpg", "--fast"], False),
     ("screenshot_fast_mem", ["screenshot", "--fast", "--base64"], False),
+    ("screenshot_fast_stdout", ["screenshot", "--fast", "--stdout"], False),
+    ("screenshot_full_jpg", ["screenshot", "--format", "jpg", "--base64"], False),
+    ("screenshot_full_heic", ["screenshot", "--format", "heic", "--base64"], False),
+    ("screenshot_half_png", ["screenshot", f"{TMP}/xyzlcu-bench.png", "--scale", "0.5"], False),
+    ("screenshot_diff", ["screenshot", "--fast", "--diff", "--base64"], False),
+    ("seq_3_calls", [["cursor"], ["screenshot", "--fast", "--base64"], ["cursor"]], False),
+    ("run_3_steps", ["run", "cursor; screenshot --fast --base64; cursor"], False),
 ]
 win = None
 if gui:
