@@ -13,6 +13,8 @@
 - ⌨️ **Keyboard**: types Unicode text directly (Chinese, emoji; bypasses the input method), key combos like `cmd+shift+4`
 - 🌳 **Accessibility tree**: dumps any app window's control tree (role, title, value, frame); `find` returns a control's frame and center by role/title, `click-el` finds and presses in one call, `wait` waits for a control to appear or disappear
 - 🪟 **Apps & windows**: list, open, activate and hide apps; list windows; move and resize windows; list displays
+- 🛣 **Multiple input paths** (v0.4.0): probes whether the event stream is stuck, then picks a working path among Accessibility writes, keyboard events, direct-to-process delivery and menu paste, and reports which one it used
+- ⏺ **Record / replay**: listen-only recording of keyboard and mouse (never intercepts input; no keys recorded in password fields or while locked), replayed with the original timing
 - 🔒 **Lock-screen guard**: refuses mouse and keyboard input while the screen is locked, so nothing gets typed into the password field
 - ⚡ **Resident daemon**: after `xyzlcu serve &`, commands are forwarded to it automatically, skipping process start-up and permission checks; most commands take 7–20 ms
 - 🧾 **Parseable output**: JSON or a plain `ok`, plus clear exit codes
@@ -88,7 +90,7 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 
 | Command | Description | Example |
 |---|---|---|
-| `check` | Permission and lock status | `xyzlcu check` |
+| `check [--probe]` | Permissions, lock status, and which input paths work (see [Multiple input paths](#multiple-input-paths-when-keyboard-events-are-blocked)) | `xyzlcu check` |
 | `request` | Bring up the system permission prompts | `xyzlcu request` |
 | `whoami` | Process chain and responsible app | `xyzlcu whoami` |
 | `version` | Version | `xyzlcu version` |
@@ -102,12 +104,12 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `drag x1 y1 x2 y2` | Drag with the left button held | `xyzlcu drag 100 100 400 400` |
 | `scroll dx dy` | Scroll in lines; positive dy scrolls up | `xyzlcu scroll 0 -5` |
 | `cursor` | Current pointer position | `xyzlcu cursor` |
-| `type "text" [--app "App"] [--via auto\|events\|ax\|paste]` | Type Unicode text. Default auto: keyboard events normally, Accessibility value writes when the keyboard is detected as blocked | `xyzlcu type "你好 Hello 😀"` |
+| `type "text" [--app "App"] [--window title] [--via auto\|ax\|events\|pid\|paste]` | Type Unicode text; JSON output (`path` = path actually used, `verified` = read back and checked). Default auto picks the path | `xyzlcu type --app TextEdit --window Notes "你好 😀"` |
 | `insert "App" [target] "text"` | Insert text at the focus via Accessibility (sets AXSelectedText), no keyboard events; verified by reading back | `xyzlcu insert TextEdit --window Notes "hello"` |
 | `settext "App" [target] "text"` | Replace a text field's whole content via Accessibility (sets AXValue); verified by reading back | `xyzlcu settext Safari --role AXTextField --title Search "XYZLCU"` |
 | `value "App" [target]` | Read back an element's value (focused element by default) to check the input | `xyzlcu value TextEdit` |
-| `menu "App" "Menu>Item"` | Press a menu item by path instead of a shortcut; each level accepts alternatives like `File\|文件` | `xyzlcu menu TextEdit "File>Save"` |
-| `key combo… [--app "App"]` | Keys / combos, several at once | `xyzlcu key cmd+s` · `xyzlcu key cmd+c cmd+v` |
+| `menu "App" "Menu>Item" [--window title] [--activate]` | Press a menu item by path (AXPress, does not activate the app by default) instead of a shortcut; each level accepts alternatives like `File\|文件` | `xyzlcu menu TextEdit "File>New"` |
+| `key combo… [--app "App"] [--via auto\|events\|menu\|pid]` | Keys / combos, several at once; JSON output with the path used per key. Presses the matching menu item when the event stream is blocked | `xyzlcu key cmd+s` · `xyzlcu key --app TextEdit cmd+a` |
 | `apps` | Running GUI apps | `xyzlcu apps` |
 | `open "App"` | Open an app | `xyzlcu open "TextEdit"` |
 | `activate "App"` | Bring an app to the front | `xyzlcu activate Finder` |
@@ -120,7 +122,9 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `press "App" "title"` | Find a control by title and press it (older form; prefer `click-el` in new scripts) | `xyzlcu press TextEdit "Cancel"` |
 | `wait "App" --title T [--role R] [--timeout sec] [--gone]` | Wait for a control to appear (or, with `--gone`, disappear); 5 s timeout by default | `xyzlcu wait TextEdit --role AXSheet --timeout 3` |
 | `wait ms` / `sleep ms` | Fixed wait | `xyzlcu sleep 300` |
-| `taps` | List system event taps (diagnose stuck or dropped input) | `xyzlcu taps` |
+| `taps` | List system event taps (diagnose stuck or dropped input); `blocking` marks suspicious ones | `xyzlcu taps` |
+| `record [--out f.jsonl] [--duration s] [--no-moves]` | Listen-only recording of keyboard and mouse, see [Record and replay](#record-and-replay) | `xyzlcu record --duration 30` |
+| `replay f.jsonl [--speed N] [--no-keys] [--force]` | Replay a recording | `xyzlcu replay rec.jsonl --no-keys` |
 | `run [--continue-on-error] 'cmd; cmd; …'` | Run several commands at once (split on `;` or newlines) | `xyzlcu run 'click-el TextEdit --title Save; wait TextEdit --role AXSheet; key return'` |
 | `batch [--continue-on-error] [file]` | Run commands line by line from a file or stdin | `printf 'type a\nkey return\n' \| xyzlcu batch` |
 | `serve [--status\|--stop]` | Start / inspect / stop the resident daemon; see [Daemon](#daemon) | `xyzlcu serve &` |
@@ -138,29 +142,81 @@ Notes:
 - **`--delay N`**: gap between synthesized mouse/keyboard events in ms (default 2). Raise it if a slow app drops input, e.g. `xyzlcu --delay 20 type …` or `XYZLCU_DELAY=20`.
 - **Screenshots**: on macOS 14+ capture goes through ScreenCaptureKit (in-process, rendered directly at the `--scale` size; `--window` captures only that window, even when covered; `--region` only that area); otherwise, or with `--cli`, it falls back to the system `screencapture`. The `method` field tells you which path ran, and `originX/originY` is the image's top-left in global points.
 
-## When keyboard events are blocked
+## Multiple input paths (when keyboard events are blocked)
 
-Sometimes another process's keyboard event tap hangs. `xyzlcu type` / `key` then return ok, but nothing shows up in the app, not even with `--app` direct delivery. The mouse usually still works.
+Sometimes a process's keyboard event tap hangs: keyboard events are posted but take ages to reach the app, or queue up and burst out much later, while the mouse still works. Since v0.4.0, `type` and `key` check event-stream health first, pick a path that works, and report the path actually used in the `path` field of their JSON output.
 
-**How to tell**: `xyzlcu check` lists the stuck taps under `keyboardBlockedBy` (active filter, interested in key events, average latency above 1 s). `xyzlcu taps` shows all the details. If the latency numbers never change, events are not being drained and old keystrokes are not being replayed either.
+**Health check**
 
-**Input paths that skip keyboard events** (none of them go through the keyboard event stream):
+- Reads the system tap list (`CGGetEventTapList`): an active (not listen-only) tap with average latency above 1000 ms (`XYZLCU_TAP_THRESHOLD_MS`) is suspicious.
+- Those stats are historical: a freshly hung tap still shows low numbers, while one that recovered long ago can keep showing high numbers. So the keyboard is **actively probed** every time: a tagged "right Shift up" event (no effect on any app) is posted and timed by a listen-only tap at the end of the chain; it is healthy if it gets through the whole stream within 400 ms (normally 1–30 ms). The mouse is probed only when its stats look suspicious (an in-place mouseMoved). Taps with high stats but a passing probe are listed as `staleTapStats` in `check` and treated as healthy.
+- The daemon caches the result for 1.5 s; `check` always re-checks, and `check --probe` probes the mouse too. `XYZLCU_PROBE=0` disables probing (stats only).
+- `XYZLCU_EVENTS_HEALTH=bad` / `good` forces blocked / healthy, for testing the fallback paths (works with the daemon too; the client forwards these variables with each request).
+
+**The paths**
+
+| `path` | How | Passes HID-stream taps? | App must be frontmost? | Verification |
+|---|---|---|---|---|
+| `ax-selected-text` | Accessibility write of the focused element's `AXSelectedText` (inserts at the caret) | No | No | Reads back `AXValue` |
+| `events-hid` | CGEvents posted to the system HID stream (`type` / `key` without `--app`) | Yes | Yes | Read back within 300 ms |
+| `events-pid` | `CGEventPostToPid`, delivered straight to the app process (`--app`, or `--via pid`) | No | No | Read back within 600 ms |
+| `paste-menu` | Puts the text on the clipboard, AXPresses the app's Edit>Paste item, restores the clipboard after verifying | No | No | Read back |
+| `menu` | `key` only: finds the menu item with the same shortcut and AXPresses it (e.g. `cmd+a` → Edit>Select All) | No | see below | — |
+| `ax-menu` | The `menu` command: AXPress by menu path | No | see below | — |
+
+**`type --via auto` (default)**
+
+- Healthy stream: `ax` when focus is a standard text control (`AXTextField` / `AXTextArea` / `AXComboBox` / `AXSearchField`), otherwise `events`.
+- Blocked stream: tries `ax` → `pid` → `paste`, verifying each by reading back and moving on only if it had no effect. It **never** uses `events-hid` while blocked, because those keystrokes would queue and burst out once the stream recovers.
+- If the field can't be read back (no way to verify), it stops at the current path instead of trying another, so the same text is never entered twice.
+- If no path worked: exit code 4, with each path's result in `tried`.
+- If `paste` could not be verified, the clipboard is **not** restored (`clipboardRestored: false`), so a queued paste won't paste the old contents.
+- `--via ax|events|pid|paste` forces one path; `XYZLCU_TYPE_VIA` changes the default.
+- `--window title`: refuses (exit code 4) unless the focused element is in a window whose title contains this text, so you never type into another document.
+
+**`key --via auto` (default)**
+
+- Healthy stream: `events` (`events-pid` with `--app`).
+- Blocked stream: first looks for a menu item with the same shortcut (matching `AXMenuItemCmdChar` / `AXMenuItemCmdModifiers` / `AXMenuItemCmdGlyph`, enabled items first) and presses it; keys with no menu item (arrows, return, …) go through `CGEventPostToPid`.
+- If nothing works: exit code 4, suggesting `menu` with an explicit item. `--via events|menu|pid` forces a path; `XYZLCU_KEY_VIA` changes the default.
+- Output `keys[]`: the `path` used for each combo, plus `menuItem` when a menu item was pressed.
+
+**Menus in the background**
+
+`menu "App" "Menu>Item" [--window title]` reads the menu bar by pid and AXPresses the item **without bringing the app to the front** (output `activated: false`, `appWasActive`). `--window` first makes that window the main window. Tested with TextEdit:
+
+- App-level items (File>New, File>Open…) work while the app is in the background;
+- Items that act on the document or the focused control (Select All, Bold, Prevent Editing, …) are disabled by Cocoa while the app is not frontmost, so pressing them does nothing and the output carries a `note`. Add `--activate` (activate first, then press), or use `insert` / `settext` / `type --via ax` instead.
+
+**Other commands that bypass keyboard events**
 
 ```bash
-xyzlcu insert TextEdit --window "My notes" "inserted at the caret"         # sets AXSelectedText
-xyzlcu settext TextEdit --role AXTextArea --window "My notes" "replace all" # sets AXValue
-xyzlcu value TextEdit --window "My notes"                                   # read it back
-xyzlcu type "hello"     # default --via auto switches to Accessibility writes when the keyboard is blocked
+xyzlcu insert TextEdit --window "My notes" "insert at the caret"           # writes AXSelectedText
+xyzlcu settext TextEdit --role AXTextArea --window "My notes" "replace all"  # writes AXValue
+xyzlcu value TextEdit --window "My notes"                                  # read back to verify
 ```
 
-- Target: the app's focused element by default, or pick one with `--role` / `--subrole` / `--title` (or `--id`) / `--index`. `--window TITLE` checks which window the element is in and refuses to write if it does not match, so you cannot write into the wrong document.
-- Every write reads `AXValue` back. Only `verified: true` counts as success; a mismatch exits with code 1.
-- The app does not need to be frontmost, and nothing outside the target element is touched. Native Cocoa text views (TextEdit, Notes, most text fields) support it. Some web pages and custom-drawn UIs do not accept value writes and report an error.
-- `--via paste`: puts the text on the clipboard, presses the "Edit>Paste" menu item, then restores your original clipboard.
+- Target: the app's focused element by default, or pick one with `--role` / `--subrole` / `--title` (or `--id`) / `--index`. `--window title` checks the element's window and refuses to write if it doesn't match.
+- Every write is read back from `AXValue`; only `verified: true` counts as success, otherwise the exit code is 1.
+- Native Cocoa text controls (TextEdit, Notes, most input fields) support this; some web pages and custom-drawn UIs don't, and then only `pid` / `paste` remain.
 
-**Instead of shortcuts**: press menu items with `menu`, for example `xyzlcu menu TextEdit "File>Save"`, `"文件>关闭"`, or `"Edit|编辑>Select All|全选"`. If an item is not found, every item on that level is listed.
+**`check` output**: `paths` lists whether events / mouse / ax / menu / pid / paste / record are usable (events and mouse include the measured `probeMs`); `typeOrder` / `keyOrder` show the order auto would try right now; `keyboardBlockedBy` lists the hung taps.
 
-**Limitation**: menu actions (`menu`, `press`, `--via paste`) rely on the app processing its own event queue. If the event pipeline is stuck as a whole, the app does not process them: the command reports success but nothing happens, and the action may be queued until the pipeline recovers. So when a stuck tap is detected, `menu` adds a `warning` to its output and `--via auto` does not fall back to paste. In that state only `insert` / `settext` / `type --via ax` take effect immediately. The real fix is to restart the stuck process (the one with the huge latency in `xyzlcu taps`) or to log out/reboot. XYZLCU does not kill system processes for you.
+**Limits**: `events-pid`, `menu` and `paste` bypass taps on the HID stream; if the app's own main thread is stuck, no path helps. To really fix it, restart the hung process (the one with `blocking: true` in `xyzlcu taps`) or log out / reboot. XYZLCU never kills processes for you.
+
+## Record and replay
+
+```bash
+xyzlcu record --duration 30                        # saved to ~/.xyzlcu/recordings/rec-<timestamp>.jsonl by default
+xyzlcu record --out /tmp/demo.jsonl --no-moves     # skip mouse moves
+xyzlcu replay /tmp/demo.jsonl --speed 2 --no-keys  # 2x speed, mouse only
+```
+
+- `record` uses a **listen-only** event tap at the end of the chain: it never intercepts, modifies or delays input, and can't block the keyboard even if it stalls. Needs Input Monitoring permission (`inputMonitoring` in `check`). Stops on Ctrl-C or after `--duration` seconds (default 60) and prints a summary.
+- Records key down / up / modifier changes (with characters), mouse buttons, drags and scrolls; mouse moves at most one per 15 ms (`--no-moves` skips them). The first line is a header (version, start time, display layout).
+- **Privacy**: the file is mode 0600 and stays on this Mac. Keys are **not** recorded while Secure Input (password fields) is on or the screen is locked (counted as `skippedSecureKeys`); recording stops when the screen locks. Recordings may contain what you typed, so delete them when done.
+- `replay` posts the events to the HID stream with the recorded timing; `--speed` speeds it up, `--no-keys` replays only the mouse. It refuses while the event stream is blocked (replayed events would queue) unless `--force`; it stops immediately if the screen locks (exit code 3). Check the frontmost window before replaying.
+- Replay posts ordinary synthetic events with the recorded timing: no random jitter, no "humanizing", and no anti-detection of any kind.
 
 ## Daemon
 
@@ -223,7 +279,7 @@ You can control this Mac's GUI with `xyzlcu`. Rules:
    - Act: use `xyzlcu click-el "App" --role R --title T` instead of clicking coordinates when possible.
    - Wait: use `xyzlcu wait "App" --title T --timeout 5` for UI changes instead of fixed sleeps.
    - Verify: re-run find / ax or take another screenshot after each action.
-3. Before every `type` or `key`, run `xyzlcu activate "TargetApp"` and confirm with `xyzlcu apps` that it is frontmost (active: true). Keyboard input goes to the frontmost app.
+3. Before every `type` or `key`, run `xyzlcu activate "TargetApp"` and confirm with `xyzlcu apps` that it is frontmost (active: true). Keyboard input goes to the frontmost app. Prefer `xyzlcu type --app "App" --window "Window title" "text"`: it refuses if focus is not in that window; check `path` and `verified` in the output.
 4. Ask the user before anything irreversible: payments, deletions, sending, submitting.
 5. Never use --force to bypass the lock-screen guard.
 6. Once the target is confirmed frontmost, chain several steps into one `xyzlcu run 'click-el App --title Search; type hello; key return; wait App --title Results'`; it is several times faster than separate calls.
@@ -272,7 +328,7 @@ Run it yourself: `python3 scripts/bench.py build/xyzlcu`; `--daemon` starts the 
 | 1 | Bad arguments, or app / element / display not found |
 | 2 | Missing permission (Accessibility or Screen Recording) |
 | 3 | Screen is locked; mouse/keyboard input refused |
-| 4 | `find` / `click-el` found no control, or `wait` timed out |
+| 4 | `find` / `click-el` found no control, `wait` timed out, `type` / `key` found no working input path, or the `--window` guard refused |
 | 5 | `XYZLCU_DAEMON=1` is set but the daemon can't be reached |
 
 ## Troubleshooting
@@ -287,12 +343,13 @@ Run it yourself: `python3 scripts/bench.py build/xyzlcu`; `--daemon` starts the 
 - After changing permissions or updating the app, you may need to toggle the switch off and on again.
 - Input shows up late or characters go missing: run `xyzlcu taps`. A process with `listenOnly: false` and a large `avgLatencyMs` (hundreds of ms or more) is holding up input events; common culprits are Screen Sharing (RFBEventHelperd), voice assistants or other computer-use tools. Quit or restart it and try again.
 - If an app can't keep up with fast input, widen the gap: `xyzlcu --delay 20 type …`.
-- Keyboard does nothing at all while the mouse works: an event tap that intercepts keyboard events is probably hung (in `xyzlcu taps` its `avgLatencyMs` is in the hundreds of thousands or millions, and its `eventsMask` covers only keyboard events). That blocks keyboard input system-wide, and `type --app "App"` may not get through either. Quit or restart that process (often Siri or Screen Sharing's RFBEventHelperd), or log out and back in.
+- Keyboard does nothing at all while the mouse works: an event tap that intercepts keyboard events is probably hung (`xyzlcu check` shows `paths.events.healthy: false`, and `xyzlcu taps` marks it `blocking: true`). `type` / `key` automatically switch to Accessibility, direct-to-process or menu paths (see [Multiple input paths](#multiple-input-paths-when-keyboard-events-are-blocked)). To fully recover, quit or restart that process (often Siri or Screen Sharing's RFBEventHelperd), or log out and back in.
 
 **Daemon issues**
 - `daemon` stays false in `check`: the daemon isn't running, or it's an older version (on a version mismatch commands run in-process). Run `xyzlcu serve --status`.
 - Permissions are false inside the daemon: it was started from a different app. Run `xyzlcu serve --stop`, then `xyzlcu serve &` again from the authorized terminal / agent shell.
-- After updating xyzlcu, run `xyzlcu serve --stop` and start it again.
+- After updating xyzlcu, run `xyzlcu serve --stop` and start it again. (a version mismatch falls back to in-process automatically).
+- When replacing the binary yourself, write to a temp file and `mv` it into place (`build.sh --install` does this); overwriting a signed binary that is in use with `cp` can get new processes killed by the system (exit code 137).
 
 **Does a Chinese input method get in the way?**
 - `type` sends Unicode characters directly and bypasses the input method, so the right text comes out even with a Chinese IME active.
@@ -310,6 +367,7 @@ Run it yourself: `python3 scripts/bench.py build/xyzlcu`; `--daemon` starts the 
 - With Accessibility permission, anything can be clicked or typed. Use it only where you trust the setup, and turn the switch off when you don't need it.
 - **Always confirm the frontmost app before `type` / `key`.** Otherwise text can land in another document, and a shortcut can close another window.
 - **Lock-screen guard**: while the screen is locked, `click / move / drag / scroll / type / key` refuse to run and exit with code 3. `--force` overrides this but isn't recommended.
+- **Recordings may contain what you typed**: they stay on this Mac (mode 0600), and no keys are recorded in password fields or while locked; delete them when done and don't share them. Check the frontmost window before `replay`, `type` or `key`.
 - Don't let an agent auto-confirm payment, deletion or sending dialogs.
 - XYZLCU makes no network connections, collects no data, and never modifies the system permission database. The daemon only listens on a local Unix socket and only accepts the same user.
 - **No detection evasion**: XYZLCU sends ordinary synthesized mouse and keyboard events. It doesn't pretend to be a human, randomize timing, or get around captchas or websites' bot detection. When an agent hits a captcha, an "are you human" check or any other anti-bot check, it should stop and hand it to a person.

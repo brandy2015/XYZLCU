@@ -7,6 +7,7 @@ import ApplicationServices
 import CoreGraphics
 import ImageIO
 import ScreenCaptureKit
+import Carbon.HIToolbox
 
 // MARK: - 工具函数
 /// 守护进程模式下输出写进缓冲区再回传给客户端；普通模式直接打印
@@ -92,20 +93,25 @@ let modMap: [String: CGEventFlags] = [
     "cmd":.maskCommand,"command":.maskCommand,"shift":.maskShift,"opt":.maskAlternate,"option":.maskAlternate,"alt":.maskAlternate,
     "ctrl":.maskControl,"control":.maskControl,"fn":.maskSecondaryFn,
 ]
-func pressCombo(_ combo: String) throws {
+/// 解析 cmd+shift+s 这样的组合键，返回（键码、修饰键、主键名）
+func parseCombo(_ combo: String) throws -> (CGKeyCode, CGEventFlags, String) {
+    // 单独的 "+" 键写成 cmd++ 时最后一段为空，这里不支持，用 shift+= 代替
     let parts = combo.lowercased().split(separator: "+").map(String.init)
     var flags: CGEventFlags = []
-    var key: CGKeyCode? = nil
+    var key: CGKeyCode? = nil, name = ""
     for p in parts {
         if let m = modMap[p] { flags.insert(m) }
-        else if let k = keyMap[p] { key = k }
+        else if let k = keyMap[p] { key = k; name = p }
         else { try fail("未知按键: \(p)") }
     }
     guard let k = key else { try fail("组合键里没有主键: \(combo)") }
-    let src = eventSource
-    let d = CGEvent(keyboardEventSource: src, virtualKey: k, keyDown: true); d?.flags = flags; postKey(d)
-    let u = CGEvent(keyboardEventSource: src, virtualKey: k, keyDown: false); u?.flags = flags; postKey(u)
+    return (k, flags, name)
 }
+func postCombo(_ k: CGKeyCode, _ flags: CGEventFlags) {
+    let d = CGEvent(keyboardEventSource: eventSource, virtualKey: k, keyDown: true); d?.flags = flags; postKey(d)
+    let u = CGEvent(keyboardEventSource: eventSource, virtualKey: k, keyDown: false); u?.flags = flags; postKey(u)
+}
+func pressCombo(_ combo: String) throws { let (k, f, _) = try parseCombo(combo); postCombo(k, f) }
 func typeText(_ text: String) {
     let src = eventSource
     let units = Array(text.utf16)
@@ -293,14 +299,102 @@ func windowTitle(of el: AXUIElement) -> String? {
     if let w = axElement(attr(el, kAXWindowAttribute)) { return str(w, kAXTitleAttribute) }
     return nil
 }
-/// 被键盘事件卡住的监听：主动拦截、已启用、关心 keyDown、平均延迟超过 1 秒
-func blockingKeyboardTaps() -> [[String: Any]] {
+// MARK: - 输入路径健康检查（多条路自动选择）
+/// 环境变量。守护进程模式下用客户端随请求转发过来的值（守护进程自己的环境可能是旧的）
+var envOverlay: [String: String] = [:]
+func envv(_ k: String) -> String? { daemonMode ? envOverlay[k] : ProcessInfo.processInfo.environment[k] }
+let forwardedEnv = ["XYZLCU_EVENTS_HEALTH", "XYZLCU_TAP_THRESHOLD_MS", "XYZLCU_TYPE_VIA", "XYZLCU_KEY_VIA", "XYZLCU_PROBE"]
+
+struct TapInfo { let pid: pid_t; let process: String; let enabled: Bool; let listenOnly: Bool; let mask: UInt64; let avgMs: Double; let maxMs: Double }
+func eventTaps() -> [TapInfo] {
     var n: UInt32 = 0; CGGetEventTapList(0, nil, &n)
     guard n > 0 else { return [] }
     var list = [CGEventTapInformation](repeating: CGEventTapInformation(), count: Int(n)); CGGetEventTapList(n, &list, &n)
-    return list.prefix(Int(n)).filter { t in
-        t.enabled && t.options != .listenOnly && (t.eventsOfInterest & (1 << CGEventType.keyDown.rawValue)) != 0 && t.avgUsecLatency > 1_000_000
-    }.map { t in ["process": pathOf(t.tappingProcess), "pid": Int(t.tappingProcess), "avgLatencyMs": Double(t.avgUsecLatency) / 1000] }
+    return list.prefix(Int(n)).map { t in
+        TapInfo(pid: t.tappingProcess, process: pathOf(t.tappingProcess), enabled: t.enabled, listenOnly: t.options == .listenOnly,
+                mask: t.eventsOfInterest, avgMs: Double(t.avgUsecLatency) / 1000, maxMs: Double(t.maxUsecLatency) / 1000)
+    }
+}
+func evBit(_ t: CGEventType) -> UInt64 { 1 << UInt64(t.rawValue) }
+let keyboardEventsMask = evBit(.keyDown) | evBit(.keyUp) | evBit(.flagsChanged)
+let mouseEventsMask = evBit(.leftMouseDown) | evBit(.leftMouseUp) | evBit(.rightMouseDown) | evBit(.rightMouseUp) |
+    evBit(.mouseMoved) | evBit(.leftMouseDragged) | evBit(.scrollWheel)
+func tapThresholdMs() -> Double { Double(envv("XYZLCU_TAP_THRESHOLD_MS") ?? "") ?? 1000 }
+/// 会挡住输入的监听：已启用、主动拦截（不是只监听）、平均延迟超过阈值（默认 1000 毫秒）
+func isBlockingTap(_ t: TapInfo) -> Bool { t.enabled && !t.listenOnly && t.avgMs > tapThresholdMs() }
+struct InputHealth {
+    var keyboardOK = true, mouseOK = true
+    var keyboardBlockedBy: [[String: Any]] = [], mouseBlockedBy: [[String: Any]] = []
+    var override: String? = nil
+    /// 主动探测耗时（毫秒）；nil = 没探测，-1 = 建不了监听（没有输入监控权限），infinity = 超时
+    var keyboardProbeMs: Double? = nil, mouseProbeMs: Double? = nil
+    /// 系统统计显示延迟很高、但实测事件能正常走完的监听（统计是历史值，可能早已恢复）
+    var staleBlockers: [[String: Any]] = []
+    var at = Date()
+    var blockerNames: [String] { keyboardBlockedBy.compactMap { ($0["process"] as? String)?.split(separator: "/").last.map(String.init) } }
+}
+var cachedHealth: InputHealth? = nil
+var forceProbe = false
+let probeMagic: Int64 = 0x58595A4C
+var probeHit: Double? = nil
+/// 主动探测事件流：发一个没有副作用的带标记事件（键盘：右 Shift 松开的 flagsChanged；鼠标：原地 mouseMoved），
+/// 用排在最后的只监听监听计时，看它多久走完整条事件流。返回毫秒；超时 = infinity；建不了监听 = -1
+func probeStream(keyboard: Bool, timeoutMs: Int) -> Double {
+    let type: CGEventType = keyboard ? .flagsChanged : .mouseMoved
+    let cb: CGEventTapCallBack = { _, _, ev, _ in
+        if probeHit == nil && ev.getIntegerValueField(.eventSourceUserData) == probeMagic {
+            probeHit = CFAbsoluteTimeGetCurrent(); CFRunLoopStop(CFRunLoopGetCurrent())
+        }
+        return Unmanaged.passUnretained(ev)
+    }
+    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                      eventsOfInterest: evBit(type), callback: cb, userInfo: nil) else { return -1 }
+    let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    defer { CGEvent.tapEnable(tap: tap, enable: false); CFRunLoopRemoveSource(CFRunLoopGetCurrent(), src, .commonModes); CFMachPortInvalidate(tap) }
+    probeHit = nil
+    let e: CGEvent?
+    if keyboard { e = CGEvent(keyboardEventSource: nil, virtualKey: 0x3C, keyDown: false); e?.type = .flagsChanged; e?.flags = [] }
+    else { e = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGEvent(source: nil)?.location ?? .zero, mouseButton: .left) }
+    e?.setIntegerValueField(.eventSourceUserData, value: probeMagic)
+    let t0 = CFAbsoluteTimeGetCurrent(), deadline = t0 + Double(timeoutMs) / 1000
+    e?.post(tap: .cghidEventTap)
+    while probeHit == nil && CFAbsoluteTimeGetCurrent() < deadline {
+        _ = CFRunLoopRunInMode(.defaultMode, deadline - CFAbsoluteTimeGetCurrent(), true)
+    }
+    return probeHit.map { ($0 - t0) * 1000 } ?? .infinity
+}
+/// 读取系统事件监听列表判断键盘 / 鼠标事件流是否健康。守护进程里缓存 1.5 秒
+/// XYZLCU_EVENTS_HEALTH=bad 可模拟「事件流卡住」（测试备用路径），=good 忽略检测
+func inputHealth() -> InputHealth {
+    let ov = envv("XYZLCU_EVENTS_HEALTH")?.lowercased()
+    if ov == nil, !forceProbe, daemonMode, let h = cachedHealth, Date().timeIntervalSince(h.at) < 1.5 { return h }
+    let blocking = eventTaps().filter(isBlockingTap)
+    func desc(_ t: TapInfo) -> [String: Any] { ["process": t.process, "pid": Int(t.pid), "avgLatencyMs": t.avgMs] }
+    var h = InputHealth()
+    h.keyboardBlockedBy = blocking.filter { $0.mask & keyboardEventsMask != 0 }.map(desc)
+    h.mouseBlockedBy = blocking.filter { $0.mask & mouseEventsMask != 0 }.map(desc)
+    h.keyboardOK = h.keyboardBlockedBy.isEmpty; h.mouseOK = h.mouseBlockedBy.isEmpty
+    // 系统统计里的延迟是历史值（刚卡住的监听统计还是低的，早已恢复的统计却可能还很高），所以键盘每次都实测：
+    // 发一个带标记的「右 Shift 松开」事件，400 毫秒内走完整条事件流就算健康（正常 1–30 毫秒）。XYZLCU_PROBE=0 关闭
+    // 鼠标只在统计说卡住时（或 check --probe）才实测
+    if ov == nil && envv("XYZLCU_PROBE") != "0" {
+        do {
+            let ms = probeStream(keyboard: true, timeoutMs: 400); h.keyboardProbeMs = ms
+            if ms >= 0 && ms.isFinite { h.staleBlockers += h.keyboardBlockedBy; h.keyboardBlockedBy = []; h.keyboardOK = true }
+            else if ms.isInfinite && h.keyboardOK { h.keyboardOK = false; h.keyboardBlockedBy = [["process": "unknown", "pid": 0, "avgLatencyMs": -1, "note": "探测事件 400 毫秒内没走完"]] }
+        }
+        if !h.mouseOK || forceProbe {
+            let ms = probeStream(keyboard: false, timeoutMs: 400); h.mouseProbeMs = ms
+            if ms >= 0 && ms.isFinite { h.mouseBlockedBy = []; h.mouseOK = true }
+            else if ms.isInfinite && h.mouseOK { h.mouseOK = false }
+        }
+    }
+    if ov == "bad" { h.keyboardOK = false; h.mouseOK = false } else if ov == "good" { h.keyboardOK = true; h.mouseOK = true }
+    h.override = ov
+    if ov == nil { cachedHealth = h }
+    return h
 }
 
 /// 解析输入目标：给了 --role/--subrole/--title/--id 就按条件找，否则用应用当前的焦点元素。--window 限定所在窗口标题
@@ -399,7 +493,8 @@ func axWrite(_ el: AXUIElement, _ text: String, replaceAll: Bool) -> [String: An
 /// 剪贴板 + 菜单「编辑>粘贴」：不用 cmd+v，不经过键盘事件；结束后恢复剪贴板
 func pasteWrite(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceAll: Bool) throws -> [String: Any] {
     let snap = snapshotPasteboard()
-    defer { restorePasteboard(snap) }
+    var restore = true
+    defer { if restore { restorePasteboard(snap) } }
     let before = el.flatMap(axStringValue)
     if replaceAll { _ = try pressMenu(appName, menuSelectAll); sleepMs(50) }
     let pb = NSPasteboard.general
@@ -414,7 +509,11 @@ func pasteWrite(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceA
             sleepMs(30)
         }
     } else { sleepMs(300) }
-    return ["method": "paste-menu", "verified": verified, "length": (el.flatMap(axStringValue) ?? "").count, "clipboardRestored": true]
+    // 没核对上时，菜单动作可能排队到以后才执行；这时不恢复剪贴板，免得以后粘贴出旧内容
+    restore = verified || el == nil
+    var o: [String: Any] = ["method": "paste-menu", "verified": verified, "length": (el.flatMap(axStringValue) ?? "").count, "clipboardRestored": restore]
+    if !restore { o["note"] = "粘贴没有立即生效，可能会在事件流恢复后才执行；剪贴板里保留了要输入的文字" }
+    return o
 }
 
 /// 先试辅助功能写值，不行（或 --via paste）再走剪贴板 + 菜单粘贴
@@ -429,12 +528,339 @@ func writeText(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceAl
         }
     }
     if via == "ax" { try fail("没有可写入的焦点元素") }
-    // 菜单「粘贴」要靠应用处理事件队列；键盘事件流卡住时按了也不会生效，还可能排队到以后才执行，所以自动模式下不走这条路
-    if via == "auto", !blockingKeyboardTaps().isEmpty {
-        try fail("辅助功能写入不可用，且检测到卡住的键盘监听（xyzlcu taps），剪贴板 + 菜单粘贴也不会生效。如确实要试，加 --via paste", code: 4)
-    }
     return try pasteWrite(appName, el, text, replaceAll: replaceAll)
 }
+// MARK: - 多条输入路径：type / key 自动选路
+// type：辅助功能写值（ax）→ 键盘事件（events，事件流健康时）→ 直接投递给应用进程（pid）→ 剪贴板 + 菜单「粘贴」（paste）
+// key ：键盘事件（events，事件流健康时）→ 按快捷键对应的菜单项（menu）→ 直接投递给应用进程（pid）
+let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+/// 等输入框的值变化并包含 text。读不到值时返回 nil（无法核对）
+func waitValueChange(_ el: AXUIElement?, from before: String?, contains text: String, ms: Int) -> Bool? {
+    guard let el = el, before != nil else { return nil }
+    let t0 = Date()
+    repeat {
+        if let v = axStringValue(el), v != before, v.contains(text) { return true }
+        sleepMs(25)
+    } while Date().timeIntervalSince(t0) * 1000 < Double(ms)
+    return false
+}
+func jsonText(_ o: Any) -> String {
+    guard let d = try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys, .withoutEscapingSlashes]) else { return "\(o)" }
+    return String(data: d, encoding: .utf8) ?? "\(o)"
+}
+func typeChain(_ appOpt: String?, _ text: String, via: String, window: String? = nil) throws -> [String: Any] {
+    guard ["auto", "ax", "events", "pid", "paste"].contains(via) else { try fail("--via 只能是 auto、ax、events、pid、paste") }
+    let h = inputHealth()
+    let (root, app) = try axRoot(appOpt)
+    let el = axElement(attr(root, kAXFocusedUIElementAttribute))
+    let role = el.flatMap { str($0, kAXRoleAttribute) } ?? ""
+    // --window：焦点元素必须在标题含该文字的窗口里，否则拒绝输入（防止打进别的文稿）
+    if let w = window {
+        let wt = el.flatMap(windowTitle(of:)) ?? ""
+        guard el != nil, wt.localizedCaseInsensitiveContains(w) else { try fail("焦点元素在窗口「\(wt)」里，不是「\(w)」，已拒绝输入", code: 4) }
+    }
+    let appKey = app.bundleIdentifier ?? app.localizedName ?? ""
+    var order: [String]
+    if via == "auto" {
+        order = []
+        // 标准文本框总是先走辅助功能（不经过事件流，最快且能核对）；事件流卡住时任何焦点元素都先试一下
+        if el != nil && (textRoles.contains(role) || !h.keyboardOK) { order.append("ax") }
+        order += h.keyboardOK ? ["events"] : ["pid", "paste"]
+    } else { order = [via] }
+    var tried: [[String: Any]] = []
+    func result(_ path: String, _ verified: Any, _ extra: [String: Any] = [:]) -> [String: Any] {
+        var o: [String: Any] = ["ok": true, "path": path, "verified": verified, "app": app.localizedName ?? "", "pid": Int(app.processIdentifier),
+                                "role": role, "eventsHealthy": h.keyboardOK, "tried": tried]
+        if let el = el, let w = windowTitle(of: el) { o["window"] = w }
+        if !h.keyboardOK { o["blockedBy"] = h.blockerNames }
+        if let ov = h.override { o["healthOverride"] = ov }
+        o.merge(extra) { a, _ in a }
+        return o
+    }
+    for p in order {
+        let before = el.flatMap(axStringValue)
+        switch p {
+        case "ax":
+            guard let el = el else {
+                if via == "ax" { try fail("\(app.localizedName ?? "应用") 没有焦点元素，无法用辅助功能输入", code: 4) }
+                tried.append(["path": "ax", "result": "没有焦点元素"]); continue
+            }
+            if let r = axWrite(el, text, replaceAll: false) {
+                if (r["verified"] as? Bool) == true || axStringValue(el) != before { return result("ax-selected-text", r["verified"] ?? false) }
+                tried.append(["path": "ax-selected-text", "result": "写入后内容没变"])
+            } else { tried.append(["path": "ax-selected-text", "result": "AXSelectedText 不可写"]) }
+        case "events":
+            keyTargetPid = appOpt == nil ? nil : app.processIdentifier
+            typeText(text); keyTargetPid = nil
+            let v = waitValueChange(el, from: before, contains: text, ms: 300)
+            return result(appOpt == nil ? "events-hid" : "events-pid", v.map { $0 as Any } ?? "unknown")
+        case "pid":
+            // CGEventPostToPid：直接投递到应用进程的事件队列，不经过系统 HID 事件流上的监听
+            keyTargetPid = app.processIdentifier
+            typeText(text); keyTargetPid = nil
+            let v = waitValueChange(el, from: before, contains: text, ms: 600)
+            if v == true || via == "pid" { return result("events-pid", v.map { $0 as Any } ?? "unknown") }
+            if v == nil { return result("events-pid", "unknown", ["note": "读不到输入框内容，无法核对；为避免重复输入，不再尝试其它路径"]) }
+            tried.append(["path": "events-pid", "result": "600 毫秒内没有生效（事件可能在排队，稍后才出现）"])
+        case "paste":
+            let r = try pasteWrite(appKey, el, text, replaceAll: false)
+            if (r["verified"] as? Bool) == true || el == nil || via == "paste" { return result("paste-menu", r["verified"] ?? false, r) }
+            tried.append(["path": "paste-menu", "result": "菜单「粘贴」后内容没变", "clipboardRestored": r["clipboardRestored"] ?? true])
+        default: break
+        }
+    }
+    try fail("所有输入路径都没有生效（事件流\(h.keyboardOK ? "正常" : "卡住: " + h.blockerNames.joined(separator: ", "))）。尝试过: \(jsonText(tried))。可用 insert/settext 指定输入框，或 xyzlcu taps 排查", code: 4)
+}
+
+/// AXMenuItemCmdGlyph 的取值（Carbon 菜单字形常量），用来匹配回车、删除、方向键等特殊键的快捷键
+let menuGlyphs: [String: Int] = ["tab": 2, "enter": 4, "kpenter": 4, "space": 9, "forwarddelete": 10, "return": 11, "delete": 23, "backspace": 23,
+    "esc": 27, "escape": 27, "pageup": 98, "left": 100, "right": 101, "home": 102, "up": 104, "end": 105, "down": 106, "pagedown": 107,
+    "f1": 111, "f2": 112, "f3": 113, "f4": 114, "f5": 115, "f6": 116, "f7": 117, "f8": 118, "f9": 119, "f10": 120, "f11": 121, "f12": 122]
+let menuScanAttrs = [kAXRoleAttribute, kAXTitleAttribute, "AXMenuItemCmdChar", "AXMenuItemCmdVirtualKey", "AXMenuItemCmdModifiers",
+                     kAXChildrenAttribute, kAXEnabledAttribute, "AXMenuItemCmdGlyph"] as CFArray
+/// 在应用菜单栏里找快捷键等于 combo 的菜单项（按 pid 读取，不激活应用）。优先返回可用的菜单项
+func menuItemForShortcut(_ root: AXUIElement, keyName: String, keycode: CGKeyCode, flags: CGEventFlags) -> (AXUIElement, String, Bool)? {
+    guard let bar = axElement(attr(root, kAXMenuBarAttribute)) else { return nil }
+    let want = (flags.contains(.maskCommand), flags.contains(.maskShift), flags.contains(.maskAlternate), flags.contains(.maskControl))
+    var queue: [(AXUIElement, String)] = children(bar).map { ($0, "") }
+    var head = 0
+    var fallback: (AXUIElement, String, Bool)? = nil
+    while head < queue.count && head < 6000 {
+        let (el, prefix) = queue[head]; head += 1
+        var raw: CFArray?
+        guard AXUIElementCopyMultipleAttributeValues(el, menuScanAttrs, AXCopyMultipleAttributeOptions(rawValue: 0), &raw) == .success,
+              let v = raw as? [AnyObject], v.count == 8 else { continue }
+        let role = axs(clean(v[0])) ?? "", title = axs(clean(v[1])) ?? ""
+        let path = title.isEmpty ? prefix : (prefix.isEmpty ? title : prefix + ">" + title)
+        if role == "AXMenuItem" {
+            let ch = axs(clean(v[2])) ?? ""
+            let vk = (clean(v[3]) as? NSNumber)?.intValue
+            let mods = (clean(v[4]) as? NSNumber)?.intValue ?? 0
+            let glyph = (clean(v[7]) as? NSNumber)?.intValue
+            var keyOK = false
+            if !ch.isEmpty && keyName.count == 1 { keyOK = ch.uppercased() == keyName.uppercased() }
+            if !keyOK, let g = glyph, g != 0, let wg = menuGlyphs[keyName] { keyOK = g == wg }
+            if !keyOK, ch.isEmpty, let vk = vk, vk != 0 { keyOK = vk == Int(keycode) }
+            // kAXMenuItemModifier：Shift=1、Option=2、Control=4、NoCommand=8（不带 8 表示含 Command）
+            let have = (mods & 8 == 0, mods & 1 != 0, mods & 2 != 0, mods & 4 != 0)
+            if keyOK && have == want && (!ch.isEmpty || glyph != nil || vk != nil) {
+                let enabled = (clean(v[6]) as? Bool) ?? true
+                if enabled { return (el, path, true) }
+                if fallback == nil { fallback = (el, path, false) }
+            }
+        }
+        if let kids = clean(v[5]) as? [AXUIElement] { queue.append(contentsOf: kids.map { ($0, path) }) }
+    }
+    return fallback
+}
+func keyChain(_ appOpt: String?, _ combos: [String], via: String) throws -> [String: Any] {
+    guard ["auto", "events", "menu", "pid"].contains(via) else { try fail("--via 只能是 auto、events、menu、pid") }
+    let h = inputHealth()
+    let app: NSRunningApplication
+    if let a = appOpt { guard let x = findApp(a) else { try fail("找不到应用: \(a)") }; app = x }
+    else { guard let x = NSWorkspace.shared.frontmostApplication else { try fail("没有前台应用") }; app = x }
+    let order: [String] = via == "auto" ? (h.keyboardOK ? ["events"] : ["menu", "pid"]) : [via]
+    var results: [[String: Any]] = []
+    for (i, c) in combos.enumerated() {
+        if i > 0 { sleepMs(stepDelay) }
+        let (k, f, name) = try parseCombo(c)
+        var tried: [[String: Any]] = []
+        var done: [String: Any]? = nil
+        paths: for p in order {
+            switch p {
+            case "events":
+                keyTargetPid = appOpt == nil ? nil : app.processIdentifier
+                postCombo(k, f); keyTargetPid = nil
+                done = ["key": c, "path": appOpt == nil ? "events-hid" : "events-pid"]
+            case "menu":
+                let ax = AXUIElementCreateApplication(app.processIdentifier); AXUIElementSetMessagingTimeout(ax, 3)
+                if let (el, path, enabled) = menuItemForShortcut(ax, keyName: name, keycode: k, flags: f) {
+                    let r = AXUIElementPerformAction(el, kAXPressAction as CFString)
+                    if r == .success { done = ["key": c, "path": "menu", "menuItem": path, "enabledBefore": enabled] }
+                    else { tried.append(["path": "menu", "menuItem": path, "result": "AXPress 失败: AXError \(r.rawValue)"]) }
+                } else { tried.append(["path": "menu", "result": "\(app.localizedName ?? "应用") 的菜单栏里没有快捷键为 \(c) 的菜单项"]) }
+            case "pid":
+                keyTargetPid = app.processIdentifier
+                postCombo(k, f); keyTargetPid = nil
+                done = ["key": c, "path": "events-pid", "note": "按键已直接投递给应用进程，无法核对是否生效"]
+            default: break
+            }
+            if done != nil { break paths }
+        }
+        guard var d = done else {
+            try fail("快捷键 \(c) 没有可用路径（事件流\(h.keyboardOK ? "正常" : "卡住")）。尝试过: \(jsonText(tried))。可用 menu \"App\" \"菜单>菜单项\" 指定", code: 4)
+        }
+        if !tried.isEmpty { d["tried"] = tried }
+        results.append(d)
+    }
+    var o: [String: Any] = ["ok": true, "app": app.localizedName ?? "", "pid": Int(app.processIdentifier), "eventsHealthy": h.keyboardOK, "keys": results]
+    if !h.keyboardOK { o["blockedBy"] = h.blockerNames }
+    if let ov = h.override { o["healthOverride"] = ov }
+    return o
+}
+/// 不激活应用，把它的某个窗口设为主窗口（菜单动作作用于主窗口 / 关键窗口）
+func setMainWindow(_ appName: String, _ title: String) throws -> String {
+    let (root, app) = try axRoot(appName)
+    let wins = (attr(root, kAXWindowsAttribute) as? [AXUIElement]) ?? []
+    guard let w = wins.first(where: { (str($0, kAXTitleAttribute) ?? "").localizedCaseInsensitiveContains(title) }) else {
+        try fail("\(app.localizedName ?? appName) 没有标题含「\(title)」的窗口", code: 4)
+    }
+    AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue)
+    AXUIElementSetAttributeValue(w, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    return str(w, kAXTitleAttribute) ?? ""
+}
+
+// MARK: - 录制 / 回放（只监听的事件监听：不拦截、不修改任何输入，卡住也不会挡键盘）
+let recNames: [(String, CGEventType)] = [("leftMouseDown", .leftMouseDown), ("leftMouseUp", .leftMouseUp), ("rightMouseDown", .rightMouseDown),
+    ("rightMouseUp", .rightMouseUp), ("otherMouseDown", .otherMouseDown), ("otherMouseUp", .otherMouseUp), ("mouseMoved", .mouseMoved),
+    ("leftMouseDragged", .leftMouseDragged), ("rightMouseDragged", .rightMouseDragged), ("otherMouseDragged", .otherMouseDragged),
+    ("scrollWheel", .scrollWheel), ("keyDown", .keyDown), ("keyUp", .keyUp), ("flagsChanged", .flagsChanged)]
+var recOut: FileHandle? = nil
+var recStart: CFAbsoluteTime = 0
+var recCount = 0, recSecureSkipped = 0
+var recLastMove: CFAbsoluteTime = 0
+var recMoves = true
+var recTap: CFMachPort? = nil
+var recStopReason = ""
+func recWrite(_ o: [String: Any]) {
+    guard let d = try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys, .withoutEscapingSlashes]) else { return }
+    recOut?.write(d); recOut?.write(Data("\n".utf8))
+}
+func recordEvent(_ type: CGEventType, _ e: CGEvent) {
+    guard let name = recNames.first(where: { $0.1 == type })?.0 else { return }
+    let now = CFAbsoluteTimeGetCurrent()
+    let isKey = type == .keyDown || type == .keyUp || type == .flagsChanged
+    if isKey {
+        // 密码框等安全输入开启时、或锁屏时，不记录按键
+        if IsSecureEventInputEnabled() || screenLocked() { recSecureSkipped += 1; return }
+    }
+    let isMove = type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged
+    if isMove {
+        if type == .mouseMoved && !recMoves { return }
+        if now - recLastMove < 0.015 { return }  // 移动事件最多约 66 次/秒
+        recLastMove = now
+    }
+    var o: [String: Any] = ["t": Int((now - recStart) * 1000), "type": name]
+    let p = e.location
+    o["x"] = (p.x * 10).rounded() / 10; o["y"] = (p.y * 10).rounded() / 10
+    if isKey {
+        o["keycode"] = Int(e.getIntegerValueField(.keyboardEventKeycode)); o["flags"] = e.flags.rawValue
+        if type == .keyDown {
+            var len = 0; var buf = [UniChar](repeating: 0, count: 8)
+            e.keyboardGetUnicodeString(maxStringLength: 8, actualStringLength: &len, unicodeString: &buf)
+            if len > 0 { o["chars"] = String(utf16CodeUnits: buf, count: len) }
+            if e.getIntegerValueField(.keyboardEventAutorepeat) != 0 { o["repeat"] = true }
+        }
+    } else if type == .scrollWheel {
+        o["dy"] = Int(e.getIntegerValueField(.scrollWheelEventPointDeltaAxis1)); o["dx"] = Int(e.getIntegerValueField(.scrollWheelEventPointDeltaAxis2))
+    } else {
+        o["button"] = Int(e.getIntegerValueField(.mouseEventButtonNumber)); o["clicks"] = Int(e.getIntegerValueField(.mouseEventClickState))
+        if e.flags.rawValue & 0x00FF0000 != 0 { o["flags"] = e.flags.rawValue }
+    }
+    recWrite(o); recCount += 1
+}
+func recordSession(outPath: String, duration: Double, moves: Bool) throws {
+    if daemonMode { try fail("record 要在前台进程里运行（不经过守护进程）") }
+    if screenLocked() { try fail("屏幕已锁定，拒绝录制", code: 3) }
+    var mask: CGEventMask = 0
+    for (_, t) in recNames { mask |= evBit(t) }
+    let dir = (outPath as NSString).deletingLastPathComponent
+    if !dir.isEmpty { try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+    guard FileManager.default.createFile(atPath: outPath, contents: nil, attributes: [.posixPermissions: 0o600]),
+          let fh = FileHandle(forWritingAtPath: outPath) else { try fail("无法写入: \(outPath)") }
+    recOut = fh; recMoves = moves; recCount = 0; recSecureSkipped = 0; recStopReason = ""
+    recStart = CFAbsoluteTimeGetCurrent()
+    let disp: [[String: Int]] = activeDisplays().map { d in let b = CGDisplayBounds(d); return ["x": Int(b.minX), "y": Int(b.minY), "w": Int(b.width), "h": Int(b.height)] }
+    recWrite(["kind": "header", "xyzlcu": version, "startedAt": ISO8601DateFormatter().string(from: Date()), "displays": disp])
+    let cb: CGEventTapCallBack = { _, type, event, _ in
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let t = recTap { CGEvent.tapEnable(tap: t, enable: true) }
+        } else { recordEvent(type, event) }
+        return Unmanaged.passUnretained(event)
+    }
+    // listenOnly：只看不拦，回调慢了也不会耽误任何输入；只在 record 运行期间存在
+    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
+                                      eventsOfInterest: mask, callback: cb, userInfo: nil) else {
+        fh.closeFile(); recOut = nil; try? FileManager.default.removeItem(atPath: outPath)
+        try fail("创建只监听的事件监听失败：需要「输入监控」或「辅助功能」权限（系统设置 > 隐私与安全性）", code: 2)
+    }
+    recTap = tap
+    let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    var sigs: [DispatchSourceSignal] = []
+    for sg in [SIGINT, SIGTERM, SIGHUP] {
+        signal(sg, SIG_IGN)
+        let d = DispatchSource.makeSignalSource(signal: sg, queue: .main)
+        d.setEventHandler { recStopReason = "interrupted"; CFRunLoopStop(CFRunLoopGetMain()) }
+        d.resume(); sigs.append(d)
+    }
+    let timer = Timer(timeInterval: 0.25, repeats: true) { _ in
+        if screenLocked() { recStopReason = "screen-locked"; CFRunLoopStop(CFRunLoopGetMain()) }
+        else if CFAbsoluteTimeGetCurrent() - recStart >= duration { recStopReason = "duration"; CFRunLoopStop(CFRunLoopGetMain()) }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    FileHandle.standardError.write("录制中（只监听，不拦截输入）… 最长 \(Int(duration)) 秒，Ctrl-C 提前结束\n".data(using: .utf8)!)
+    CFRunLoopRun()
+    timer.invalidate()
+    CGEvent.tapEnable(tap: tap, enable: false)
+    CFRunLoopRemoveSource(CFRunLoopGetCurrent(), src, .commonModes)
+    CFMachPortInvalidate(tap); recTap = nil
+    for d in sigs { d.cancel() }
+    for sg in [SIGINT, SIGTERM, SIGHUP] { signal(sg, SIG_DFL) }
+    fh.closeFile(); recOut = nil
+    out(["path": outPath, "events": recCount, "durationMs": Int((CFAbsoluteTimeGetCurrent() - recStart) * 1000),
+         "stoppedBy": recStopReason, "skippedSecureKeys": recSecureSkipped, "tap": "listenOnly"])
+}
+func numv(_ o: [String: Any], _ k: String) -> Double? { (o[k] as? NSNumber)?.doubleValue }
+func replaySession(path: String, speed: Double, force: Bool, noKeys: Bool) throws {
+    guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { try fail("读不到录制文件: \(path)") }
+    let evs = text.split(separator: "\n").compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+        .filter { $0["kind"] == nil && $0["type"] is String }
+    let keyTypes: Set<String> = ["keyDown", "keyUp", "flagsChanged"]
+    let hasKeys = !noKeys && evs.contains { keyTypes.contains($0["type"] as! String) }
+    let hasMouse = evs.contains { !keyTypes.contains($0["type"] as! String) }
+    let h = inputHealth()
+    if !force {
+        // 事件流卡住时回放的事件会排队，以后才一股脑执行，所以默认拒绝
+        if hasKeys && !h.keyboardOK { try fail("键盘事件流卡住（\(h.blockerNames.joined(separator: ", "))），回放的按键会排队到以后才执行，已拒绝。加 --force 强制", code: 4) }
+        if hasMouse && !h.mouseOK { try fail("鼠标事件流卡住，已拒绝回放。加 --force 强制", code: 4) }
+    }
+    let sp = speed > 0 ? speed : 1
+    let t0 = CFAbsoluteTimeGetCurrent(); var n = 0
+    for ev in evs {
+        let name = ev["type"] as! String
+        if noKeys && keyTypes.contains(name) { continue }
+        guard let type = recNames.first(where: { $0.0 == name })?.1 else { continue }
+        let due = (numv(ev, "t") ?? 0) / 1000 / sp
+        let wait = due - (CFAbsoluteTimeGetCurrent() - t0)
+        if wait > 0 { usleep(useconds_t(wait * 1_000_000)) }
+        if screenLocked() { try fail("屏幕被锁定，回放已停止（已回放 \(n) / \(evs.count) 个事件）", code: 3) }
+        let p = CGPoint(x: numv(ev, "x") ?? 0, y: numv(ev, "y") ?? 0)
+        var e: CGEvent?
+        switch type {
+        case .keyDown, .keyUp:
+            e = CGEvent(keyboardEventSource: eventSource, virtualKey: CGKeyCode(numv(ev, "keycode") ?? 0), keyDown: type == .keyDown)
+            // 录到的字符（含程序以 Unicode 字符串发出的输入）原样带回去
+            if let c = ev["chars"] as? String, !c.isEmpty {
+                let u = Array(c.utf16); e?.keyboardSetUnicodeString(stringLength: u.count, unicodeString: u)
+            }
+        case .flagsChanged:
+            e = CGEvent(keyboardEventSource: eventSource, virtualKey: CGKeyCode(numv(ev, "keycode") ?? 0), keyDown: true); e?.type = .flagsChanged
+        case .scrollWheel:
+            e = CGEvent(scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 2, wheel1: Int32(numv(ev, "dy") ?? 0), wheel2: Int32(numv(ev, "dx") ?? 0), wheel3: 0)
+            e?.location = p
+        default:
+            let btn = CGMouseButton(rawValue: UInt32(numv(ev, "button") ?? 0)) ?? .left
+            e = CGEvent(mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: p, mouseButton: btn)
+            e?.setIntegerValueField(.mouseEventClickState, value: Int64(numv(ev, "clicks") ?? 1))
+        }
+        if let f = ev["flags"] as? NSNumber { e?.flags = CGEventFlags(rawValue: f.uint64Value) }
+        e?.post(tap: .cghidEventTap); n += 1
+    }
+    out(["path": path, "events": n, "ms": Int((CFAbsoluteTimeGetCurrent() - t0) * 1000), "speed": sp, "keysSkipped": noKeys])
+}
+
 // MARK: - 截图
 func activeDisplays() -> [CGDirectDisplayID] {
     var n: UInt32 = 0
@@ -587,28 +1013,32 @@ func screenshot(path: String, scale: Double?, display: Int, region: CGRect?, win
 // MARK: - 主命令
 let usage = """
 xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
-  check | request | whoami
+  check [--probe] | request | whoami
   screenshot [path] [--scale 0.5] [--display N] [--format png|jpg] [--quality 0.7] [--fast] [--cli]
              [--window "App" [--title 标题]] [--region x,y,w,h]      （--fast = jpg、质量 0.6、缩放 0.5）
   click x y [--right] [--double] | move x y | drag x1 y1 x2 y2 | scroll dx dy
-  type "文字" [--via auto|events|ax|paste] | key cmd+shift+4   （都可加 --app "App"：直接投递给该应用）
+  type "文字" [--app "App"] [--window 标题] [--via auto|ax|events|pid|paste]   （输出 JSON，path = 实际走的路）
+  key cmd+shift+4 [--app "App"] [--via auto|events|menu|pid]    （auto：事件流卡住时改按对应菜单项 / 直接投递给进程）
   insert "App" "文字" | settext "App" [--role R] [--title T|--id I] [--window 窗口] "文字" | value "App" [...]
                         （辅助功能直接写值，不经过键盘事件；--via paste = 剪贴板 + 菜单「粘贴」，会恢复剪贴板）
-  menu "App" "文件>存储"   按菜单路径按下菜单项（每级可写 文件|File），键盘被卡住时代替快捷键
+  menu "App" "文件>存储" [--window 标题] [--activate]   按菜单项（AXPress，按 pid，默认不激活应用；每级可写 文件|File）
+  record [--out f.jsonl] [--duration 60] [--no-moves]   只监听地录制键鼠（不拦截输入，Ctrl-C 结束）
+  replay f.jsonl [--speed 2] [--no-keys] [--force]       回放录制（事件流卡住时默认拒绝）
   apps | open "App" | activate "App" | hide "App" | windows [--all]
   displays | movewin "App" x y [--w W --h H] [--title 标题]
   ax ["App"] [--depth N] [--menu] | press "App" "按钮标题"
   find "App" [--role AXButton] [--title 保存] [--contains] [--index N|--all] [--window 标题] [--menu]
   click-el "App" --role AXButton --title 保存 [--click] [--right] [--double]
   wait "App" --title X [--role R] [--timeout 5] [--gone]   |   wait 毫秒 | sleep 毫秒
-  cursor | version | taps（诊断输入卡顿）
+  cursor | version | taps（诊断输入卡顿） | check（权限 + 各输入路径健康状态）
   batch [--continue-on-error] [脚本文件]  （从 stdin 或文件逐行读取命令，一次启动执行多步）
   run [--continue-on-error] 'click 10 20; type 你好; key return'
   serve [--status | --stop]  常驻守护进程（~/.xyzlcu/sock），之后的命令自动转发给它，更快
   通用选项: --delay N  事件间隔毫秒（默认 2，也可用环境变量 XYZLCU_DELAY）
   环境变量: XYZLCU_DAEMON=0 不用守护进程；=1 必须用守护进程
+            XYZLCU_EVENTS_HEALTH=bad 模拟事件流卡住（测试备用路径）；XYZLCU_TAP_THRESHOLD_MS 卡住阈值（默认 1000）
 """
-let version = "0.3.1"
+let version = "0.4.0"
 var inBatch = false
 let startedAt = Date()
 
@@ -622,9 +1052,29 @@ switch cmd {
 case "help", "-h", "--help": emit(usage)
 case "version", "--version", "-v": emit("xyzlcu \(version)")
 case "check":
-    out(["accessibility": axTrusted(), "screenRecording": screenTrusted(), "screenLocked": screenLocked(), "binary": pathOf(getpid()),
+    forceProbe = flag("--probe")
+    cachedHealth = nil  // check 总是重新检测
+    let h = inputHealth(), ax = axTrusted()
+    forceProbe = false
+    var o: [String: Any] = ["accessibility": ax, "screenRecording": screenTrusted(), "screenLocked": screenLocked(), "binary": pathOf(getpid()),
+         "inputMonitoring": CGPreflightListenEventAccess(), "version": version,
          "responsibleProcess": responsiblePid(getpid()).map { pathOf($0) } ?? "unknown", "daemon": daemonMode,
-         "keyboardBlockedBy": blockingKeyboardTaps()])
+         "keyboardBlockedBy": h.keyboardBlockedBy, "tapThresholdMs": tapThresholdMs()]
+    o["paths"] = [
+        "events": ["healthy": h.keyboardOK, "probeMs": h.keyboardProbeMs.map { $0.isFinite ? ($0 * 10).rounded() / 10 : -2 } as Any,
+                   "desc": "CGEvent 发到系统 HID 事件流（会经过所有主动拦截的事件监听）"],
+        "mouse": ["healthy": h.mouseOK, "blockedBy": h.mouseBlockedBy, "probeMs": h.mouseProbeMs.map { $0.isFinite ? ($0 * 10).rounded() / 10 : -2 } as Any],
+        "ax": ["available": ax, "desc": "辅助功能直接写值 / 按按钮（insert、settext、press、type --via ax），不经过事件流"],
+        "menu": ["available": ax, "desc": "按 pid 读菜单栏并 AXPress 菜单项，不激活应用（menu、key --via menu）"],
+        "pid": ["available": ax, "desc": "CGEventPostToPid 直接投递到应用进程（type/key --via pid、--app）"],
+        "paste": ["available": ax, "desc": "剪贴板 + 菜单「编辑>粘贴」，用后恢复剪贴板（--via paste）"],
+        "record": ["available": CGPreflightListenEventAccess() || ax, "desc": "只监听的事件监听，不会挡住输入"],
+    ] as [String: Any]
+    o["typeOrder"] = h.keyboardOK ? ["ax（标准文本框）", "events"] : ["ax", "pid", "paste"]
+    o["keyOrder"] = h.keyboardOK ? ["events"] : ["menu", "pid"]
+    if let ov = h.override { o["healthOverride"] = ov }
+    if !h.staleBlockers.isEmpty { o["staleTapStats"] = h.staleBlockers; o["note"] = "这些监听的延迟统计偏高，但实测事件能正常走完（统计是历史值），按健康处理" }
+    out(o)
 case "request":
     let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     let ax = AXIsProcessTrustedWithOptions(opts)
@@ -682,35 +1132,18 @@ case "scroll":
     post(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: Int32(try dbl(args[1])), wheel2: Int32(try dbl(args[0])), wheel3: 0)); emit("ok")
 case "type", "key":
     try guardUnlocked()
-    // --app "App"：直接投递给该应用进程，不经过系统 HID 事件流（应用必须已在前台，焦点在要输入的位置）
+    // --app "App"：目标应用（默认前台应用）。--via 选路，默认 auto：按事件流健康状态自动选择并逐条回退，输出 JSON 里的 path 是实际走的路
     let appOpt = option("--app")
-    // --via events|ax|paste|auto：auto = 平时用键盘事件；检测到卡住的键盘监听时改用辅助功能写值（不行再剪贴板 + 菜单粘贴）
-    let via = (option("--via") ?? ProcessInfo.processInfo.environment["XYZLCU_TYPE_VIA"] ?? "auto").lowercased()
-    guard ["auto", "events", "ax", "paste"].contains(via) else { try fail("--via 只能是 auto、events、ax、paste") }
     if cmd == "type" {
-        try need(1, "type \"文字\" [--app App] [--via auto|events|ax|paste]")
-        let text = args.joined(separator: " ")
-        var mode = via
-        var blocked: [[String: Any]] = []
-        if mode == "auto" { blocked = blockingKeyboardTaps(); mode = blocked.isEmpty ? "events" : "auto-ax" }
-        if mode != "events" {
-            let (root, app) = try axRoot(appOpt)
-            let el = axElement(attr(root, kAXFocusedUIElementAttribute))
-            if el == nil && mode != "paste" && mode != "auto-ax" { try fail("\(app.localizedName ?? "应用") 没有焦点元素，无法用辅助功能输入", code: 4) }
-            var r = try writeText(appOpt ?? app.bundleIdentifier, el, text, replaceAll: false, via: mode == "auto-ax" ? "auto" : mode)
-            if !blocked.isEmpty { r["reason"] = "检测到卡住的键盘监听: " + blocked.compactMap { ($0["process"] as? String)?.split(separator: "/").last.map(String.init) }.joined(separator: ", ") }
-            emit("ok via=\(r["method"] ?? "?") verified=\(r["verified"] ?? false)\((r["reason"] as? String).map { "（\($0)）" } ?? "")")
-            break
-        }
+        let via = (option("--via") ?? envv("XYZLCU_TYPE_VIA") ?? "auto").lowercased()
+        let win = option("--window")
+        try need(1, "type \"文字\" [--app App] [--window 窗口标题] [--via auto|ax|events|pid|paste]")
+        out(try typeChain(appOpt, args.joined(separator: " "), via: via, window: win))
+    } else {
+        let via = (option("--via") ?? envv("XYZLCU_KEY_VIA") ?? "auto").lowercased()
+        try need(1, "key cmd+shift+4 [--app App] [--via auto|events|menu|pid]")
+        out(try keyChain(appOpt, args, via: via))
     }
-    if let a = appOpt {
-        guard let app = findApp(a) else { try fail("找不到应用: \(a)") }
-        keyTargetPid = app.processIdentifier
-    }
-    defer { keyTargetPid = nil }
-    if cmd == "type" { typeText(args.joined(separator: " ")) }
-    else { try need(1, "key cmd+shift+4 [--app App]（键盘被卡住时用 menu \"App\" \"文件>存储\" 代替快捷键）"); for (i, c) in args.enumerated() { if i > 0 { sleepMs(stepDelay) }; try pressCombo(c) } }
-    emit("ok")
 case "insert", "settext":
     // insert：在焦点处插入（写 AXSelectedText）；settext：整体替换（写 AXValue）。都不经过键盘事件
     try guardUnlocked()
@@ -741,15 +1174,34 @@ case "value":
 case "menu":
     // 按菜单路径按下菜单项（AXPress），代替 cmd+s / cmd+w 等快捷键；每级可写多个候选：编辑|Edit>粘贴|Paste
     try guardUnlocked()
-    try need(2, "menu \"App\" \"文件>存储\"   （每级可写 文件|File）")
+    let winOpt = option("--window")
+    let doActivate = flag("--activate")
+    try need(2, "menu \"App\" \"文件>存储\" [--window 窗口标题] [--activate]   （每级可写 文件|File）")
     let t0 = Date()
+    let wasActive = findApp(args[0])?.isActive ?? false
+    var activated = false
+    if doActivate && !wasActive, let a = findApp(args[0]) {
+        a.activate()
+        // isActive 靠 KVO 更新，需要跑 run loop 才会刷新；以前台应用的 pid 为准
+        for _ in 0..<20 where NSWorkspace.shared.frontmostApplication?.processIdentifier != a.processIdentifier {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        activated = NSWorkspace.shared.frontmostApplication?.processIdentifier == a.processIdentifier
+    }
+    var mainWin: String? = nil
+    if let w = winOpt { mainWin = try setMainWindow(args[0], w) }
     let path = parseMenuPath(args.dropFirst().joined(separator: " "))
     guard !path.isEmpty else { try fail("菜单路径为空，例如 \"文件>存储\" 或 \"File>Save\"") }
     let picked = try pressMenu(args[0], path)
-    var o: [String: Any] = ["app": findApp(args[0])?.localizedName ?? args[0], "pressed": picked.joined(separator: ">"), "ms": Int(Date().timeIntervalSince(t0) * 1000)]
-    if lastMenuWasDisabled { o["note"] = "按下前该菜单项显示为不可用（可能是旧状态），请确认效果" }
-    let blocked = blockingKeyboardTaps()
-    if !blocked.isEmpty { o["warning"] = "检测到卡住的键盘监听，应用可能处理不了菜单动作（会排队到事件流恢复后才执行）。请确认效果" }
+    var o: [String: Any] = ["app": findApp(args[0])?.localizedName ?? args[0], "pressed": picked.joined(separator: ">"), "ms": Int(Date().timeIntervalSince(t0) * 1000),
+                            "path": "ax-menu", "activated": activated, "appWasActive": wasActive]
+    if let w = mainWin { o["window"] = w }
+    if lastMenuWasDisabled {
+        o["note"] = (wasActive || activated) ? "按下前该菜单项显示为不可用（可能是旧状态），请确认效果"
+            : "按下前该菜单项显示为不可用：应用在后台时，作用于文稿/输入焦点的菜单项（全选、粗体等）通常不会生效，应用级菜单项（新建、打开等）照常可用；需要时加 --activate"
+    }
+    let h = inputHealth()
+    if !h.keyboardOK { o["warning"] = "检测到卡住的事件监听（\(h.blockerNames.joined(separator: ", "))），请确认菜单动作的效果" }
     out(o)
 case "cursor":
     let p = CGEvent(source: nil)?.location ?? .zero; out(["x": Int(p.x), "y": Int(p.y)])
@@ -880,8 +1332,22 @@ case "taps":
         var buf = [CChar](repeating: 0, count: 4096); proc_pidpath(t.tappingProcess, &buf, 4096)
         return ["process": String(cString: buf), "pid": Int(t.tappingProcess), "enabled": t.enabled,
                 "listenOnly": t.options == .listenOnly, "eventsMask": String(t.eventsOfInterest, radix: 16),
-                "avgLatencyMs": Double(t.avgUsecLatency) / 1000, "maxLatencyMs": Double(t.maxUsecLatency) / 1000]
+                "avgLatencyMs": Double(t.avgUsecLatency) / 1000, "maxLatencyMs": Double(t.maxUsecLatency) / 1000,
+                "blocking": t.enabled && t.options != .listenOnly && Double(t.avgUsecLatency) / 1000 > tapThresholdMs()]
     })
+case "record":
+    // 只监听地录制键鼠事件到 JSON Lines 文件。不拦截、不修改输入；锁屏或安全输入（密码框）时不记录按键
+    if screenLocked() { try fail("屏幕已锁定，拒绝录制", code: 3) }
+    let outPath = option("--out") ?? args.first ?? (NSHomeDirectory() + "/.xyzlcu/recordings/rec-\(Int(Date().timeIntervalSince1970)).jsonl")
+    let dur = try option("--duration").map(dbl) ?? 60
+    let moves = !flag("--no-moves")
+    try recordSession(outPath: outPath, duration: max(0.5, dur), moves: moves)
+case "replay":
+    try guardUnlocked()
+    let speed = try option("--speed").map(dbl) ?? 1
+    let force = flag("--force"), noKeys = flag("--no-keys")
+    try need(1, "replay 录制文件.jsonl [--speed 2] [--no-keys] [--force]")
+    try replaySession(path: args[0], speed: speed, force: force, noKeys: noKeys)
 case "__status":
     out(["running": daemonMode, "pid": Int(getpid()), "version": version, "uptimeSec": Int(Date().timeIntervalSince(startedAt)),
          "socket": socketPath(), "accessibility": axTrusted(), "screenRecording": screenTrusted(), "screenLocked": screenLocked(),
@@ -994,6 +1460,9 @@ func forward(_ top: [String]) -> Int32? {
     defer { close(fd) }
     var req: [String: Any] = ["v": version, "argv": top, "cwd": FileManager.default.currentDirectoryPath]
     if let d = ProcessInfo.processInfo.environment["XYZLCU_DELAY"], let n = Int(d) { req["delay"] = n }
+    var env: [String: String] = [:]
+    for k in forwardedEnv { if let v = ProcessInfo.processInfo.environment[k] { env[k] = v } }
+    req["env"] = env
     if top.first == "batch", let bo = try? batchOptions(Array(top.dropFirst())), bo.rest.isEmpty {
         req["stdin"] = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) ?? ""
     }
@@ -1015,6 +1484,7 @@ func handle(_ data: Data) -> (Data, Bool) {
             if let cwd = req["cwd"] as? String { FileManager.default.changeCurrentDirectoryPath(cwd) }
             let saved = stepDelay
             if let d = req["delay"] as? Int { stepDelay = d }
+            envOverlay = req["env"] as? [String: String] ?? [:]
             outBuf = ""; var errText = ""
             let code = runMain(argv, stdinText: { req["stdin"] as? String ?? "" }, err: { errText += $0 + "\n" })
             resp = ["code": Int(code), "out": outBuf ?? "", "err": errText]
@@ -1084,7 +1554,8 @@ if top.first == "serve" {
     do { try serve() } catch let e as XErr { errOut("error: " + e.msg); exit(e.code) } catch { exit(1) }
 }
 let daemonEnv = ProcessInfo.processInfo.environment["XYZLCU_DAEMON"]
-if daemonEnv != "0", !top.isEmpty, !["help", "-h", "--help"].contains(top[0]) {
+// record / replay 运行时间长，总在当前进程里执行，不占用守护进程
+if daemonEnv != "0", !top.isEmpty, !["help", "-h", "--help", "record", "replay"].contains(top[0]) {
     if let code = forward(top) { exit(code) }
     if daemonEnv == "1" { errOut("error: 守护进程没有运行（先在智能体的终端里执行 xyzlcu serve &）"); exit(5) }
 }

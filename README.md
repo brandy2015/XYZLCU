@@ -13,6 +13,8 @@
 - ⌨️ **键盘**：直接输入 Unicode 文字（中文、emoji 都行，不经过输入法），支持组合键（`cmd+shift+4`）
 - 🌳 **辅助功能树**：导出任意应用窗口的控件树（角色、标题、值、坐标）；`find` 按角色/标题直接返回坐标和中心点，`click-el` 一步找到并按下，`wait` 等控件出现或消失
 - 🪟 **应用与窗口**：列出、打开、激活、隐藏应用；列出窗口；移动和调整窗口大小；列出显示器
+- 🛣 **多条输入路径**（v0.4.0）：先实测事件流是否卡住，再在辅助功能写值、键盘事件、直接投递进程、菜单粘贴之间自动挑一条走得通的，输出里写明实际走的路
+- ⏺ **录制 / 回放**：只监听地录下键鼠操作（不拦截输入，密码框和锁屏时不录按键），按原节奏回放
 - 🔒 **锁屏保护**：屏幕锁定时拒绝键鼠操作，防止把字打进锁屏密码框
 - ⚡ **常驻守护进程**：`xyzlcu serve &` 之后，命令自动转发给它，省掉进程启动和权限检查开销，大部分命令 7–20 毫秒
 - 🧾 **输出好解析**：结果是 JSON 或一行 `ok`，出错时返回明确的退出码
@@ -88,7 +90,7 @@ xyzlcu whoami
 
 | 命令 | 说明 | 示例 |
 |---|---|---|
-| `check` | 权限和锁屏状态 | `xyzlcu check` |
+| `check [--probe]` | 权限、锁屏状态、各输入路径是否可用（见[多条输入路径](#多条输入路径键盘被卡住时)） | `xyzlcu check` |
 | `request` | 弹出系统授权窗口 | `xyzlcu request` |
 | `whoami` | 进程链与负责 App | `xyzlcu whoami` |
 | `version` | 版本号 | `xyzlcu version` |
@@ -102,12 +104,12 @@ xyzlcu whoami
 | `drag x1 y1 x2 y2` | 按住左键拖动 | `xyzlcu drag 100 100 400 400` |
 | `scroll dx dy` | 滚动，单位是行，正 dy 向上 | `xyzlcu scroll 0 -5` |
 | `cursor` | 当前鼠标位置 | `xyzlcu cursor` |
-| `type "文字" [--app "App"] [--via auto\|events\|ax\|paste]` | 输入 Unicode 文本。默认 auto：平时用键盘事件，检测到键盘被卡住时改用辅助功能写值 | `xyzlcu type "你好 Hello 😀"` |
+| `type "文字" [--app "App"] [--window 标题] [--via auto\|ax\|events\|pid\|paste]` | 输入 Unicode 文本，输出 JSON（`path` = 实际走的路、`verified` = 是否读回核对过）。默认 auto 自动挑路 | `xyzlcu type --app TextEdit --window 笔记 "你好 😀"` |
 | `insert "App" [定位] "文字"` | 用辅助功能在焦点处插入文字（写 AXSelectedText），不经过键盘事件，写完读回核对 | `xyzlcu insert TextEdit --window 笔记 "你好"` |
 | `settext "App" [定位] "文字"` | 用辅助功能整体替换文本框内容（写 AXValue），写完读回核对 | `xyzlcu settext Safari --role AXTextField --title 搜索 "XYZLCU"` |
 | `value "App" [定位]` | 读回元素的值（默认焦点元素），用来核对输入结果 | `xyzlcu value TextEdit` |
-| `menu "App" "菜单>菜单项"` | 按菜单路径按下菜单项，代替快捷键；每级可写多个候选 `文件\|File` | `xyzlcu menu TextEdit "文件>存储"` |
-| `key 组合… [--app "App"]` | 按键 / 组合键，可以一次多个 | `xyzlcu key cmd+s` · `xyzlcu key cmd+c cmd+v` |
+| `menu "App" "菜单>菜单项" [--window 标题] [--activate]` | 按菜单路径按下菜单项（AXPress，默认不激活应用），代替快捷键；每级可写多个候选 `文件\|File` | `xyzlcu menu TextEdit "文件>新建"` |
+| `key 组合… [--app "App"] [--via auto\|events\|menu\|pid]` | 按键 / 组合键，可以一次多个；输出 JSON，每个键实际走的路。事件流卡住时自动改按对应菜单项 | `xyzlcu key cmd+s` · `xyzlcu key --app TextEdit cmd+a` |
 | `apps` | 正在运行的图形界面应用 | `xyzlcu apps` |
 | `open "App"` | 打开应用 | `xyzlcu open "TextEdit"` |
 | `activate "App"` | 切换到前台 | `xyzlcu activate Finder` |
@@ -120,7 +122,9 @@ xyzlcu whoami
 | `press "App" "标题"` | 按标题找到控件并按下（旧写法；新脚本建议用 `click-el`） | `xyzlcu press TextEdit "取消"` |
 | `wait "App" --title T [--role R] [--timeout 秒] [--gone]` | 等控件出现（或 `--gone` 消失），默认 5 秒超时 | `xyzlcu wait TextEdit --role AXSheet --timeout 3` |
 | `wait 毫秒` / `sleep 毫秒` | 等待固定时间 | `xyzlcu sleep 300` |
-| `taps` | 列出系统事件监听（排查输入卡顿/丢失） | `xyzlcu taps` |
+| `taps` | 列出系统事件监听（排查输入卡顿/丢失），`blocking` 标出可疑的 | `xyzlcu taps` |
+| `record [--out f.jsonl] [--duration 秒] [--no-moves]` | 只监听地录制键鼠，见[录制与回放](#录制与回放) | `xyzlcu record --duration 30` |
+| `replay f.jsonl [--speed N] [--no-keys] [--force]` | 回放录制 | `xyzlcu replay rec.jsonl --no-keys` |
 | `run [--continue-on-error] '命令; 命令; …'` | 一次执行多条命令（`;` 或换行分隔） | `xyzlcu run 'click-el TextEdit --title 保存; wait TextEdit --role AXSheet; key return'` |
 | `batch [--continue-on-error] [文件]` | 从文件或 stdin 逐行读命令执行 | `printf 'type a\nkey return\n' \| xyzlcu batch` |
 | `serve [--status\|--stop]` | 启动 / 查看 / 停止常驻守护进程，见[守护进程](#守护进程) | `xyzlcu serve &` |
@@ -138,29 +142,81 @@ xyzlcu whoami
 - **`--delay N`**：鼠标/键盘事件之间的间隔（毫秒，默认 2）。个别应用反应慢、丢字时调大，例如 `xyzlcu --delay 20 type …` 或 `XYZLCU_DELAY=20`。
 - **截图**：macOS 14+ 走 ScreenCaptureKit（进程内截图，直接按 `--scale` 输出目标尺寸；`--window` 只截那个窗口，被挡住也能截到；`--region` 只截那块区域），否则或加 `--cli` 时退回系统 `screencapture`。输出里的 `method` 字段会告诉你走的哪条路，`originX/originY` 是图片左上角的全局点坐标。
 
-## 键盘被卡住时
+## 多条输入路径（键盘被卡住时）
 
-有时系统里某个进程的键盘事件监听（event tap）卡住了：`xyzlcu type` / `key` 返回 ok，但应用里什么也没出现，连 `--app` 直接投递也没用。鼠标通常还正常。
+有时系统里某个进程的键盘事件监听（event tap）卡住了：键盘事件发出去迟迟不到应用，甚至排队到很久以后才一起冒出来，鼠标却正常。v0.4.0 起，`type`、`key` 会先检查事件流是否健康，再挑一条走得通的路，并在输出 JSON 的 `path` 里写明实际走的是哪条。
 
-**怎么确认**：`xyzlcu check` 的 `keyboardBlockedBy` 会列出卡住的监听（主动拦截、关心按键、平均延迟超过 1 秒）。`xyzlcu taps` 显示全部细节。延迟数字一直不变，说明事件没在消化，旧按键也没有在补发。
+**健康检查**
 
-**绕开键盘事件的输入方式**（都不经过键盘事件流）：
+- 读系统事件监听列表（`CGGetEventTapList`）：主动拦截（不是只监听）、平均延迟超过 1000 毫秒（`XYZLCU_TAP_THRESHOLD_MS` 可改）的监听算可疑。
+- 这些统计是历史值：刚卡住的监听数字还很低，早已恢复的数字却可能一直很高。所以键盘每次都**实测**：发一个带标记的「右 Shift 松开」事件（对任何应用都没有效果），用排在最后的只监听监听计时，400 毫秒内走完整条事件流就算健康（正常 1–30 毫秒）。鼠标只在统计可疑时实测（原地发一个 mouseMoved）。统计偏高、实测正常的监听列在 `check` 的 `staleTapStats` 里，按健康处理。
+- 守护进程里结果缓存 1.5 秒；`check` 总是重新检测，`check --probe` 连鼠标也实测。`XYZLCU_PROBE=0` 关闭实测，只看统计。
+- `XYZLCU_EVENTS_HEALTH=bad` / `good` 强制当作卡住 / 正常，用来测试备用路径（守护进程模式下也生效，客户端会把这些环境变量随请求转发过去）。
+
+**各条路**
+
+| `path` | 做法 | 经过 HID 事件流的监听？ | 应用要在前台？ | 核对 |
+|---|---|---|---|---|
+| `ax-selected-text` | 辅助功能写焦点元素的 `AXSelectedText`（在光标处插入） | 否 | 否 | 读回 `AXValue` |
+| `events-hid` | CGEvent 发到系统 HID 事件流（`type` / `key` 不带 `--app`） | 是 | 是 | 300 毫秒内读回 |
+| `events-pid` | `CGEventPostToPid` 直接投递给应用进程（带 `--app`，或 `--via pid`） | 否 | 否 | 600 毫秒内读回 |
+| `paste-menu` | 文字放进剪贴板，AXPress 应用的「编辑>粘贴」菜单项，核对后恢复剪贴板 | 否 | 否 | 读回 |
+| `menu` | `key` 专用：在菜单栏里找快捷键相同的菜单项并 AXPress（如 `cmd+a` → 「编辑>全选」） | 否 | 见下文 | — |
+| `ax-menu` | `menu` 命令：按菜单路径 AXPress | 否 | 见下文 | — |
+
+**`type --via auto`（默认）**
+
+- 事件流正常：焦点是标准文本框（`AXTextField` / `AXTextArea` / `AXComboBox` / `AXSearchField`）时走 `ax`，否则走 `events`。
+- 事件流卡住：依次试 `ax` → `pid` → `paste`，每一步都读回核对，没生效才换下一条。卡住时**不会**用 `events-hid`，那些按键会排队，事件流恢复后突然打出来。
+- 读不到输入框内容、没法核对时，就停在当前这条路，不再换路，避免同一段文字被输入两次。
+- 所有路都没生效：退出码 4，错误里列出每条路的结果（`tried`）。
+- `paste` 没核对成功时**不恢复剪贴板**（输出 `clipboardRestored: false`），避免排队中的粘贴贴出旧内容。
+- `--via ax|events|pid|paste` 指定一条路；环境变量 `XYZLCU_TYPE_VIA` 改默认值。
+- `--window 标题`：焦点元素不在标题含这段文字的窗口里就拒绝输入（退出码 4），防止打进别的文稿。
+
+**`key --via auto`（默认）**
+
+- 事件流正常：`events`（带 `--app` 时是 `events-pid`）。
+- 事件流卡住：先在应用菜单栏里找快捷键相同的菜单项（比对 `AXMenuItemCmdChar` / `AXMenuItemCmdModifiers` / `AXMenuItemCmdGlyph`，优先可用的项）并按下；找不到对应菜单项（方向键、return 等）就用 `CGEventPostToPid`。
+- 都不行：退出码 4，提示改用 `menu` 指定菜单项。`--via events|menu|pid` 指定一条路，`XYZLCU_KEY_VIA` 改默认值。
+- 输出 `keys[]`：每个组合键实际走的 `path`，走菜单时还有 `menuItem`。
+
+**后台菜单**
+
+`menu "App" "菜单>项" [--window 标题]` 按 pid 读菜单栏并 AXPress，**不把应用切到前台**（输出 `activated: false`、`appWasActive`）。`--window` 会先把那个窗口设成主窗口。在文本编辑上实测：
+
+- 应用级菜单项（「文件>新建」「文件>打开…」等）在后台照常生效；
+- 作用于文稿或输入焦点的菜单项（全选、粗体、防止编辑等）在应用不在前台时被 Cocoa 置灰，按了也没效果，输出会带 `note` 说明。这时加 `--activate`（先激活应用再按），或者改用 `insert` / `settext` / `type --via ax`。
+
+**其他绕开键盘事件的命令**
 
 ```bash
 xyzlcu insert TextEdit --window 我的笔记 "在光标处插入"         # 写 AXSelectedText
 xyzlcu settext TextEdit --role AXTextArea --window 我的笔记 "整体替换"   # 写 AXValue
 xyzlcu value TextEdit --window 我的笔记                         # 读回核对
-xyzlcu type "你好"          # 默认 --via auto：检测到键盘被卡住时自动改用辅助功能写值
 ```
 
-- 定位：默认是应用当前的焦点元素；也可以用 `--role` / `--subrole` / `--title`（或 `--id`）/ `--index` 指定。`--window 标题` 会检查元素所在窗口，不对就拒绝写入，避免写错文档。
-- 每次写完都会读回 `AXValue` 核对，输出里 `verified: true` 才算成功；不一致时退出码为 1。
-- 应用不必在前台，也不会动键盘焦点以外的东西。原生 Cocoa 文本框（文本编辑、备忘录、大多数输入框）都支持；有些网页和自绘界面不支持写值，这时会报错。
-- `--via paste`：把文字放进剪贴板，再按菜单「编辑>粘贴」，结束后恢复原来的剪贴板。
+- 定位：默认是应用当前的焦点元素；也可以用 `--role` / `--subrole` / `--title`（或 `--id`）/ `--index` 指定。`--window 标题` 会检查元素所在窗口，不对就拒绝写入。
+- 每次写完都会读回 `AXValue` 核对，`verified: true` 才算成功；不一致时退出码为 1。
+- 原生 Cocoa 文本框（文本编辑、备忘录、大多数输入框）都支持；有些网页和自绘界面不支持写值，这时只能靠 `pid` / `paste`。
 
-**快捷键的替代**：用 `menu` 按菜单项，例如 `xyzlcu menu TextEdit "文件>存储"`、`"File>Close"`、`"编辑|Edit>全选|Select All"`。找不到时会列出这一级所有菜单项。
+**`check` 输出**：`paths` 里列出 events / mouse / ax / menu / pid / paste / record 是否可用（events、mouse 带实测的 `probeMs`），`typeOrder` / `keyOrder` 是当前 auto 会按什么顺序试，`keyboardBlockedBy` 是卡住的监听。
 
-**限制**：菜单动作（`menu`、`press`、`--via paste`）要靠应用自己处理事件队列。如果事件流整体卡住，应用不处理这些动作：命令返回成功，但没有效果，并且可能排队到事件流恢复后才执行。所以检测到卡住的监听时，`menu` 输出里会带 `warning`，`--via auto` 也不会退回到粘贴。这种情况下只有 `insert` / `settext` / `type --via ax` 能立刻生效。要真正修好，需要重启卡住的进程（`xyzlcu taps` 里延迟巨大的那个）或者注销/重启。XYZLCU 不会替你结束系统进程。
+**限制**：`events-pid`、`menu`、`paste` 绕开的是 HID 事件流上的监听；如果应用自己的主线程卡住了，哪条路都没用。要真正修好，需要重启卡住的进程（`xyzlcu taps` 里 `blocking: true` 的那个）或者注销/重启。XYZLCU 不会替你结束任何进程。
+
+## 录制与回放
+
+```bash
+xyzlcu record --duration 30                        # 默认存到 ~/.xyzlcu/recordings/rec-时间戳.jsonl
+xyzlcu record --out /tmp/demo.jsonl --no-moves     # 不录鼠标移动
+xyzlcu replay /tmp/demo.jsonl --speed 2 --no-keys  # 两倍速，只回放鼠标
+```
+
+- `record` 用的是**只监听**的事件监听（listenOnly，排在最后）：不拦截、不修改、不延迟任何输入，它自己卡住也不会挡住键盘。需要「输入监控」权限（`check` 里的 `inputMonitoring`）。Ctrl-C 或到 `--duration` 秒（默认 60）结束，输出摘要。
+- 录下：按键按下 / 抬起 / 修饰键（含字符）、鼠标按键、拖动、滚动；鼠标移动最多每 15 毫秒一条（`--no-moves` 不录）。文件第一行是表头（版本、开始时间、显示器布局）。
+- **隐私**：文件权限 0600，只存在本机，不上传。安全输入（密码框）开启时、屏幕锁定时**不录按键**（摘要里 `skippedSecureKeys` 计数）；锁屏后录制自动停止。录制文件里可能有你打的字，用完记得删掉。
+- `replay` 按录制时的时间间隔把事件发到 HID 事件流，`--speed` 加速，`--no-keys` 只回放鼠标。事件流卡住时默认拒绝（回放的事件会排队），`--force` 强制；回放中屏幕被锁定会立刻停止（退出码 3）。回放前同样要确认前台窗口。
+- 回放的就是普通合成事件，原样按时间重放：不加随机抖动，不做「拟人化」，也不做任何反检测处理。
 
 ## 守护进程
 
@@ -223,7 +279,7 @@ xyzlcu key cmd+w
    - 操作：能 `xyzlcu click-el "App" --role R --title T` 就不用 click 坐标。
    - 等待：用 `xyzlcu wait "App" --title T --timeout 5` 等界面变化，不要固定 sleep。
    - 验证：操作后重新 find / ax 或截图，确认结果。
-3. 每次 `type` 或 `key` 之前先 `xyzlcu activate "目标App"`，再用 `xyzlcu apps` 确认它是前台（active: true）。键盘输入会发给当前前台应用。
+3. 每次 `type` 或 `key` 之前先 `xyzlcu activate "目标App"`，再用 `xyzlcu apps` 确认它是前台（active: true）。键盘输入会发给当前前台应用。打字优先用 `xyzlcu type --app "App" --window "窗口标题" "文字"`：焦点不在那个窗口就拒绝；看输出的 path 和 verified 确认结果。
 4. 付款、删除、发送、提交这类不可撤销的操作，先征得用户同意。
 5. 不要用 --force 绕过锁屏保护。
 6. 已经确认过前台、要连续做几步时，可以合成一条 `xyzlcu run 'click-el App --title 搜索; type 你好; key return; wait App --title 结果'`，比分开调用快好几倍。
@@ -272,7 +328,7 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 | 1 | 参数错误，或找不到应用 / 元素 / 显示器 |
 | 2 | 缺少权限（辅助功能或屏幕录制） |
 | 3 | 屏幕已锁定，键鼠操作被拒绝 |
-| 4 | `find` / `click-el` 找不到控件，或 `wait` 超时 |
+| 4 | `find` / `click-el` 找不到控件，`wait` 超时，`type` / `key` 所有输入路径都没生效，或 `--window` 不符被拒绝 |
 | 5 | 设置了 `XYZLCU_DAEMON=1` 但连不上守护进程 |
 
 ## 常见问题
@@ -287,12 +343,13 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 - 改过权限或更新过 App 之后，可能要把开关关掉再打开。
 - 输入很久之后才出现、或者丢字：运行 `xyzlcu taps`。如果有 `listenOnly: false` 且 `avgLatencyMs` 很大（几百毫秒以上）的进程，说明它拦着输入事件处理得很慢，常见于屏幕共享（RFBEventHelperd）、语音助手或其他「电脑操控」工具。退出或重启那个程序后再试。
 - 某些应用来不及处理快速输入时，加大间隔：`xyzlcu --delay 20 type …`。
-- 键盘完全没反应、鼠标却正常：多半是某个拦截键盘的事件监听卡住了（`xyzlcu taps` 里它的 `avgLatencyMs` 会大到几十万甚至上百万毫秒，`eventsMask` 只含键盘事件）。这时系统层面的键盘输入都会被堵住，`type --app "App"` 也不一定能送到。需要退出或重启那个进程（常见是 Siri 或屏幕共享的 RFBEventHelperd），或者注销重新登录。
+- 键盘完全没反应、鼠标却正常：多半是某个拦截键盘的事件监听卡住了（`xyzlcu check` 里 `paths.events.healthy` 为 false，`xyzlcu taps` 里它 `blocking: true`）。`type` / `key` 默认会自动改走辅助功能、直接投递或菜单（见[多条输入路径](#多条输入路径键盘被卡住时)）。要彻底恢复，需要退出或重启那个进程（常见是 Siri 或屏幕共享的 RFBEventHelperd），或者注销重新登录。
 
 **守护进程相关**
 - `check` 里 `daemon` 一直是 false：守护进程没启动，或者是旧版本（版本不一致时会自动退回进程内执行）。运行 `xyzlcu serve --status` 看看。
 - 守护进程里权限是 false：它是从另一个 App 启动的。`xyzlcu serve --stop` 后，在已授权的终端 / 智能体 shell 里重新 `xyzlcu serve &`。
-- 更新 xyzlcu 后记得 `xyzlcu serve --stop` 再重新启动。
+- 更新 xyzlcu 后记得 `xyzlcu serve --stop` 再重新启动（版本号不同时会自动退回进程内执行）。
+- 自己覆盖安装二进制时，先写到临时文件再 `mv` 过去（`build.sh --install` 就是这么做的）；直接 `cp` 覆盖正在使用的已签名二进制，新进程可能被系统直接杀掉（退出码 137）。
 
 **中文输入法会干扰吗？**
 - `type` 直接发送 Unicode 字符，不经过输入法，中文输入法开着也能输入正确的文字。
@@ -310,6 +367,7 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 - 有了辅助功能权限，就能模拟任何键鼠操作。只在你信任的环境里使用；不用时可以到系统设置里关掉开关。
 - **`type` / `key` 前一定确认前台应用**，否则文字可能打进别的文档，快捷键也可能关掉别的窗口。
 - **锁屏保护**：锁屏时 `click / move / drag / scroll / type / key` 返回码 3 并拒绝执行。`--force` 可以强制执行，但不建议。
+- **录制文件可能含有你打的字**：只存本机（权限 0600），密码框和锁屏时不录按键；用完删掉，不要分享。回放、`type`、`key` 前同样先确认前台窗口。
 - 不要让智能体在付款、删除、发送这类确认框上自动点「确定」。
 - XYZLCU 不联网、不收集任何数据，也不修改系统权限数据库。守护进程只监听本机 Unix 套接字，只接受同一用户。
 - **不做反检测**：XYZLCU 发出的就是普通的合成键鼠事件，不会伪装成真人、不会随机化节奏、也不会绕过验证码或网站的机器人检测。遇到验证码、「确认你是真人」或其他反机器人检查时，智能体应该停下来交给人处理。

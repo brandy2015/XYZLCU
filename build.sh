@@ -18,6 +18,7 @@ codesign -s - -f -i com.xyztech.xyzlcu build/xyzlcu >/dev/null 2>&1 || true
 lipo -info build/xyzlcu
 if [[ "${1:-}" == "--install" ]]; then
   mkdir -p "$HOME/.local/bin"
-  cp build/xyzlcu "$HOME/.local/bin/xyzlcu"
+  # 先写到临时文件再 mv：直接覆盖正在使用的已签名二进制会让新进程被系统以 SIGKILL 杀掉
+  cp build/xyzlcu "$HOME/.local/bin/.xyzlcu.new" && mv -f "$HOME/.local/bin/.xyzlcu.new" "$HOME/.local/bin/xyzlcu"
   echo "installed: $HOME/.local/bin/xyzlcu"
 fi
