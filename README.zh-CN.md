@@ -4,6 +4,8 @@
 
 [English](README.md) | **中文**
 
+**当前版本 0.7.0**：先聚焦再写值的 AX 输入、深层控件操作和后台全局输入保护。见 [CHANGELOG.md](CHANGELOG.md)。
+
 [![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#系统要求) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#系统要求) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![智能体: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#支持的智能体)
 
 **支持的智能体：**[Grok · Codex · ChatGPT · Claude · DeepSeek · ……](#支持的智能体)（任何能跑 shell 命令或接 MCP 服务器的智能体都能用）
@@ -16,10 +18,10 @@
 
 ## 为什么选 XYZLCU（核心优势）
 
-下面的数字都是在同一台 Apple Silicon Mac（macOS 26+）上实测的中位数，测法和完整数据见[性能对比](#性能对比与-lcu)。LCU 的数字是 0.4.2 那一轮在同一台机器上测的（LCU 0.13.4）。LCU 也有比 XYZLCU 强的地方，同样写在[性能对比](#性能对比与-lcu)里。
+下面保留的是 v0.5.0–0.6.1 历史测速，不代表 v0.7.0：新版点击默认增加 75 毫秒悬停和 60 毫秒按住时间，按键默认按住 30 毫秒。数字都是在同一台 Apple Silicon Mac（macOS 26+）上实测的中位数，测法和完整数据见[性能对比](#性能对比与-lcu)。LCU 的数字是 0.4.2 那一轮在同一台机器上测的（LCU 0.13.4）。LCU 也有比 XYZLCU 强的地方，同样写在[性能对比](#性能对比与-lcu)里。
 
 - 🔌 **支持 Grok、Codex、ChatGPT、Claude、DeepSeek** 等主流智能体：能跑 shell 命令就能用，只认 MCP 的客户端用内置的 `xyzlcu mcp`。已实测：Grok Bot、Codex CLI、OpenCode、MCP 客户端（完整握手）、Python / Node、shell 脚本；ChatGPT、Claude、DeepSeek 走同一接口，兼容（还没亲自实测）。见[支持的智能体](#支持的智能体)。
-- 🪟 **锁定窗口的后台模式**（v0.6.1）：`xyzlcu lock --app Safari` 之后，智能体只在这一个窗口里操作，你照常用电脑：鼠标不动、应用不被激活；点击和输入优先走辅助功能，每个结果都写明走的 `route`。在文本编辑、访达、Safari 上实测，限制也如实写了。见[后台 / 锁定窗口模式](#后台--锁定窗口模式v061)。
+- 🪟 **锁定窗口的后台模式**（v0.6.1）：`xyzlcu lock --app Safari` 之后，智能体只在这一个窗口里操作，你照常用电脑：鼠标不动、应用不被激活；点击和输入优先走辅助功能，每个结果都写明走的 `route`。在文本编辑、访达、Safari 上实测，限制也如实写了。见[后台 / 锁定窗口模式](#后台--锁定窗口模式v070)。
 - ⚡ **快**：开着守护进程时，`xyzlcu` 是一个很小的 C 程序，一次调用约 **3 毫秒**。
 
   | 操作 | XYZLCU | LCU |
@@ -32,18 +34,20 @@
   | 列出应用 | **3 毫秒** | 17 毫秒 |
 
 - 🧠 **截图不落盘、只看变化**：`--base64` / `--stdout` 直接在内存里出图，`--fast` 半尺寸 JPEG 约 **9 毫秒**。`--diff` 只返回变化的那一块，画面没变时只回一小段 JSON（3–4 毫秒，没有图片），适合智能体反复「看一眼」。
-- 🛣 **键盘卡住也能打字**：每次先实测事件流。卡住时自动换路：辅助功能写值 → 直接投递给进程 → 菜单粘贴；快捷键先找菜单栏里对应的菜单项。每条路都**读回核对**，没生效才换下一条。读不到内容、没法核对时就停在当前这条路，**不会把同一段文字打两遍**。输出里写明实际走的是哪条路。
+- 🛣 **先聚焦再写值的 AX 输入**：`set-text`（兼容旧名 `settext`）先用辅助功能聚焦控件，再写值并读回核对；后台 `type` 优先走这条路。结果带 `verified`、实际 `route` 和操作前后的前台应用。失败后可尝试选区插入和菜单粘贴，全局输入受明确的安全检查约束。
 - 🪙 **省 token**：`ax --compact` 只列可以操作的控件，一行一个，带编号和中心点；再用 `click-el --ref N` 按编号点。访达加菜单栏的控件树 **13.7 KB → 0.4 KB**，文本编辑窗口 740 → 243 字节。
 - 🧰 **功能全**：鼠标位置和移动、拖拽、滚动、整屏 / 窗口 / 区域截图、窗口列表、移动和调整窗口、显示器列表、后台按菜单、控件树和按控件、等控件出现、录制和回放。LCU 在 Mac 上没有鼠标位置 / 移动、整屏截图和窗口列表这几项。
 - 🔒 **安全**：
   - 锁屏时拒绝键鼠操作，防止把字打进锁屏密码框。
   - 录制器只监听、不拦截输入；安全输入（密码框）开启时和锁屏时不录按键。
   - 不做反检测：不伪装成真人，不绕过验证码或机器人检测。
-- 🏠 **隐私**：只在本机运行，**不联网、没有遥测**。代码里唯一的套接字是守护进程本机的 Unix 套接字；只会调用系统自带的 `screencapture`（macOS 13 退回用）和 `open`（打开应用）。录制文件权限 0600，只存本机。
+- 🏠 **隐私**：只在本机运行，**不联网、没有遥测**。代码里唯一的套接字是守护进程本机的 Unix 套接字；截图/启动应用使用系统的 `screencapture` 和 `open`，异步 AX 动作可启动另一个 xyzlcu-core 工作进程。录制文件权限 0600，只存本机。
 - 📦 **零依赖**：两个文件（`xyzlcu` + `xyzlcu-core`），通用二进制，Apple Silicon 和 Intel 都能跑，macOS 13+。不需要 ChatGPT 桌面应用，也不需要 Python、Node、Homebrew 或任何第三方库。
 - 📖 **开源**：MIT 许可，中英文文档，测速脚本在 `scripts/`，结果可以自己复现。
 
 ## 功能
+
+- **v0.7.0**：`--pid` 定位；聚焦后写值并核对的 `set-text`；深层 `press --nth/--list/--async`；原生下拉框 `select`；`scroll-to` / `scroll --ax`；`wait-text`；纯文字 `observe`；全局输入保护；负责宿主权限诊断。
 
 - 📸 **截屏**：截整块屏、单个窗口（`--window`）或一块区域（`--region`），可缩小；`--fast` 一键出小 JPEG；会输出点坐标与像素的换算关系
 - 🧠 **内存截图**（v0.4.2）：`--base64` / `--stdout` 直接在内存里出图，不写文件；守护进程按需保持截图流，重复截同一个窗口约 20 毫秒
@@ -54,11 +58,11 @@
 - ⌨️ **键盘**：直接输入 Unicode 文字（中文、emoji 都行，不经过输入法），支持组合键（`cmd+shift+4`）
 - 🌳 **辅助功能树**：导出任意应用窗口的控件树（角色、标题、值、坐标）；`find` 按角色/标题直接返回坐标和中心点，`click-el` 一步找到并按下，`wait` 等控件出现或消失
 - 🪟 **应用与窗口**：列出、打开、激活、隐藏应用；列出窗口；移动和调整窗口大小；列出显示器
-- 🛣 **多条输入路径**（v0.4.0）：先实测事件流是否卡住，再在辅助功能写值、键盘事件、直接投递进程、菜单粘贴之间自动挑一条走得通的，输出里写明实际走的路
+- 🛣 **多条输入路径**：辅助功能写值、键盘事件、直接投递进程、菜单粘贴，输出实际路线并在可读时核对。只有显式的 `check --probe` 才发送探测事件，普通检查只读取状态。
 - ⏺ **录制 / 回放**：只监听地录下键鼠操作（不拦截输入，密码框和锁屏时不录按键），按原节奏回放
 - 🔒 **锁屏保护**：屏幕锁定时拒绝键鼠操作，防止把字打进锁屏密码框
 - 📊 **实测数据**：和 LCU 的逐项速度对比见[性能对比](#性能对比与-lcu)，脚本可复现
-- ⚡ **常驻守护进程**：`xyzlcu serve --background` 之后，命令自动转发给它，省掉进程启动和权限检查开销，大部分命令 2–10 毫秒
+- ⚡ **常驻守护进程**：`xyzlcu serve --background` 之后，命令自动转发给它，省掉进程启动开销，同时保留权限和安全检查；历史查询类命令为 2–10 毫秒
 - 🔌 **MCP 服务器**（v0.4.2）：`xyzlcu mcp` 走 stdio，给只支持 MCP 的客户端（如 Claude Desktop），截图直接作为图片返回
 - 🧾 **输出好解析**：结果是 JSON 或一行 `ok`，出错时返回明确的退出码
 
@@ -130,14 +134,16 @@ xyzlcu whoami
 3. 列表里没有这个 App 的话，点「+」从「应用程序」里添加。
 4. 改完后**退出并重新打开那个 App**，然后运行 `xyzlcu check` 确认。
 
-`xyzlcu request` 会主动弹出这两个系统授权窗口。XYZLCU 不会修改 TCC 数据库，也不会尝试绕过权限。
+`check` 保留旧的 `responsibleProcess` 路径字符串，另加 `responsibleProcessInfo`（`pid`、`name`、`path`、`bundleId`）。MCP 权限错误会指出应授权的宿主和相应开关；授权后要重启那个宿主。终端获得授权不代表另一个 MCP 宿主也有权限。
+
+`xyzlcu request` 弹出系统授权窗口；加 `--open` 打开首个缺失权限的设置页，也可用 `--permission accessibility|screen-recording|input-monitoring` 指定。录制和显式事件探测需要「输入监控」。XYZLCU 不修改 TCC 数据库，也不绕过权限。
 
 ## 命令一览
 
 | 命令 | 说明 | 示例 |
 |---|---|---|
 | `check [--probe]` | 权限、锁屏状态、各输入路径是否可用（见[多条输入路径](#多条输入路径键盘被卡住时)） | `xyzlcu check` |
-| `request` | 弹出系统授权窗口 | `xyzlcu request` |
+| `request [--open] [--permission P]` | 请求权限，打开缺失或指定的隐私设置页 | `xyzlcu request --open --permission accessibility` |
 | `whoami` | 进程链与负责 App | `xyzlcu whoami` |
 | `version` | 版本号 | `xyzlcu version` |
 | `screenshot [path] [--scale S] [--display N] [--format png\|jpg\|heic] [--quality Q]` | 截屏。格式看 `--format`，没给就看文件扩展名，都没有时 PNG（`--fast` 和只在内存里出图时 JPEG） | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
@@ -150,14 +156,14 @@ xyzlcu whoami
 | `screenshot … --diff` | 只返回和上一张（同一目标、同一缩放）相比变了的区域：输出 `diff.rects`（全局点坐标）、`changedPercent`，图片裁到变化范围；没变化时不出图。只在守护进程 / MCP 里有效 | `xyzlcu screenshot --fast --diff --base64` |
 | `screenshot … --out 路径` / `--timing` | `--out` 同时写一份文件；`--timing` 输出各阶段耗时 `timingMs` | `xyzlcu screenshot --fast --base64 --timing` |
 | `displays` | 列出显示器及其坐标范围 | `xyzlcu displays` |
-| `click x y [--right] [--double]` | 点击 | `xyzlcu click 500 300 --double` |
+| `click x y [--right] [--double] [--hold ms]` | 点击，默认悬停 75 毫秒后按住 60 毫秒 | `xyzlcu click 500 300 --hold 90` |
 | `move x y` | 移动鼠标 | `xyzlcu move 800 600` |
 | `drag x1 y1 x2 y2` | 按住左键拖动 | `xyzlcu drag 100 100 400 400` |
 | `scroll dx dy` | 滚动，单位是行，正 dy 向上 | `xyzlcu scroll 0 -5` |
 | `cursor` | 当前鼠标位置 | `xyzlcu cursor` |
 | `type "文字" [--app "App"] [--window 标题] [--via auto\|ax\|events\|pid\|paste]` | 输入 Unicode 文本，输出 JSON（`path` = 实际走的路、`verified` = 是否读回核对过）。默认 auto 自动挑路 | `xyzlcu type --app TextEdit --window 笔记 "你好 😀"` |
 | `insert "App" [定位] "文字"` | 用辅助功能在焦点处插入文字（写 AXSelectedText），不经过键盘事件，写完读回核对 | `xyzlcu insert TextEdit --window 笔记 "你好"` |
-| `settext "App" [定位] "文字"` | 用辅助功能整体替换文本框内容（写 AXValue），写完读回核对 | `xyzlcu settext Safari --role AXTextField --title 搜索 "XYZLCU"` |
+| `set-text "App" [定位] "文字"` | 用 AX 聚焦、整体替换 AXValue 并读回核对；兼容旧名 `settext` | `xyzlcu set-text --pid 1234 --role AXTextArea "你好"` |
 | `value "App" [定位]` | 读回元素的值（默认焦点元素），用来核对输入结果 | `xyzlcu value TextEdit` |
 | `menu "App" "菜单>菜单项" [--window 标题] [--activate]` | 按菜单路径按下菜单项（AXPress，默认不激活应用），代替快捷键；每级可写多个候选 `文件\|File` | `xyzlcu menu TextEdit "文件>新建"` |
 | `key 组合… [--app "App"] [--via auto\|events\|menu\|pid]` | 按键 / 组合键，可以一次多个；输出 JSON，每个键实际走的路。事件流卡住时自动改按对应菜单项 | `xyzlcu key cmd+s` · `xyzlcu key --app TextEdit cmd+a` |
@@ -168,12 +174,18 @@ xyzlcu whoami
 | `windows [--all]` | 屏幕上的窗口（所属应用、标题、位置） | `xyzlcu windows` |
 | `movewin "App" x y [--w W --h H] [--title T]` | 移动 / 缩放窗口并置前 | `xyzlcu movewin "Safari" 200 100 --w 1200 --h 800` |
 | `ax ["App"] [--depth N] [--menu]` | 导出界面控件树 | `xyzlcu ax TextEdit --depth 6` |
-| `ax ["App"] --compact [--menu] [--text] [--max 300]` | 只列可操作的控件：`[编号] 角色 "标题" ="值" @中心x,y`，给智能体用，省 token | `xyzlcu ax TextEdit --compact` |
-| `find "App" [--role R] [--title T] [--contains] [--index N\|--all] [--window T] [--menu]` | 找控件，返回 role、title、frame、center；找到就停 | `xyzlcu find TextEdit --role AXButton --title 保存` |
+| `ax ["App"] --compact [--menu] [--text] [--max 300]` | 只列可操作控件，带编号、中心点、enabled 和 focused，给智能体用 | `xyzlcu ax TextEdit --compact` |
+| `find "App" [--role R] [--title T] [--contains] [--index N\|--all] [--window T] [--menu]` | 找控件，返回 role、title、frame、center、enabled、focused；找到指定项就停 | `xyzlcu find TextEdit --role AXButton --title 保存` |
 | `click-el "App" --role R --title T [--click] [--right] [--double]` | 找到控件并按下（AXPress，不行就点中心） | `xyzlcu click-el TextEdit --role AXButton --title 保存` |
 | `click-el --ref N ["App"]` | 按上一次 `ax --compact` 的编号按下控件（需要守护进程） | `xyzlcu click-el --ref 3` |
-| `press "App" "标题"` | 按标题找到控件并按下（旧写法；新脚本建议用 `click-el`） | `xyzlcu press TextEdit "取消"` |
+| `press "App" [--role R] [--title T] [--nth N] [--list] [--async]` | 深层包含匹配标题、描述、值和子控件文字后 AXPress；下拉框自动异步 | `xyzlcu press XYZStudio --role AXRadioButton --title "My Models" --nth 1` |
 | `wait "App" --title T [--role R] [--timeout 秒] [--gone]` | 等控件出现（或 `--gone` 消失），默认 5 秒超时 | `xyzlcu wait TextEdit --role AXSheet --timeout 3` |
+| `select "App" --popup T --item T [--nth N] [--timeout s]` | 异步打开原生下拉框，再按菜单项 | `xyzlcu select XYZStudio --popup Model --item "Local model"` |
+| `scroll-to "App" --role R --title T [--index N]` | 用 AXScrollToVisible、聚焦或有限次滚动条遍历使控件可见 | `xyzlcu scroll-to XYZStudio --role AXDisclosureTriangle --title Documents` |
+| `scroll dx dy --ax [--pid N] [--role R] [--title T]` | 改所在滚动区的滚动条值，不移动鼠标 | `xyzlcu scroll 0 -5 --ax --pid 1234 --role AXTextArea` |
+| `wait-text "App" "文字片段" [--timeout s] [--gone]` | 轮询静态文字和 AX 值，等文字出现或消失 | `xyzlcu wait-text XYZStudio "Complete" --timeout 60` |
+| `observe ["App"] [--pid N] [--max N]` | 纯文字返回前台应用、目标窗口和简洁 AX 摘要 | `xyzlcu observe --pid 1234` |
+| `selftest` | 无需 GUI 权限的解析、匹配和输入策略自检 | `build/xyzlcu-core selftest` |
 | `wait 毫秒` / `sleep 毫秒` | 等待固定时间 | `xyzlcu sleep 300` |
 | `taps` | 列出系统事件监听（排查输入卡顿/丢失），`blocking` 标出可疑的 | `xyzlcu taps` |
 | `record [--out f.jsonl] [--duration 秒] [--no-moves]` | 只监听地录制键鼠，见[录制与回放](#录制与回放) | `xyzlcu record --duration 30` |
@@ -185,14 +197,15 @@ xyzlcu whoami
 
 补充：
 
-- **应用名**可以写本地化名称（「访达」）、英文名（`Finder`）或 bundle ID（`com.apple.finder`）。
+- **应用名**可写本地化名、英文名或 bundle ID。AX 命令（`ax`、`find`、`press`、`click-el`、`set-text`、`value`、`menu`、`scroll`、`scroll-to`、`wait`、`wait-text`、`lock`）也可用 `--pid N` 代替应用名。同名进程优先选有屏幕窗口的那个，结果报告所选 pid；有 watchdog/辅助进程时建议明确指定 pid。
 - **按键名**：`a–z`、`0–9`、常用符号、`return`/`enter`、`tab`、`space`、`delete`/`backspace`、`forwarddelete`、`esc`、`up`/`down`/`left`/`right`、`home`/`end`/`pageup`/`pagedown`、`f1–f12`。修饰键：`cmd`、`shift`、`opt`/`alt`、`ctrl`、`fn`。
 - **`ax` 输出格式**：`角色(子角色) title="…" desc="…" value="…" id="…" [x,y 宽x高]`。中括号里的就是点坐标，中心点 = `(x + 宽/2, y + 高/2)`。
 - **`find` / `click-el` / `wait`**：`--title` 也可以写成第二个参数（`xyzlcu find TextEdit 保存`）。标题按完全匹配（不区分大小写）比对 title、description、value 和 identifier，加 `--contains` 改为包含匹配。先搜当前焦点窗口，再搜其他窗口；`--menu` 才搜菜单栏。找到第 `--index` 个（默认第 1 个）就立刻停止，不会遍历整棵树。找不到返回退出码 4。
-- **`click-el` / `press`** 优先执行 AXPress，按不了就点控件中心；加 `--click`（或 `--right`、`--double`）强制用鼠标点中心。
+- **`click-el`** 先 AXPress，不行再点中心；`--click`、`--right`、`--double` 强制点击。**`press`** 深层搜索并包含匹配子控件文字，只走 AX；`--list` 查看带编号的候选，`--nth N` 选第 N 项（从 1 开始）。`--async` 适用于菜单保持打开的动作，AXPopUpButton / AXMenuButton 自动异步。
 - **`wait "App" …`** 先 20 毫秒检查一次，间隔逐步加到 250 毫秒，超时返回退出码 4。
-- **`type` / `key --app "App"`**：把键盘事件直接投递给这个应用的进程（`CGEventPostToPid`），而不是发给系统输入流。前台被别的窗口抢走时也不会打错地方，但仍然要先确认这个应用的焦点窗口是你要的。
+- **`type` / `key --app "App"` 或 `--pid N`**：把 AX/菜单和按键投递限定到该进程。WebView 可能忽略 pid 事件，仍要确认目标窗口并读回值；任何全局回退都必须通过安全一节的前台检查。
 - **`run` / `batch`**：引号规则和 shell 一样（`"…"`、`'…'`、`\` 转义），`#` 开头的行是注释。默认遇到第一个出错的命令就停止，退出码同那条命令，错误信息会写明是第几步；加 `--continue-on-error` 则继续执行后面的步骤，最后返回最后一个出错步骤的退出码（全部成功为 0）。里面可以混用 `find`、`click-el`、`wait`、`sleep`。
+- **`--hold ms`**：只覆盖本次命令的按下到抬起时间（0–60000 毫秒），默认点击 60、按键 30。`XYZLCU_CLICK_HOLD` 改点击默认值，不影响悬停等待；守护进程不会把本次覆盖留给下一条请求。
 - **`--delay N`**：鼠标/键盘事件之间的间隔（毫秒，默认 2）。个别应用反应慢、丢字时调大，例如 `xyzlcu --delay 20 type …` 或 `XYZLCU_DELAY=20`。
 - **截图**：macOS 14+ 走 ScreenCaptureKit（进程内截图，直接按 `--scale` 输出目标尺寸；`--window` 只截那个窗口，被挡住也能截到；`--region` 只截那块区域），否则或加 `--cli` 时退回系统 `screencapture`。输出里的 `method` 字段会告诉你走的哪条路，`originX/originY` 是图片左上角的全局点坐标。
 
@@ -203,14 +216,15 @@ xyzlcu whoami
 **健康检查**
 
 - 读系统事件监听列表（`CGGetEventTapList`）：主动拦截（不是只监听）、平均延迟超过 1000 毫秒（`XYZLCU_TAP_THRESHOLD_MS` 可改）的监听算可疑。
-- 这些统计是历史值：刚卡住的监听数字还很低，早已恢复的数字却可能一直很高。所以键盘每次都**实测**：发一个带标记的「右 Shift 松开」事件（对任何应用都没有效果），用排在最后的只监听监听计时，400 毫秒内走完整条事件流就算健康（正常 1–30 毫秒）。鼠标只在统计可疑时实测（原地发一个 mouseMoved）。统计偏高、实测正常的监听列在 `check` 的 `staleTapStats` 里，按健康处理。
-- 守护进程里结果缓存 1.5 秒；`check` 总是重新检测，`check --probe` 连鼠标也实测。`XYZLCU_PROBE=0` 关闭实测，只看统计。
+- 这些统计是历史值，平均延迟高不能证明 Siri 等进程此刻拦住输入。普通检查输出 `suspectedTapStats`，不会发送任何合成探测事件。
+- 只有显式 `check --probe` 才发送带标记的 Shift 抬起和原地鼠标移动，用只监听的 tap 计时（400 毫秒截止）。应在排查输入问题时单独使用，不放进后台任务。探测通过就清除过时的拦截判断；普通守护进程状态缓存 1.5 秒。
 - `XYZLCU_EVENTS_HEALTH=bad` / `good` 强制当作卡住 / 正常，用来测试备用路径（守护进程模式下也生效，客户端会把这些环境变量随请求转发过去）。
 
 **各条路**
 
 | `path` | 做法 | 经过 HID 事件流的监听？ | 应用要在前台？ | 核对 |
 |---|---|---|---|---|
+| `ax-focus-value` | 先设 AXFocused，再写 AXValue 并读回；保持前台应用 | 否 | 否 | 读回 AXValue |
 | `ax-selected-text` | 辅助功能写焦点元素的 `AXSelectedText`（在光标处插入） | 否 | 否 | 读回 `AXValue` |
 | `events-hid` | CGEvent 发到系统 HID 事件流（`type` / `key` 不带 `--app`） | 是 | 是 | 300 毫秒内读回 |
 | `events-pid` | `CGEventPostToPid` 直接投递给应用进程（带 `--app`，或 `--via pid`） | 否 | 否 | 600 毫秒内读回 |
@@ -246,19 +260,19 @@ xyzlcu whoami
 
 ```bash
 xyzlcu insert TextEdit --window 我的笔记 "在光标处插入"         # 写 AXSelectedText
-xyzlcu settext TextEdit --role AXTextArea --window 我的笔记 "整体替换"   # 写 AXValue
+xyzlcu set-text TextEdit --role AXTextArea --window 我的笔记 "整体替换" # 聚焦、写值、读回
 xyzlcu value TextEdit --window 我的笔记                         # 读回核对
 ```
 
-- 定位：默认是应用当前的焦点元素；也可以用 `--role` / `--subrole` / `--title`（或 `--id`）/ `--index` 指定。`--window 标题` 会检查元素所在窗口，不对就拒绝写入。
-- 每次写完都会读回 `AXValue` 核对，`verified: true` 才算成功；不一致时退出码为 1。
+- 定位：默认是应用当前焦点元素。`set-text` 支持 `--role`、`--title`、`--contains`、`--index`，或 compact AX 的 `--ref N`；用应用名或 `--pid N`，并按需限定锁定/窗口范围。`--window 标题` 限定目标窗口。
+- 检查读回值和 `verified`：只有 `true` 才证明预期的 AX 值已写入；`false` 或 `"unknown"` 不能算输入已确认，失败会列出尝试路线。
 - 原生 Cocoa 文本框（文本编辑、备忘录、大多数输入框）都支持；有些网页和自绘界面不支持写值，这时只能靠 `pid` / `paste`。
 
 **`check` 输出**：`paths` 里列出 events / mouse / ax / menu / pid / paste / record 是否可用（events、mouse 带实测的 `probeMs`），`typeOrder` / `keyOrder` 是当前 auto 会按什么顺序试，`keyboardBlockedBy` 是卡住的监听。
 
 **限制**：`events-pid`、`menu`、`paste` 绕开的是 HID 事件流上的监听；如果应用自己的主线程卡住了，哪条路都没用。要真正修好，需要重启卡住的进程（`xyzlcu taps` 里 `blocking: true` 的那个）或者注销/重启。XYZLCU 不会替你结束任何进程。
 
-## 后台 / 锁定窗口模式（v0.6.1）
+## 后台 / 锁定窗口模式（v0.7.0）
 
 像沙盒里的智能体窗口一样：锁定**一个**应用窗口，之后的命令都只作用于它。**真实鼠标指针不动、应用不会被激活，你可以同时正常用键盘鼠标。**
 
@@ -282,12 +296,12 @@ xyzlcu unlock
 |---|---|---|
 | `screenshot` | `sck-window` | ScreenCaptureKit 单独截这个窗口，被挡住也完整 |
 | `click` | `ax-focus` / `ax-press` / `ax-select` / `ax-showmenu`（右键），再 `pid-mouse` | 用辅助功能命中该点，向上找最近的控件；工具栏里被标签盖住的输入框用小范围邻近搜索找到（`nearby: true`）。`--via ax\|pid` 强制 |
-| `type` | `ax-selected-text`，再 `pid-keys` | 辅助功能在选区插入，并读回核对（`verified`） |
+| `type` | `ax-focus-value`，再 AXSelectedText / 菜单粘贴 | 先聚焦后通过 AX 插入并核对（`verified`）；可显式 `--via pid`，但 WebView 可能忽略 |
 | `key` | 带 ⌘ 且有可用菜单项 → `ax-menu`；Esc / Return 按对话框的取消 / 默认按钮（`ax-press-cancel` / `ax-press-default`）；否则 `pid-keys` | `--via pid\|menu` 强制 |
 | `scroll` | `ax-scrollbar`（直接设滚动条的值，1 行约 40 点），再 `pid-scroll` | `--via ax\|pid` |
 | `drag`、`move`、`activate` 等 | 拒绝（退出码 6） | 需要真实鼠标或前台；加 `--allow-foreground` 会激活应用、走原来的路线 |
 
-在 Apple Silicon Mac 上实测，目标窗口被别的应用挡住（所有情况下鼠标都没动、前台应用都没变）：
+以下为 v0.6.1 历史实测，早于 v0.7.0 的时序和输入路线调整：Apple Silicon Mac，目标窗口被别的应用挡住（所有情况下鼠标都没动、前台应用都没变）：
 
 | 应用 | 操作 | 路线 | 耗时 | 核对 |
 |---|---|---|---:|---|
@@ -314,6 +328,43 @@ xyzlcu unlock
 - 只在鼠标悬停时出现的控件（比如标签页的关闭按钮）和拖放做不到。
 - 不支持最小化的窗口和其他桌面（Space）上的窗口。锁定的窗口关掉后，命令会以退出码 4 失败，直到 `unlock`。
 - 权限弹窗（TCC）等系统对话框不在范围内，绝不会去点。
+
+## 在后台操控 WKWebView / Tauri / Electron 应用
+
+先用 `windows` / `apps` 找到真正拥有窗口的进程，避免选到同名 watchdog，再按 pid 锁定并观察 AX。下面是人工验收步骤；v0.7.0 的真实 GUI 行为仍需在有权限的 Mac 上验收。
+
+```bash
+xyzlcu lock --pid 1234 --window-title XYZStudio
+xyzlcu observe --pid 1234
+xyzlcu ax --pid 1234 --compact --text
+xyzlcu set-text --pid 1234 --role AXTextArea --index 1 "你好，AX"
+xyzlcu value --pid 1234 --role AXTextArea
+xyzlcu press --pid 1234 --role AXRadioButton --title "My Models" --list
+xyzlcu press --pid 1234 --role AXRadioButton --title "My Models" --nth 1
+xyzlcu select --pid 1234 --popup Model --item "Local model"
+xyzlcu scroll-to --pid 1234 --role AXDisclosureTriangle --title Documents
+xyzlcu scroll 0 -5 --ax --pid 1234 --role AXTextArea
+xyzlcu wait-text --pid 1234 "Complete" --timeout 60
+xyzlcu wait-text --pid 1234 "Generating" --gone --timeout 60
+xyzlcu unlock
+```
+
+`set-text` 先设控件 AXFocused，再写 AXValue（`route: "ax-focus-value"`）。必要时会设置应用的 AXFocusedUIElement 或窗口的 AXMain，但这条路线不会激活应用或发送全局事件。读回失败后依次尝试 AXSelectedText、按 pid 找菜单粘贴，不会悄悄改成全局打字。后台 `type` 使用同样的先聚焦逻辑，并保留插入语义。
+
+原生 HTML select 通常表现为 AXPopUpButton，不能直接写值。AXPress 可能一直等到菜单关闭才返回，因此 `select` 异步打开菜单，找到该应用的 AXMenuItem 后按下。`press --list` 显示 index、role、title、frame、enabled、focused，便于先检查子文字标签和同名控件。
+
+视口外的控件可能尚不存在于 AX 树。`scroll-to` 用 AXScrollToVisible、聚焦滚动或滚动条值做有限次遍历，`scroll --ax` 直接改最近滚动区。这依赖具体 WebView 的 AX 支持。pid 鼠标和按键事件可能被忽略；要看 `verified`、读回值并观察界面变化，投递成功本身不代表送达。
+
+### 人工验收清单
+
+- 让另一个应用留在前台，执行锁定后的输入步骤；确认 `verified: true`、值读回一致、`frontmostBefore` / `frontmostAfter` 相同且鼠标未动。
+- 查看 `press --list`，按角色、文字片段和序号操作单选/展开控件；选择原生下拉菜单项后，用 AX 或截图确认选中状态。
+- 在长页面上滚到原先不在 AX 树里的控件，核对 `scroll-to` 的可见性和 `scroll --ax` 的滚动条读回；分别测试文字出现和 `--gone`。
+- 锁定后、目标不在前台时，显式全局输入路线必须失败；未锁定时，目标 `--app` / `--pid` 或 `--expect-front` 与前台不同，也必须在发字前失败。
+- 在可丢弃的前台文稿中测试 `click --hold 90`、`key return --hold 40`、单击/右键/双击，再分别在目标应用验收。编译和 selftest 通过不代表 GUI 送达。
+- 从实际 MCP 宿主启动，查看 `responsibleProcessInfo`，调用 `observe` 和 `screenshot`（`max_side: 1024`），确认权限错误点名那个宿主；`request --open` 应打开指定设置页。
+
+无需 GUI 权限的检查：`./build.sh`、`build/xyzlcu-core version`、`build/xyzlcu-core --help`、`scripts/selftest.sh`（CLI、C 客户端和 MCP 协议检查）。没有 GUI/AX 权限的沙箱中不要运行上述 GUI 验收步骤。
 
 ## 录制与回放
 
@@ -467,7 +518,7 @@ XYZLCU 是**通用的**：它不依赖任何智能体框架，也不需要插件
   4 找不到控件、wait 超时、输入没生效或 --window 不符；5 要求守护进程但连不上。
 
 安全规则
-- 每次 `type` / `key` 之前确认目标应用和窗口在前台（`xyzlcu apps` 里 active: true），或者用 `--app` / `--window` 限定。
+- 优先 `lock --pid N` 和 AX 控件/写值；绝不静默放行全局输入。前台流程用 `--expect-front "App"`，检查 frontmostBefore/frontmostAfter 和 verified。
 - 循环：观察 → 定位 → 操作 → 验证。操作后重新 find / 截图确认结果。
 - 付款、删除、发送、提交等不可撤销的操作先征得用户同意。
 - 不要用 `--force` 绕过锁屏保护。
@@ -506,11 +557,11 @@ const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Bu
 
 `xyzlcu mcp` 以 stdio 方式运行一个 MCP 服务器（JSON-RPC 2.0，一行一条消息），给只支持 MCP、不能直接跑命令的客户端。提供这些工具：
 
-- 只读：`check`、`screenshot`（直接返回图片，默认 JPEG）、`apps`、`windows`、`cursor`、`ax`、`find`
-- 操作：`click_element`、`click`、`type_text`、`key`、`activate`
-- 后台（v0.6.1）：`lock`（`app`、`window_title`、`window_id`、`unlock`、`status`）；`screenshot`、`ax`、`find`、`click_element`、`click`、`type_text`、`key` 支持 `background: true`（配 `app`）做单次后台操作。锁定时 `screenshot` 默认 scale 1，`ax` 支持 `focus`（`content` / `window` / `web`），`ax` / `find` 的 `app` 可省略
+- 只读：`check`、`observe`（前台应用、目标窗口、简洁 AX 文字）、`screenshot`、`apps`、`windows`、`cursor`、`ax`、`find`、`wait_text`
+- 操作：保留 `click_element`、`click`、`type_text`、`key`、`activate`；新增 `set_text`、`press`（`nth`、`list`、`async`）、`select_popup_item`（`popup`、`item`）、`scroll_to`
+- 后台：`lock` 支持 `app` 或 `pid`、`window_title` / `window_id`、`unlock`、`status`。目标工具支持 `pid` / `app` 和 `background`；锁定后可省应用名。`ax` 支持 `focus`（`content` / `window` / `web`）。输入工具支持 `allow_global`、`expect_front`，沿用 CLI 安全检查。
 - 批量：`batch`（`steps` 是命令字符串数组，比如 `["click-el TextEdit --title 保存", "wait TextEdit --role AXSheet", "screenshot --diff"]`，一次调用按顺序执行，返回每一步的输出和图片；`continue_on_error` 出错后继续）。省掉多次往返和模型多轮生成；截图步骤默认半尺寸 JPEG
-- `screenshot` 支持 `diff: true`：只返回变化的区域
+- `screenshot` 默认 fast JPEG、质量 0.6、缩放 0.5，锁定窗口也一样；`max_side` 限制图片最长边，`scale` 覆盖默认缩放。`diff: true` 只返回变化区域。元数据给出坐标换算，应按返回比例计算，不要假定 Retina 一定为 2 倍。
 - 通用：`xyzlcu`（`args` 数组，执行任意子命令；不允许 `mcp`、`serve`、`record`、`replay`、`batch` 和 `--stdout`）
 
 有守护进程在跑时，每个工具调用都转发给它；没有时 `xyzlcu mcp` 自己就是一个常驻进程（同样会保持截图流），不会每次调用都启动新进程。
@@ -556,9 +607,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 ## 性能对比（与 LCU）
 
+下表保留旧版本测量。v0.7.0 增加了点击/按键按住时间并调整 AX 路线，这里没有宣称新版 GUI 测速已经完成。
+
 **LCU 仍然占优的地方**（先说清楚）：
 
-- **后台操作**：LCU 点击和输入不移动真实鼠标、不把应用切到前台，用户可以同时用电脑。XYZLCU 的 `click` / `type` 会真的移动鼠标、需要应用在前台；不抢前台的路有 `click-el`（AXPress）、`type --app`、`menu`、`insert` / `settext`，但不是每个应用都支持。
+- **后台操作**：两者都有后台路线。XYZLCU 现在提供锁定窗口 + AX 优先操作，但支持程度取决于应用，限制见上文；下方历史测速中的 XYZLCU 输入采用前台路线。
 - **和模型的配合**：LCU 背后是 ChatGPT 的 CUA 运行时，按应用组织操作，和 ChatGPT / Codex 配合得更紧。下面的表只比单个操作的延迟，不代表完成整个任务的能力。
 
 ### 0.6.0 对比 0.5.0
@@ -653,7 +706,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 - **`run` / MCP `batch` 省的是往返**：命令行下 3 次调用 17 毫秒，一次 `run` 12 毫秒；MCP 本来就连着守护进程，3 次调用和一次 `batch` 差不多（16.1 vs 15.8 毫秒）。MCP `batch` 真正省的是模型多轮生成工具调用的时间（每轮通常是几百毫秒到几秒），这一部分这里没算。
 - **`--diff`**：画面没变时只回一小段 JSON（3–4 毫秒，没有图片）；变了就只给变化的那块。对需要反复「看一眼」的智能体最省 token。
 - 进程内（不开守护进程）基本和 0.4.2 一样，时间主要花在启动进程和连接窗口服务器上；比 0.4.2 多 1–2 毫秒，是 C 客户端 `exec` 到 `xyzlcu-core` 的代价。
-- **LCU 的点击慢一些（140 毫秒），但它是后台投递**：不移动真实鼠标、不把应用切到前台，用户可以同时用电脑。XYZLCU 的 `click` 会真的移动鼠标去点。想后台操作，XYZLCU 有 `click-el`（AXPress）、`type --app`、`menu`、`insert` / `settext` 这些不抢前台的路。
+- **历史点击对比**：旧的 140 毫秒与 6 毫秒数字比较的是不同投递路线；v0.7.0 增加悬停和按住时间，当前延迟需重新测速，后台送达另行核对。
 - **LCU 输入中文很慢**：`你好abc` 中位数约 9 秒，纯英文只要 43 毫秒。XYZLCU 直接发送 Unicode 或写辅助功能，中英文一样快。
 - **「—」在 LCU 列不是没测，是 LCU 在 Mac 上没有这个能力**（没有鼠标位置 / 移动、整屏截图和窗口列表，它按应用来操作）。
 - 这张表只比单个操作的延迟，不代表完成整个任务的能力。LCU 背后是 ChatGPT 的 CUA 运行时，在和模型配合、后台操作方面有它的长处。
@@ -758,7 +811,7 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 
 ## 坐标系
 
-- 所有坐标都是**全局点坐标（point）**，原点在**主显示器左上角**，x 向右、y 向下。
+- 非锁定/后台模式下，坐标是**全局点坐标（point）**，原点在**主显示器左上角**，x 向右、y 向下。
 - **点和像素**：Retina 屏 1 点 = 2 像素。截图是像素，`click` 用的是点。`screenshot` 会输出 `pixelsPerPoint`，换算方法：`点 = 像素 / pixelsPerPoint`。
 - **`--scale`**：在 2 倍屏上用 `--scale 0.5`，图片像素正好等于点坐标，最省事，图片也更小。
 - **多显示器**：`xyzlcu displays` 列出每块屏的 `x, y, w, h`（副屏的 x、y 可能是负数）。`screenshot --display 2` 截第 2 块屏，输出里的 `originX/originY` 就是这块屏左上角的全局坐标：`全局 x = originX + 像素x / pixelsPerPoint`。
@@ -805,12 +858,13 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 - 每个应用的请求超时是 3 秒，最多输出 3000 个节点。
 
 **按键发到了别的窗口？**
-- 键盘事件发给当前前台应用。先 `activate`，再用 `apps` 确认。
+- 全局键盘事件发给当前前台应用。优先用锁定 + AX/pid，前台流程可加 `--expect-front "App"`。明确目标与前台不同就拒绝全局输入；检查 `frontmostBefore` / `frontmostAfter`。
 
 ## 安全须知
 
 - 有了辅助功能权限，就能模拟任何键鼠操作。只在你信任的环境里使用；不用时可以到系统设置里关掉开关。
-- **`type` / `key` 前一定确认前台应用**，否则文字可能打进别的文档，快捷键也可能关掉别的窗口。
+- **全局输入保护（v0.7.0）**：锁定/后台 `type`、`key`、`click` 默认拒绝 `events-hid`，只有显式 `--allow-global` 才可能放行。`--allow-foreground` 是另一项开关，不代表允许全局输入。即使给了 `--allow-global`，全局路线运行前仍要求 `--app` / `--pid` 指定的目标在前台；`--expect-front "App"` 可额外加前台检查而不更改目标。未指定目标的前台输入仍发给当前前台应用。
+- **输入证据**：输入 JSON 带 `frontmostBefore` / `frontmostAfter`；要同时检查 route 和读回值。`verified: "unknown"` 不代表送达，前台应用没变也不代表目标控件已改变。
 - **锁屏保护**：锁屏时 `click / move / drag / scroll / type / key` 返回码 3 并拒绝执行。`--force` 可以强制执行，但不建议。
 - **录制文件可能含有你打的字**：只存本机（权限 0600），密码框和锁屏时不录按键；用完删掉，不要分享。回放、`type`、`key` 前同样先确认前台窗口。
 - 不要让智能体在付款、删除、发送这类确认框上自动点「确定」。
@@ -821,10 +875,10 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 
 - 只支持 macOS，只操作当前登录用户的图形会话。锁屏时没法操作，截图也是全黑。
 - macOS 13 上没有 ScreenCaptureKit 截图，会退回 `/usr/sbin/screencapture`（`--window` 用 `-l 窗口号`，`--region` 用 `-R`）。
-- `press` 只按完全匹配（不区分大小写）的标题、描述、值或 identifier 找控件，返回第一个匹配项；需要更精确时用 `find` / `click-el` 的 `--role`、`--index`、`--window`。
+- `press` 包含匹配标题、描述、值、identifier 和子文字（不区分大小写）；用角色 + `--list` + `--nth` 区分候选。异步成功表示 AX 动作已启动，不等于菜单项已选中。
 - `type` 不经过输入法，需要输入法联想的场景不适用。
 - 不支持其他桌面（Space）上的窗口的切换管理。
-- 后台 / 锁定窗口模式的限制见[那一节](#后台--锁定窗口模式v061)（App Nap 延迟、后台时菜单项不可用、投递的鼠标事件被忽略、不能拖拽、不支持最小化窗口）。
+- 后台 / 锁定窗口模式的限制见[那一节](#后台--锁定窗口模式v070)（App Nap 延迟、后台时菜单项不可用、投递的鼠标事件被忽略、不能拖拽、不支持最小化窗口）。
 - 守护进程的应用表最多 10 秒刷新一次：后台进程刚变成普通应用、又没有被激活时，`apps` 最多晚 10 秒看到它（按名字找应用时找不到会立刻整体重扫，不受影响）。
 - 从主屏流里裁出来的窗口截图，圆角外面是桌面而不是透明；窗口被别的窗口挡住、跨屏或主屏流没开时，会自动改回单独截窗口。
 
@@ -841,6 +895,8 @@ rm -rf ~/.xyzlcu
 > 想继续用旧名字的话：`ln -sf ~/.local/bin/xyzlcu ~/.local/bin/macctl`
 
 ## 更新记录
+
+- **0.7.0**：先聚焦再写值的 AX 输入、pid 定位、深层按控件和下拉选择、AX 滚动和文字等待、全局输入保护、时序参数、TCC 宿主诊断、精简 MCP 观察和截图尺寸限制。完整摘要见 [CHANGELOG.md](CHANGELOG.md)。
 
 - **0.6.1**：锁定窗口的后台模式和若干修复。
   - **`lock` / `unlock` / `--background`**：锁定一个窗口；只截这个窗口（ScreenCaptureKit，被挡住也行），点击先走辅助功能（聚焦 / 按下 / 选中 / 弹菜单）再投递给进程，输入先走辅助功能再投递按键，⌘ 组合键走菜单，Esc / Return 按对话框的取消 / 默认按钮，滚动直接设滚动条。坐标相对窗口，每个结果带 `route`，每次操作后核对鼠标和前台应用。`drag` / `move` / `activate` 默认拒绝，`--allow-foreground` 放行。MCP 新增 `lock` 工具和 `background` 参数。

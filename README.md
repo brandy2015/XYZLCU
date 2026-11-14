@@ -4,6 +4,8 @@
 
 **English** | [中文](README.zh-CN.md)
 
+**Version 0.7.0** — focused AX text writes, deep controls and guarded background input. See [CHANGELOG.md](CHANGELOG.md).
+
 [![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#requirements) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![Agents: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#supported-agents)
 
 **Supported agents:** [Grok · Codex · ChatGPT · Claude · DeepSeek · …](#supported-agents) (any agent that can run shell commands or connect to an MCP server)
@@ -16,10 +18,10 @@
 
 ## Why XYZLCU (highlights)
 
-All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see [Benchmark](#benchmark-vs-lcu) for the method and full data. The LCU numbers come from the 0.4.2 round on the same machine (LCU 0.13.4). LCU does some things better than XYZLCU too, and those are listed in [Benchmark](#benchmark-vs-lcu) as well.
+The numbers below are historical v0.5.0–0.6.1 measurements, not v0.7.0 timings: clicks now include a 60 ms hold and 75 ms hover delay, and keys a 30 ms hold. All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see [Benchmark](#benchmark-vs-lcu) for the method and full data. The LCU numbers come from the 0.4.2 round on the same machine (LCU 0.13.4). LCU does some things better than XYZLCU too, and those are listed in [Benchmark](#benchmark-vs-lcu) as well.
 
 - 🔌 **Supports Grok, Codex, ChatGPT, Claude, DeepSeek** and other major agents: anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node, and shell scripts; ChatGPT, Claude and DeepSeek use the same interface and are compatible (not yet tested first-hand). See [Supported agents](#supported-agents).
-- 🪟 **Window-locked background mode** (v0.6.1): `xyzlcu lock --app Safari` and the agent works inside that one window while you keep using the Mac: the pointer never moves and the app is never activated; clicks and typing go through Accessibility first and every result says which `route` it took. Measured on TextEdit, Finder and Safari, honest limits included. See [Background / window-locked mode](#background--window-locked-mode-v061).
+- 🪟 **Window-locked background mode** (v0.6.1): `xyzlcu lock --app Safari` and the agent works inside that one window while you keep using the Mac: the pointer never moves and the app is never activated; clicks and typing go through Accessibility first and every result says which `route` it took. Measured on TextEdit, Finder and Safari, honest limits included. See [Background / window-locked mode](#background--window-locked-mode-v070).
 - ⚡ **Fast**: with the daemon running, `xyzlcu` is a tiny C program, about **3 ms** per call.
 
   | Operation | XYZLCU | LCU |
@@ -32,18 +34,20 @@ All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see 
   | List apps | **3 ms** | 17 ms |
 
 - 🧠 **In-memory and diff screenshots**: `--base64` / `--stdout` produce the image in memory, with no file written, and a `--fast` half-size JPEG takes about **9 ms**. `--diff` returns only the region that changed; if nothing changed you get a short JSON reply (3–4 ms, no image), which suits agents that keep taking a quick look.
-- 🛣 **Typing works even when the keyboard is stuck**: the event stream is probed for real every time. If it is stuck, typing falls back automatically: AX value write → posting to the process → paste via the menu. Shortcuts first look for the matching menu-bar item. Every path is **read back and verified**, and the next path is tried only if nothing landed. If the field cannot be read back, it stays on the current path, so **the same text is never typed twice**. The output says which path was actually used.
+- 🛣 **Focused AX text writes**: `set-text` (also `settext`) focuses the control through Accessibility, writes its value and reads it back. Background `type` prefers this route for text fields. The result reports `verified`, the actual `route`, and the frontmost app before and after. Failed AX writes can try selected-text insertion and menu paste; global typing is explicitly guarded.
 - 🪙 **Saves tokens**: `ax --compact` lists only actionable controls, one per line with a number and a center point; `click-el --ref N` then presses by number. Finder's control tree with the menu bar goes from **13.7 KB to 0.4 KB**, and a TextEdit window from 740 to 243 bytes.
 - 🧰 **Full feature set**: mouse position and movement, drag, scroll, full-screen / window / region screenshots, the window list, moving and resizing windows, the display list, pressing menus in the background, the control tree and pressing controls, waiting for a control to appear, and record / replay. LCU on the Mac has no mouse position or movement, no full-screen screenshots and no window list.
 - 🔒 **Safety**:
   - Mouse and keyboard actions are refused while the screen is locked, so nothing gets typed into the lock-screen password field.
   - The recorder only listens and never intercepts input; it skips keystrokes while Secure Input (password fields) is on or the screen is locked.
   - No anti-detection: it does not pretend to be a human and does not get around CAPTCHAs or bot detection.
-- 🏠 **Privacy**: local only, with **no network access and no telemetry**. The only socket in the code is the daemon's local Unix socket, and the only programs it runs are the system's own `screencapture` (the macOS 13 fallback) and `open` (to launch apps). Recordings are saved locally with permissions 0600.
+- 🏠 **Privacy**: local only, with **no network access and no telemetry**. The only socket in the code is the daemon's local Unix socket, and capture/app launching use the system's `screencapture` and `open`; async AX actions can launch another xyzlcu-core worker. Recordings are saved locally with permissions 0600.
 - 📦 **No dependencies**: two files (`xyzlcu` + `xyzlcu-core`), universal binaries for Apple Silicon and Intel, macOS 13+. No ChatGPT desktop app, Python, Node, Homebrew or third-party libraries needed.
 - 📖 **Open source**: MIT licensed, with Chinese and English docs and the benchmark scripts in `scripts/`, so you can reproduce the results.
 
 ## Features
+
+- **v0.7.0**: `--pid` targeting; focused, verified `set-text`; deep `press --nth/--list/--async`; native popup `select`; `scroll-to` / `scroll --ax`; `wait-text`; text-only `observe`; global input safety guards; host-aware permission diagnostics.
 
 - 📸 **Screenshots**: a whole display, a single window (`--window`) or a region (`--region`), optional downscaling, `--fast` for a small JPEG in one flag; prints the point/pixel mapping
 - 🧠 **In-memory screenshots** (v0.4.2): `--base64` / `--stdout` produce the image in memory without writing a file; the daemon keeps capture streams on demand, so repeated captures of the same window take about 20 ms
@@ -54,11 +58,11 @@ All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see 
 - ⌨️ **Keyboard**: types Unicode text directly (Chinese, emoji; bypasses the input method), key combos like `cmd+shift+4`
 - 🌳 **Accessibility tree**: dumps any app window's control tree (role, title, value, frame); `find` returns a control's frame and center by role/title, `click-el` finds and presses in one call, `wait` waits for a control to appear or disappear
 - 🪟 **Apps & windows**: list, open, activate and hide apps; list windows; move and resize windows; list displays
-- 🛣 **Multiple input paths** (v0.4.0): probes whether the event stream is stuck, then picks a working path among Accessibility writes, keyboard events, direct-to-process delivery and menu paste, and reports which one it used
+- 🛣 **Multiple input paths**: Accessibility writes, keyboard events, direct-to-process delivery and menu paste, with route reporting and readback when available. Only `check --probe` actively posts test events; normal health checks inspect metadata.
 - ⏺ **Record / replay**: listen-only recording of keyboard and mouse (never intercepts input; no keys recorded in password fields or while locked), replayed with the original timing
 - 🔒 **Lock-screen guard**: refuses mouse and keyboard input while the screen is locked, so nothing gets typed into the password field
 - 📊 **Measured**: a per-operation speed comparison with LCU is in [Benchmark](#benchmark-vs-lcu), with a reproducible script
-- ⚡ **Resident daemon**: after `xyzlcu serve --background`, commands are forwarded to it automatically, skipping process start-up and permission checks; most commands take 2–10 ms
+- ⚡ **Resident daemon**: after `xyzlcu serve --background`, commands are forwarded to it automatically, avoiding process start-up while retaining permission and safety checks; historical query commands take 2–10 ms
 - 🔌 **MCP server** (v0.4.2): `xyzlcu mcp` over stdio for MCP-only clients (such as Claude Desktop); screenshots come back as images
 - 🧾 **Parseable output**: JSON or a plain `ok`, plus clear exit codes
 
@@ -130,14 +134,16 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 3. If the app isn't in the list, click "+" and add it from Applications.
 4. **Quit and reopen that app**, then run `xyzlcu check`.
 
-`xyzlcu request` brings up both system permission prompts. XYZLCU never edits the TCC database and never tries to bypass permissions.
+`check` keeps the existing `responsibleProcess` path string and adds `responsibleProcessInfo` (`pid`, `name`, `path`, `bundleId`). MCP permission failures identify this host and explain which Privacy & Security switches it needs; restart that host after granting access. Terminal permissions do not automatically authorize a separate MCP host.
+
+`xyzlcu request` brings up system permission prompts. `xyzlcu request --open` also opens the first missing permission pane; select one with `--permission accessibility|screen-recording|input-monitoring`. Input Monitoring is needed for the recorder and explicit event-stream probes. XYZLCU never edits the TCC database or bypasses permissions.
 
 ## Commands
 
 | Command | Description | Example |
 |---|---|---|
 | `check [--probe]` | Permissions, lock status, and which input paths work (see [Multiple input paths](#multiple-input-paths-when-keyboard-events-are-blocked)) | `xyzlcu check` |
-| `request` | Bring up the system permission prompts | `xyzlcu request` |
+| `request [--open] [--permission P]` | Request access; open the missing or selected Privacy & Security pane | `xyzlcu request --open --permission accessibility` |
 | `whoami` | Process chain and responsible app | `xyzlcu whoami` |
 | `version` | Version | `xyzlcu version` |
 | `screenshot [path] [--scale S] [--display N] [--format png\|jpg\|heic] [--quality Q]` | Screenshot. Format: `--format`, else the file extension, else PNG (JPEG for `--fast` and in-memory output) | `xyzlcu screenshot /tmp/s.jpg --scale 0.5` |
@@ -150,14 +156,14 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `screenshot … --diff` | Return only what changed since the previous capture of the same target and scale: `diff.rects` (global points) and `changedPercent`, with the image cropped to the changed area; no image when nothing changed. Daemon / MCP only | `xyzlcu screenshot --fast --diff --base64` |
 | `screenshot … --out path` / `--timing` | `--out` also writes a file; `--timing` adds per-stage `timingMs` | `xyzlcu screenshot --fast --base64 --timing` |
 | `displays` | Displays and their coordinate ranges | `xyzlcu displays` |
-| `click x y [--right] [--double]` | Click | `xyzlcu click 500 300 --double` |
+| `click x y [--right] [--double] [--hold ms]` | Click; default 60 ms hold after a 75 ms hover delay | `xyzlcu click 500 300 --hold 90` |
 | `move x y` | Move the pointer | `xyzlcu move 800 600` |
 | `drag x1 y1 x2 y2` | Drag with the left button held | `xyzlcu drag 100 100 400 400` |
 | `scroll dx dy` | Scroll in lines; positive dy scrolls up | `xyzlcu scroll 0 -5` |
 | `cursor` | Current pointer position | `xyzlcu cursor` |
 | `type "text" [--app "App"] [--window title] [--via auto\|ax\|events\|pid\|paste]` | Type Unicode text; JSON output (`path` = path actually used, `verified` = read back and checked). Default auto picks the path | `xyzlcu type --app TextEdit --window Notes "你好 😀"` |
 | `insert "App" [target] "text"` | Insert text at the focus via Accessibility (sets AXSelectedText), no keyboard events; verified by reading back | `xyzlcu insert TextEdit --window Notes "hello"` |
-| `settext "App" [target] "text"` | Replace a text field's whole content via Accessibility (sets AXValue); verified by reading back | `xyzlcu settext Safari --role AXTextField --title Search "XYZLCU"` |
+| `set-text "App" [target] "text"` | Focus via AX, replace AXValue and verify; `settext` remains an alias | `xyzlcu set-text --pid 1234 --role AXTextArea "Hello"` |
 | `value "App" [target]` | Read back an element's value (focused element by default) to check the input | `xyzlcu value TextEdit` |
 | `menu "App" "Menu>Item" [--window title] [--activate]` | Press a menu item by path (AXPress, does not activate the app by default) instead of a shortcut; each level accepts alternatives like `File\|文件` | `xyzlcu menu TextEdit "File>New"` |
 | `key combo… [--app "App"] [--via auto\|events\|menu\|pid]` | Keys / combos, several at once; JSON output with the path used per key. Presses the matching menu item when the event stream is blocked | `xyzlcu key cmd+s` · `xyzlcu key --app TextEdit cmd+a` |
@@ -168,12 +174,18 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `windows [--all]` | On-screen windows (owner, title, bounds) | `xyzlcu windows` |
 | `movewin "App" x y [--w W --h H] [--title T]` | Move / resize a window and raise it | `xyzlcu movewin "Safari" 200 100 --w 1200 --h 800` |
 | `ax ["App"] [--depth N] [--menu]` | Dump the UI control tree | `xyzlcu ax TextEdit --depth 6` |
-| `ax ["App"] --compact [--menu] [--text] [--max 300]` | Only actionable controls: `[N] Role "title" ="value" @centerX,centerY`, for agents, few tokens | `xyzlcu ax TextEdit --compact` |
-| `find "App" [--role R] [--title T] [--contains] [--index N\|--all] [--window T] [--menu]` | Find a control; returns role, title, frame, center; stops at the first hit | `xyzlcu find TextEdit --role AXButton --title Save` |
+| `ax ["App"] --compact [--menu] [--text] [--max 300]` | Actionable controls with numbered centers, `enabled` and `focused`, for agents | `xyzlcu ax TextEdit --compact` |
+| `find "App" [--role R] [--title T] [--contains] [--index N\|--all] [--window T] [--menu]` | Find a control; returns role, title, frame, center, enabled and focused; stops at the requested hit | `xyzlcu find TextEdit --role AXButton --title Save` |
 | `click-el "App" --role R --title T [--click] [--right] [--double]` | Find a control and press it (AXPress, falling back to a center click) | `xyzlcu click-el TextEdit --role AXButton --title Save` |
 | `click-el --ref N ["App"]` | Press control number N from the last `ax --compact` (needs the daemon) | `xyzlcu click-el --ref 3` |
-| `press "App" "title"` | Find a control by title and press it (older form; prefer `click-el` in new scripts) | `xyzlcu press TextEdit "Cancel"` |
+| `press "App" [--role R] [--title T] [--nth N] [--list] [--async]` | Deep substring match over title, description, value and child text; AXPress; popups auto-async | `xyzlcu press XYZStudio --role AXRadioButton --title "My Models" --nth 1` |
 | `wait "App" --title T [--role R] [--timeout sec] [--gone]` | Wait for a control to appear (or, with `--gone`, disappear); 5 s timeout by default | `xyzlcu wait TextEdit --role AXSheet --timeout 3` |
+| `select "App" --popup T --item T [--nth N] [--timeout s]` | Open a native popup without waiting for its AXPress to return, then press its menu item | `xyzlcu select XYZStudio --popup Model --item "Local model"` |
+| `scroll-to "App" --role R --title T [--index N]` | Reveal a control through AXScrollToVisible, focus or bounded scrollbar traversal | `xyzlcu scroll-to XYZStudio --role AXDisclosureTriangle --title Documents` |
+| `scroll dx dy --ax [--pid N] [--role R] [--title T]` | Set the containing scroll area's scrollbar value without pointer movement | `xyzlcu scroll 0 -5 --ax --pid 1234 --role AXTextArea` |
+| `wait-text "App" "substring" [--timeout s] [--gone]` | Poll static text and AX values until text appears or disappears | `xyzlcu wait-text XYZStudio "Complete" --timeout 60` |
+| `observe ["App"] [--pid N] [--max N]` | Text-only frontmost app, target window and compact AX summary | `xyzlcu observe --pid 1234` |
+| `selftest` | Pure parsing, matching and input policy checks; no GUI permissions needed | `build/xyzlcu-core selftest` |
 | `wait ms` / `sleep ms` | Fixed wait | `xyzlcu sleep 300` |
 | `taps` | List system event taps (diagnose stuck or dropped input); `blocking` marks suspicious ones | `xyzlcu taps` |
 | `record [--out f.jsonl] [--duration s] [--no-moves]` | Listen-only recording of keyboard and mouse, see [Record and replay](#record-and-replay) | `xyzlcu record --duration 30` |
@@ -185,14 +197,15 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 
 Notes:
 
-- **App names** can be the localized name, the English bundle name (`Finder`) or the bundle ID (`com.apple.finder`).
+- **App names** can be the localized name, English bundle name or bundle ID. AX commands (`ax`, `find`, `press`, `click-el`, `set-text`, `value`, `menu`, `scroll`, `scroll-to`, `wait`, `wait-text`, `lock`) also accept `--pid N` instead of a name. With duplicate names, processes owning on-screen windows are preferred; results report the chosen pid. Use an explicit pid for watchdog/helper ambiguity.
 - **Key names**: `a–z`, `0–9`, common symbols, `return`/`enter`, `tab`, `space`, `delete`/`backspace`, `forwarddelete`, `esc`, `up`/`down`/`left`/`right`, `home`/`end`/`pageup`/`pagedown`, `f1–f12`. Modifiers: `cmd`, `shift`, `opt`/`alt`, `ctrl`, `fn`.
 - **`ax` output format**: `Role(Subrole) title="…" desc="…" value="…" id="…" [x,y WxH]`. The brackets hold point coordinates; the center is `(x + W/2, y + H/2)`.
 - **`find` / `click-el` / `wait`**: `--title` can also be given as the second argument (`xyzlcu find TextEdit Save`). Titles match title, description, value and identifier exactly (case-insensitive); `--contains` switches to substring matching. The focused window is searched first, then the other windows; the menu bar only with `--menu`. The search stops as soon as the `--index`-th match (default 1) is found instead of walking the whole tree. Not found exits with code 4.
-- **`click-el` / `press`** try AXPress first and click the control's center if that fails; `--click` (or `--right`, `--double`) forces a mouse click on the center.
+- **`click-el`** tries AXPress first and falls back to a center click; `--click`, `--right` and `--double` force clicking. **`press`** performs a deep AX-only substring search, including child labels; use `--list` to inspect indexed candidates, `--nth N` (1-based) to choose, and `--async` for actions that keep native menus open. AXPopUpButton / AXMenuButton automatically use async pressing.
 - **`wait "App" …`** first checks after 20 ms and backs off to 250 ms between checks; a timeout exits with code 4.
-- **`type` / `key --app "App"`**: posts the keyboard events straight to that app's process (`CGEventPostToPid`) instead of the system input stream. Text can't land in another app if focus is stolen, but you still need to confirm that app's focused window is the one you want.
+- **`type` / `key --app "App"` or `--pid N`**: scopes AX/menu operations and posted keyboard events to that process. Pid events may be ignored by a WebView; still confirm the intended window and read back values. Any global fallback must pass the frontmost guard described in Safety.
 - **`run` / `batch`**: quoting works like the shell (`"…"`, `'…'`, `\` escapes); lines starting with `#` are comments. By default execution stops at the first failing command, with that command's exit code, and the error names the step number; with `--continue-on-error` the remaining steps still run and the exit code is that of the last failing step (0 if all succeed). `find`, `click-el`, `wait` and `sleep` can be mixed in.
+- **`--hold ms`**: override down/up hold for this command (0–60000 ms); defaults are 60 ms for clicks and 30 ms for keys. `XYZLCU_CLICK_HOLD` changes the click default; it does not change hover delay. Overrides do not leak to the next daemon request.
 - **`--delay N`**: gap between synthesized mouse/keyboard events in ms (default 2). Raise it if a slow app drops input, e.g. `xyzlcu --delay 20 type …` or `XYZLCU_DELAY=20`.
 - **Screenshots**: on macOS 14+ capture goes through ScreenCaptureKit (in-process, rendered directly at the `--scale` size; `--window` captures only that window, even when covered; `--region` only that area); otherwise, or with `--cli`, it falls back to the system `screencapture`. The `method` field tells you which path ran, and `originX/originY` is the image's top-left in global points.
 
@@ -203,14 +216,15 @@ Sometimes a process's keyboard event tap hangs: keyboard events are posted but t
 **Health check**
 
 - Reads the system tap list (`CGGetEventTapList`): an active (not listen-only) tap with average latency above 1000 ms (`XYZLCU_TAP_THRESHOLD_MS`) is suspicious.
-- Those stats are historical: a freshly hung tap still shows low numbers, while one that recovered long ago can keep showing high numbers. So the keyboard is **actively probed** every time: a tagged "right Shift up" event (no effect on any app) is posted and timed by a listen-only tap at the end of the chain; it is healthy if it gets through the whole stream within 400 ms (normally 1–30 ms). The mouse is probed only when its stats look suspicious (an in-place mouseMoved). Taps with high stats but a passing probe are listed as `staleTapStats` in `check` and treated as healthy.
-- The daemon caches the result for 1.5 s; `check` always re-checks, and `check --probe` probes the mouse too. `XYZLCU_PROBE=0` disables probing (stats only).
+- Those stats are historical: a high average does not prove that Siri or another process is currently blocking input. Normal checks report `suspectedTapStats` and do not synthesize any events.
+- Only explicit `check --probe` posts a tagged Shift-up and in-place mouse-move probe, timing each through a listen-only tap (400 ms deadline). Use it when diagnosing input, outside a background task. Passing probes clear stale blockers; normal daemon health metadata is cached for 1.5 s.
 - `XYZLCU_EVENTS_HEALTH=bad` / `good` forces blocked / healthy, for testing the fallback paths (works with the daemon too; the client forwards these variables with each request).
 
 **The paths**
 
 | `path` | How | Passes HID-stream taps? | App must be frontmost? | Verification |
 |---|---|---|---|---|
+| `ax-focus-value` | Set AXFocused, write AXValue, read it back; preserves the app foreground | No | No | Reads back AXValue |
 | `ax-selected-text` | Accessibility write of the focused element's `AXSelectedText` (inserts at the caret) | No | No | Reads back `AXValue` |
 | `events-hid` | CGEvents posted to the system HID stream (`type` / `key` without `--app`) | Yes | Yes | Read back within 300 ms |
 | `events-pid` | `CGEventPostToPid`, delivered straight to the app process (`--app`, or `--via pid`) | No | No | Read back within 600 ms |
@@ -246,19 +260,19 @@ Sometimes a process's keyboard event tap hangs: keyboard events are posted but t
 
 ```bash
 xyzlcu insert TextEdit --window "My notes" "insert at the caret"           # writes AXSelectedText
-xyzlcu settext TextEdit --role AXTextArea --window "My notes" "replace all"  # writes AXValue
+xyzlcu set-text TextEdit --role AXTextArea --window "My notes" "replace all" # focuses, writes AXValue, reads back
 xyzlcu value TextEdit --window "My notes"                                  # read back to verify
 ```
 
-- Target: the app's focused element by default, or pick one with `--role` / `--subrole` / `--title` (or `--id`) / `--index`. `--window title` checks the element's window and refuses to write if it doesn't match.
-- Every write is read back from `AXValue`; only `verified: true` counts as success, otherwise the exit code is 1.
+- Target: the app's focused element by default. `set-text` accepts `--role`, `--title`, `--contains`, `--index`, or `--ref N` from compact AX output; use an app name or `--pid N`, with the lock/window scope where applicable. `--window title` constrains the target window.
+- Inspect the readback and `verified`: only `true` proves the expected AX value landed. `false` or `"unknown"` must not be treated as confirmed input; failures include the tried routes.
 - Native Cocoa text controls (TextEdit, Notes, most input fields) support this; some web pages and custom-drawn UIs don't, and then only `pid` / `paste` remain.
 
 **`check` output**: `paths` lists whether events / mouse / ax / menu / pid / paste / record are usable (events and mouse include the measured `probeMs`); `typeOrder` / `keyOrder` show the order auto would try right now; `keyboardBlockedBy` lists the hung taps.
 
 **Limits**: `events-pid`, `menu` and `paste` bypass taps on the HID stream; if the app's own main thread is stuck, no path helps. To really fix it, restart the hung process (the one with `blocking: true` in `xyzlcu taps`) or log out / reboot. XYZLCU never kills processes for you.
 
-## Background / window-locked mode (v0.6.1)
+## Background / window-locked mode (v0.7.0)
 
 Like a sandboxed agent window: lock **one** app window and every following command acts only on it. The **real mouse pointer never moves, the app is never activated, and you can keep using the Mac** with the keyboard and mouse at the same time.
 
@@ -282,12 +296,12 @@ xyzlcu unlock
 |---|---|---|
 | `screenshot` | `sck-window` | ScreenCaptureKit captures the window by itself, so covered windows come out whole |
 | `click` | `ax-focus` / `ax-press` / `ax-select` / `ax-showmenu` (right click), then `pid-mouse` | Accessibility hit-test at the point, walking up to the nearest control; toolbar fields under a label are found with a small nearby search (`nearby: true`). `--via ax\|pid` forces one |
-| `type` | `ax-selected-text`, then `pid-keys` | AX inserts at the selection and is read back (`verified`) |
+| `type` | `ax-focus-value`, then AXSelectedText / menu paste | Focused AX text insertion is read back (`verified`); explicit `--via pid` remains available but WebViews may ignore it |
 | `key` | `ax-menu` for ⌘ combos with an enabled menu item; Esc / Return press the dialog's Cancel / default button (`ax-press-cancel` / `ax-press-default`); otherwise `pid-keys` | `--via pid\|menu` forces one |
 | `scroll` | `ax-scrollbar` (sets the scroll bar's value, ~40 pt per line), then `pid-scroll` | `--via ax\|pid` |
 | `drag`, `move`, `activate` … | refused (exit code 6) | they need the real pointer or the foreground; `--allow-foreground` activates the app and uses the normal path |
 
-Measured on an Apple Silicon Mac with the target window covered by another app (pointer stayed put and the frontmost app never changed in every case):
+Historical v0.6.1 measurements, before v0.7.0 timing and text-route changes: on an Apple Silicon Mac with the target window covered by another app (pointer stayed put and the frontmost app never changed in every case):
 
 | App | Action | Route | Time | Read back |
 |---|---|---|---:|---|
@@ -314,6 +328,43 @@ Measured on an Apple Silicon Mac with the target window covered by another app (
 - Hover-only controls (e.g. a tab's close button) and drag-and-drop are not reachable.
 - Minimized windows and windows on other Spaces are not supported. If the locked window closes, commands fail with exit code 4 until you `unlock`.
 - A permission prompt (TCC) or any system dialog is out of scope and never clicked.
+
+## Driving WKWebView/Tauri/Electron apps in the background
+
+Use the process that owns the actual window, not a same-name watchdog. Start with `windows` / `apps`, lock that pid, then inspect the AX tree. These examples are a manual test recipe; v0.7.0 GUI acceptance is pending testing on a permission-enabled Mac.
+
+```bash
+xyzlcu lock --pid 1234 --window-title XYZStudio
+xyzlcu observe --pid 1234
+xyzlcu ax --pid 1234 --compact --text
+xyzlcu set-text --pid 1234 --role AXTextArea --index 1 "Hello from AX"
+xyzlcu value --pid 1234 --role AXTextArea
+xyzlcu press --pid 1234 --role AXRadioButton --title "My Models" --list
+xyzlcu press --pid 1234 --role AXRadioButton --title "My Models" --nth 1
+xyzlcu select --pid 1234 --popup Model --item "Local model"
+xyzlcu scroll-to --pid 1234 --role AXDisclosureTriangle --title Documents
+xyzlcu scroll 0 -5 --ax --pid 1234 --role AXTextArea
+xyzlcu wait-text --pid 1234 "Complete" --timeout 60
+xyzlcu wait-text --pid 1234 "Generating" --gone --timeout 60
+xyzlcu unlock
+```
+
+`set-text` sets AXFocused on the control before writing AXValue (`route: "ax-focus-value"`). It may set the app's AXFocusedUIElement or window's AXMain, but never activates the app or posts global events for that route. On failed readback it tries AXSelectedText, then pid-scoped menu paste. It does not silently turn into global typing. `type` in background mode uses the same focus-first write logic while preserving insertion semantics.
+
+Native HTML selects expose AXPopUpButton rather than a writable value. Their AXPress can block until the menu closes; `select` opens asynchronously, finds the app-owned AXMenuItem and presses it. `press --list` shows index, role, title, frame, enabled and focused so child-text labels and duplicate controls can be inspected first.
+
+Controls outside the viewport may not exist in the AX tree. `scroll-to` retries a bounded traversal using AXScrollToVisible, focus scrolling or scrollbar values; `scroll --ax` changes the nearest scroll area directly. Neither guarantees support from every WebView. Pid mouse/key delivery can be ignored; inspect `verified`, read values, and observe the resulting UI instead of treating a posted event as delivery.
+
+### Manual acceptance checks
+
+- Keep another app frontmost, then run the locked text recipe. Confirm `verified: true`, the value readback, unchanged `frontmostBefore` / `frontmostAfter`, and an unmoved pointer.
+- Inspect `press --list`, press a radio/disclosure by substring and index, select a native popup item, and verify the selected state with AX or a screenshot.
+- Scroll a long page until a previously absent control appears; verify `scroll-to` visibility and `scroll --ax` scrollbar readback. Test `wait-text` for both appearance and `--gone`.
+- While locked and another app is frontmost, an explicit global input route must fail. Outside lock, a global route with a mismatched `--app` / `--pid` or `--expect-front` must fail before any text is sent.
+- In a disposable foreground document, compare `click --hold 90` and `key return --hold 40`; check normal click, right click and double click. Repeat against each target app; build/selftest success does not prove GUI delivery.
+- Launch MCP from the intended host, check its `responsibleProcessInfo`, try `observe` and `screenshot` with `max_side: 1024`, and confirm permission failures name that host. `request --open` should open the selected Settings pane.
+
+For permission-free checks: `./build.sh`, `build/xyzlcu-core version`, `build/xyzlcu-core --help`, and `scripts/selftest.sh` (CLI, C-client and MCP protocol checks). Do not run GUI recipes inside a sandbox lacking AX/GUI access.
 
 ## Record and replay
 
@@ -467,7 +518,7 @@ Exit codes
   4 control not found, wait timed out, input had no effect or --window mismatch; 5 daemon required but unreachable.
 
 Safety rules
-- Before every `type` / `key`, make sure the target app and window are frontmost (`active: true` in `xyzlcu apps`), or scope them with `--app` / `--window`.
+- Prefer `lock --pid N` and AX controls/text writes. Never permit global input silently; use `--expect-front "App"` for foreground workflows and inspect frontmostBefore/frontmostAfter plus verified.
 - Loop: observe → locate → act → verify. Re-run find / screenshot after acting to confirm the result.
 - Ask the user before irreversible actions such as paying, deleting, sending or submitting.
 - Never use `--force` to get around the lock-screen guard.
@@ -506,11 +557,11 @@ const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Bu
 
 `xyzlcu mcp` runs an MCP server over stdio (JSON-RPC 2.0, one message per line) for clients that only speak MCP and cannot run commands. Tools:
 
-- Read-only: `check`, `screenshot` (returns the image directly, JPEG by default), `apps`, `windows`, `cursor`, `ax`, `find`
-- Actions: `click_element`, `click`, `type_text`, `key`, `activate`
-- Background (v0.6.1): `lock` (`app`, `window_title`, `window_id`, `unlock`, `status`); `screenshot`, `ax`, `find`, `click_element`, `click`, `type_text` and `key` accept `background: true` (with `app`) for a one-off background action. While locked, `screenshot` defaults to scale 1 and `ax` accepts `focus` (`content` / `window` / `web`); `app` is optional for `ax` / `find`
+- Read-only: `check`, `observe` (frontmost app, target window, compact AX text), `screenshot`, `apps`, `windows`, `cursor`, `ax`, `find`, `wait_text`
+- Actions: existing `click_element`, `click`, `type_text`, `key`, `activate`; new `set_text`, `press` (`nth`, `list`, `async`), `select_popup_item` (`popup`, `item`), `scroll_to`
+- Background: `lock` accepts `app` or `pid`, `window_title` / `window_id`, `unlock`, `status`. Targeted tools accept `pid` / `app` and `background`; omit the app when locked. `ax` accepts `focus` (`content` / `window` / `web`). Input tools accept `allow_global` and `expect_front`; the same CLI safety guards apply.
 - Batch: `batch` (`steps` is an array of command strings, e.g. `["click-el TextEdit --title Save", "wait TextEdit --role AXSheet", "screenshot --diff"]`; one call runs them in order and returns each step's output and images; `continue_on_error` keeps going after a failure). Saves round trips and model turns; screenshot steps default to half-size JPEG
-- `screenshot` accepts `diff: true` to return only the changed area
+- `screenshot` defaults to fast JPEG, quality 0.6 and half scale, including locked windows. `max_side` caps the longest image dimension; `scale` overrides the default. `diff: true` returns only changed areas. Metadata includes coordinate conversion; use the returned scale, not an assumed 2× Retina factor.
 - Generic: `xyzlcu` (an `args` array, runs any subcommand except `mcp`, `serve`, `record`, `replay`, `batch` and `--stdout`)
 
 When a daemon is running, every tool call is forwarded to it; otherwise `xyzlcu mcp` itself is the long-lived process (it keeps capture streams too), so no new process is started per call.
@@ -556,9 +607,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 ## Benchmark (vs LCU)
 
+These tables preserve earlier version measurements. v0.7.0 has longer click/key holds and different AX routes; no v0.7.0 GUI benchmark is claimed here.
+
 **Where LCU still has the edge** (up front):
 
-- **Background operation**: LCU clicks and types without moving the real mouse or bringing the app to the front, so you can keep using the computer. XYZLCU's `click` / `type` really move the mouse and need the app in front. XYZLCU's paths that leave the foreground alone are `click-el` (AXPress), `type --app`, `menu` and `insert` / `settext`, but not every app supports them.
+- **Background operation**: both tools have background routes. XYZLCU now offers lock + AX-first control, with app-dependent limits documented above; the historical timing comparisons below used foreground XYZLCU input.
 - **Working with the model**: LCU sits on ChatGPT's CUA runtime, organizes actions per app, and is more tightly integrated with ChatGPT / Codex. The tables below compare single-operation latency only, not the ability to finish a whole task.
 
 ### 0.6.0 vs 0.5.0
@@ -653,7 +706,7 @@ Size of `ax --compact` output (same windows):
 - **`run` / MCP `batch` save round trips**: on the CLI, 3 calls take 17 ms and one `run` 12 ms. MCP is already connected to the daemon, so 3 tool calls and one `batch` cost about the same (16.1 vs 15.8 ms). What MCP `batch` really saves is the model's turns between tool calls (typically hundreds of ms to seconds each), which this table does not include.
 - **`--diff`**: when nothing changed the reply is a small JSON (3–4 ms, no image); otherwise only the changed area is returned. That saves the most tokens for agents that keep "taking a look".
 - In-process (no daemon) is about the same as 0.4.2; the time goes to process start-up and connecting to the window server. It is 1–2 ms slower than 0.4.2 because the C client `exec`s `xyzlcu-core`.
-- **LCU's click is slower (140 ms) but it is background delivery**: it does not move the real pointer or bring the app to the front, so the user can keep working. XYZLCU's `click` really moves the pointer. For background work XYZLCU has `click-el` (AXPress), `type --app`, `menu`, and `insert` / `settext`.
+- **Historical click comparison**: the old 140 ms vs 6 ms numbers compare different delivery paths. XYZLCU v0.7.0 adds hover/down-up holds; re-run the benchmark for current latency and separately verify background delivery.
 - **LCU types Chinese very slowly**: `你好abc` has a ~9 s median, while plain ASCII takes 43 ms. XYZLCU sends Unicode directly or writes via Accessibility, so both are equally fast.
 - **"—" in the LCU column means LCU has no such capability on Mac** (no pointer position/move, no full-screen screenshot, no window list; it works per app). It does not mean the test was skipped.
 - This compares single-operation latency only, not the ability to finish whole tasks. LCU sits on ChatGPT's CUA runtime and has strengths in model integration and background operation.
@@ -758,7 +811,7 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 
 ## Coordinate system
 
-- All coordinates are **global points**, with the origin at the **top-left of the main display**; x grows to the right and y grows downward.
+- Outside locked/background mode, coordinates are **global points**, with the origin at the **top-left of the main display**; x grows to the right and y grows downward.
 - **Points vs pixels**: on Retina displays 1 point = 2 pixels. Screenshots are in pixels, while `click` takes points. `screenshot` prints `pixelsPerPoint`, so `point = pixel / pixelsPerPoint`.
 - **`--scale`**: on a 2x display, `--scale 0.5` makes image pixels equal points. It's the simplest option and gives smaller images.
 - **Multiple displays**: `xyzlcu displays` lists each display's `x, y, w, h` (a secondary display can have negative x or y). `screenshot --display 2` captures display 2, and the output's `originX/originY` is that display's top-left in global coordinates: `global x = originX + pixelX / pixelsPerPoint`.
@@ -805,12 +858,13 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 - Each app request times out after 3 seconds, and output is capped at 3000 nodes.
 
 **Keys went to the wrong window?**
-- Keyboard events go to the frontmost app. `activate` first, then confirm with `apps`.
+- Global keyboard events go to the frontmost app. Prefer lock + AX/pid, or add `--expect-front "App"`. A named target that differs from the frontmost app is rejected before a global route runs; inspect `frontmostBefore` / `frontmostAfter`.
 
 ## Safety
 
 - With Accessibility permission, anything can be clicked or typed. Use it only where you trust the setup, and turn the switch off when you don't need it.
-- **Always confirm the frontmost app before `type` / `key`.** Otherwise text can land in another document, and a shortcut can close another window.
+- **Global input guard (v0.7.0)**: locked/background `type`, `key` and `click` refuse `events-hid` unless `--allow-global` is explicit. `--allow-foreground` is separate and does not grant global input. Even with `--allow-global`, an intended `--app` / `--pid` must be frontmost before a global route; `--expect-front "App"` adds the same guard without changing the target. Untargeted foreground input still goes to the current frontmost app.
+- **Input evidence**: JSON input results include `frontmostBefore` / `frontmostAfter`. Check the route and readback: `verified: "unknown"` is not successful delivery, and frontmost reporting does not prove that the intended control changed.
 - **Lock-screen guard**: while the screen is locked, `click / move / drag / scroll / type / key` refuse to run and exit with code 3. `--force` overrides this but isn't recommended.
 - **Recordings may contain what you typed**: they stay on this Mac (mode 0600), and no keys are recorded in password fields or while locked; delete them when done and don't share them. Check the frontmost window before `replay`, `type` or `key`.
 - Don't let an agent auto-confirm payment, deletion or sending dialogs.
@@ -821,10 +875,10 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 
 - macOS only, and only the logged-in user's GUI session. Nothing works while the screen is locked, and screenshots come out black.
 - On macOS 13 there is no ScreenCaptureKit capture; it falls back to `/usr/sbin/screencapture` (`-l windowID` for `--window`, `-R` for `--region`).
-- `press` matches the title, description, value or identifier exactly (case-insensitive) and takes the first match; use `find` / `click-el` with `--role`, `--index` and `--window` to be more precise.
+- `press` searches substrings in title, description, value, identifier and child text (case-insensitive); use role + `--list` + `--nth` to disambiguate. Asynchronous acceptance means the AX action was started, not that a popup item was selected.
 - `type` bypasses the input method, so it doesn't suit cases that need IME suggestions.
 - No management of windows on other Spaces (desktops).
-- Background / window-locked mode: see the [limits](#background--window-locked-mode-v061) there (App Nap delays, menu items disabled in the background, ignored posted mouse events, no drag, no minimized windows).
+- Background / window-locked mode: see the [limits](#background--window-locked-mode-v070) there (App Nap delays, menu items disabled in the background, ignored posted mouse events, no drag, no minimized windows).
 - The daemon's app table is refreshed at most every 10 s: a background process that becomes a regular app without being activated can take up to 10 s to show up in `apps` (looking an app up by name rescans immediately on a miss, so that is not affected).
 - A window shot cropped from the display stream shows the desktop outside the rounded corners instead of transparency. Covered windows, windows spanning displays, or displays without a running stream fall back to capturing the window on its own.
 
@@ -841,6 +895,8 @@ Then, in System Settings > Privacy & Security, turn off or remove any apps you n
 > To keep using the old name: `ln -sf ~/.local/bin/xyzlcu ~/.local/bin/macctl`
 
 ## Changelog
+
+- **0.7.0**: focus-first AX writes, pid targeting, deep press and popup selection, AX scrolling and text waits, guarded HID input, timing controls, TCC host diagnostics, compact MCP observation and screenshot limits. See [CHANGELOG.md](CHANGELOG.md) for the release summary.
 
 - **0.6.1**: window-locked background mode and fixes.
   - **`lock` / `unlock` / `--background`**: lock one window; screenshots of that window only (ScreenCaptureKit, works when covered), clicks via Accessibility (focus / press / select / show menu) then posted to the process, typing via AX then process keys, ⌘ combos via the menu, Esc / Return via the dialog's Cancel / default button, scrolling via the scroll bar. Window-relative coordinates, a `route` field on every result, pointer and frontmost app checked after each action. `drag` / `move` / `activate` are refused unless `--allow-foreground`. MCP: new `lock` tool and a `background` parameter.
