@@ -4,7 +4,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-**Version 0.7.0** — focused AX text writes, deep controls and guarded background input. See [CHANGELOG.md](CHANGELOG.md).
+**Version 0.7.0** — single-window background control with a strict default lock, AX/pid routes and contention evidence. See [CHANGELOG.md](CHANGELOG.md).
 
 [![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#requirements) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![Agents: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#supported-agents)
 
@@ -16,12 +16,74 @@
 
 > Inspired by and borrows ideas from [LCU (Local Computer Use)](https://github.com/amontlabs/lcu) by Amont Labs, with thanks (see [Acknowledgements](#acknowledgements)). XYZLCU is an **independent implementation**: it copies no LCU code and does **not** need the ChatGPT / Codex desktop app or its runtime. For a speed and usability comparison with LCU, see [Benchmark](#benchmark-vs-lcu).
 
+<a id="background--window-locked-mode-v070"></a>
+
+## Single-window background control
+
+Lock **one window in one process** so an agent can work while you keep using the Mac. Strict mode is the default: XYZLCU uses Accessibility inside that target or events posted to its pid; it does not move the system pointer, activate/raise the app, send global HID keystrokes, or modify the shared pasteboard. AX focus may change **inside the target app**. Unsupported actions fail instead of silently switching to foreground input.
+
+```bash
+xyzlcu windows
+xyzlcu lock --app TextEdit --window-title "Notes"   # or --window-id N; --pid P avoids same-name apps
+xyzlcu set-text --role AXTextArea "Hello from AX" --assert-no-contention
+xyzlcu type --via pid " — 你好 😀" --assert-no-contention
+xyzlcu value --role AXTextArea
+xyzlcu menu "Edit|编辑>Select All|全选" --assert-no-contention
+xyzlcu screenshot --out /tmp/notes.png --assert-no-contention
+xyzlcu lock --status
+xyzlcu unlock
+```
+
+Use `lock --pid P --window-id N` when an app has multiple windows. An unreadable/corrupt persisted lock fails closed; an exited app or closed window does not silently clear the lock. Recover explicitly with `unlock` or a new `lock`. The lock persists next to `XYZLCU_SOCKET` (default `~/.xyzlcu/lock.json`) and is shared by CLI/daemon/MCP using that socket. Explicit app/pid/window selectors must agree with it. `--background --app A [--window-title T]` applies the policy to one command. Coordinates and AX centers under lock, and origins/diffs for every targeted window screenshot, are **window-relative points**, with `(0,0)` at the window's top left; image pixels still need the reported scale conversion.
+
+For MCP, call `lock` with `{"app":"TextEdit","window_title":"Notes"}` or `{"pid":1234,"window_id":5678}`, then `set_text` with `{"role":"AXTextArea","text":"Hello","assert_no_contention":true}`, `type_text` with `{"text":"你好","via":"pid","assert_no_contention":true}`, and `screenshot` with `{}`. Tool arguments `allow_foreground`, `allow_global` and `assert_no_contention` correspond to CLI flags; `lock` accepts `unsafe:true` and `unlock:true`. The generic `xyzlcu` tool accepts CLI arguments when a dedicated tool lacks a flag.
+
+| Action | Strict background route | Evidence / limits |
+|---|---|---|
+| `set-text`, `insert`, `type` | `ax-focus-value` → `ax-selected-text` → `pid-keys` where supported; `type --via pid` forces pid Unicode | AXFocused / app AXFocusedUIElement first, AXValue readback; no menu-paste fallback in strict mode |
+| `click`, `click-el`, `press`, `select` | `ax-focus` / `ax-press` / `ax-select` / `ax-showmenu`, then `pid-mouse` where supported | Window-relative hit testing; AX state/value changes can be verified; posting alone cannot |
+| `key`, `menu` | Safe AX edit menu/default/cancel action or `pid-keys` | Strict app-menu allowlist: Edit > Select All / Undo / Redo (English/Chinese). App-wide New/Open/Quit and unknown menu scope are refused |
+| `scroll`, `scroll-to` | `ax-scrollbar` / AXScrollToVisible / bounded AX traversal, then `pid-scroll` | App may ignore pid events; inspect the resulting AX state |
+| `screenshot` | `sck-window`: ScreenCaptureKit `SCContentFilter(desktopIndependentWindow:)` | Only the selected window; covered-window capture does not crop the desktop |
+| `move`, `drag`, `open`, `activate`, `hide`, `movewin`, `replay` | Refused | Require an explicit command override; no automatic foreground fallback |
+
+Pid mouse events convert window points to global event locations, set target window-number fields and hold down/up long enough for the target to process them. They use public `CGEvent.postToPid`; this is process-directed delivery, not a guarantee that every app honors the intended window. No private SLEvent/PSN posting route is required. `route` reports the actual route. `verified:true` means a supported state/value check succeeded; `verified:false` with `reason` means delivery/effect was not verified. A successful post is not proof of delivery. A bounded target AX tree change is only an observed change, not proof that the requested semantic outcome occurred. If an AX write is accepted but its readback is ambiguous, the action stops to avoid duplicate input.
+
+Every JSON object includes `frontmostBefore`, `frontmostAfter` and `contention` (pointer or frontmost pid changed); legacy list/plain/binary output formats retain their shape. `--assert-no-contention` / MCP `assert_no_contention:true` makes detected contention a failure. These are before/after snapshots, not continuous monitoring: they cannot detect a temporary focus switch that switches back or attribute a user's own mouse movement. A target app can activate itself in response to an AX action; XYZLCU reports observed contention but cannot undo an already executed action. For asynchronous `press` and popup workers, the parent result only covers dispatch-time snapshots: worker completion, delayed app effects and later contention remain unobserved. Re-observe/read back after completion. The guarantee is the input policy, not control over another app's implementation.
+
+**Explicit escape hatches and compatibility changes.** `--allow-global` permits global HID/pasteboard use for **this command only**; global HID still requires the target already frontmost. `--allow-foreground` permits foreground/global routes for **this command only**, intentionally leaving the no-contention contract. `lock --unsafe` persistently relaxes the lock's safety policy until replaced/unlocked. Neither override is needed for normal AX/pid control. Strict locks reject `--no-lock` unless an explicit escape flag is also provided. Old scripts relying on clipboard fallback, broad app menus, activation, dragging, full-display captures, or `--no-lock` under a strict lock must change. Refusal is JSON, for example:
+
+```json
+{"error":"refused: would use global input","hint":"Use AX/pid, or explicitly opt in for this command."}
+```
+
+**Side-effect audit (strict lock).**
+
+| Command/path | Hidden or global side effect | Strict policy |
+|---|---|---|
+| `type/key --via events`, click fallback | Global HID stream / foreground keyboard | Refuse; never silently fall back |
+| `type/set-text/insert --via paste`, `cmd+c/x/v` | Shared pasteboard, even with AX menu paste | Refuse without `--allow-global`; normal AX typing never uses clipboard fallback |
+| `move`, `drag`, ordinary mouse paths | CGWarpMouse / global mouse-down, up, wheel | Refuse; use window AX/pid routes for click/scroll |
+| `open`, `activate`, `hide`, `movewin`, `menu --activate` | Activation, raise, visible window/layout changes | Refuse without foreground override |
+| `menu`, shortcut menu lookup, `press/select` targeting menus | App-wide commands can escape a document or open dialogs | Window-scoped AX only; safe edit-menu allowlist; ambiguous app menus and unrelated popup roots refused |
+| `check --probe` | Tagged Shift-up and mouse-move HID health probes | Refuse; ordinary `check` only reads health metadata |
+| `request`, `request --open` | System permission prompts / opening System Settings | Refuse while strictly locked; grant permissions before locking |
+| `replay` | Recorded global key/mouse events | Refuse without explicit escape |
+| `screenshot` | Accidental full display / desktop crop exposing other apps | Confine to locked window; conflicting display/region/window selectors refused |
+| AX focus / value / press / selection | Target-local focus and application-defined actions | Never activate or post HID; inspect value/state and contention |
+
+**Honest limits.** Some web views, games, Electron/Chromium surfaces and background document shortcuts ignore per-process events; App Nap can delay them. WKWebView often needs AX focus before value insertion or pid typing. AX focus is not caret placement. Secure input fields may refuse read/write and cannot be verified. Hover-only UI and drag/drop have no strict route. A separate process's system/open/save panel is outside the lock, including TCC dialogs. A closed/stale target fails rather than retargeting another window.
+
+ScreenCaptureKit can capture a covered window and the OS-provided backing surface of a partly off-screen window. Minimized windows and windows on other Spaces may be absent, stale, blank or unavailable, depending on macOS/app state; XYZLCU does not unminimize, switch Spaces or activate to capture them. Targeted window capture supports macOS 13+ (one-frame SCStream on macOS 13, SCScreenshotManager/live window streams on macOS 14+) and fails if the window-only route is unavailable; `--cli` is refused for window targets. It never falls back to full-display capture. `windowFrame` separately reports the global window bounds; `originX/originY` and `diff.rects` are window-relative. Check `route`, `method` and the image. TCC permissions belong to the **responsible launching app** (Terminal, your agent host, or daemon launcher): check `whoami` / `check`, grant Accessibility and Screen Recording there, and restart that host.
+
+Manual acceptance on an authorized Mac: `./scripts/bg_selftest.sh`. Keep another app (such as Terminal) frontmost and the pointer still. It opens a disposable TextEdit file with `open -g`, uses an isolated lock/socket and the built core directly, then checks AX writing, pid Unicode typing, AX Edit > Select All, a window screenshot, document value and unchanged frontmost/pointer. It never sends global input. It prints a PASS/FAIL table and retains artifacts for inspection; a disabled background menu is an honest FAIL. Build and permission-free tests do not establish real-app acceptance.
+
 ## Why XYZLCU (highlights)
 
 The numbers below are historical v0.5.0–0.6.1 measurements, not v0.7.0 timings: clicks now include a 60 ms hold and 75 ms hover delay, and keys a 30 ms hold. All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see [Benchmark](#benchmark-vs-lcu) for the method and full data. The LCU numbers come from the 0.4.2 round on the same machine (LCU 0.13.4). LCU does some things better than XYZLCU too, and those are listed in [Benchmark](#benchmark-vs-lcu) as well.
 
 - 🔌 **Supports Grok, Codex, ChatGPT, Claude, DeepSeek** and other major agents: anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node, and shell scripts; ChatGPT, Claude and DeepSeek use the same interface and are compatible (not yet tested first-hand). See [Supported agents](#supported-agents).
-- 🪟 **Window-locked background mode** (v0.6.1): `xyzlcu lock --app Safari` and the agent works inside that one window while you keep using the Mac: the pointer never moves and the app is never activated; clicks and typing go through Accessibility first and every result says which `route` it took. Measured on TextEdit, Finder and Safari, honest limits included. See [Background / window-locked mode](#background--window-locked-mode-v070).
+- 🪟 **Single-window background control** (v0.7.0): strict `lock` confines actions/capture to one window and refuses global input, clipboard changes and activation by default. See [the policy, routes and limits](#single-window-background-control).
 - ⚡ **Fast**: with the daemon running, `xyzlcu` is a tiny C program, about **3 ms** per call.
 
   | Operation | XYZLCU | LCU |
@@ -34,7 +96,7 @@ The numbers below are historical v0.5.0–0.6.1 measurements, not v0.7.0 timings
   | List apps | **3 ms** | 17 ms |
 
 - 🧠 **In-memory and diff screenshots**: `--base64` / `--stdout` produce the image in memory, with no file written, and a `--fast` half-size JPEG takes about **9 ms**. `--diff` returns only the region that changed; if nothing changed you get a short JSON reply (3–4 ms, no image), which suits agents that keep taking a quick look.
-- 🛣 **Focused AX text writes**: `set-text` (also `settext`) focuses the control through Accessibility, writes its value and reads it back. Background `type` prefers this route for text fields. The result reports `verified`, the actual `route`, and the frontmost app before and after. Failed AX writes can try selected-text insertion and menu paste; global typing is explicitly guarded.
+- 🛣 **Focused AX text writes**: `set-text` (alias `settext`) AX-focuses the target, writes its value and verifies readback; strict background typing can use AXSelectedText or pid Unicode, with no clipboard fallback.
 - 🪙 **Saves tokens**: `ax --compact` lists only actionable controls, one per line with a number and a center point; `click-el --ref N` then presses by number. Finder's control tree with the menu bar goes from **13.7 KB to 0.4 KB**, and a TextEdit window from 740 to 243 bytes.
 - 🧰 **Full feature set**: mouse position and movement, drag, scroll, full-screen / window / region screenshots, the window list, moving and resizing windows, the display list, pressing menus in the background, the control tree and pressing controls, waiting for a control to appear, and record / replay. LCU on the Mac has no mouse position or movement, no full-screen screenshots and no window list.
 - 🔒 **Safety**:
@@ -47,12 +109,12 @@ The numbers below are historical v0.5.0–0.6.1 measurements, not v0.7.0 timings
 
 ## Features
 
-- **v0.7.0**: `--pid` targeting; focused, verified `set-text`; deep `press --nth/--list/--async`; native popup `select`; `scroll-to` / `scroll --ax`; `wait-text`; text-only `observe`; global input safety guards; host-aware permission diagnostics.
+- **v0.7.0**: strict single-window background control; `--pid`; verified `set-text`; deep `press` / `select`; AX scroll / text waits; contention assertions; permission-aware MCP. See the headline section for safety changes.
 
 - 📸 **Screenshots**: a whole display, a single window (`--window`) or a region (`--region`), optional downscaling, `--fast` for a small JPEG in one flag; prints the point/pixel mapping
 - 🧠 **In-memory screenshots** (v0.4.2): `--base64` / `--stdout` produce the image in memory without writing a file; the daemon keeps capture streams on demand, so repeated captures of the same window take about 20 ms
 - 🚀 **Faster in v0.5.0**: a tiny C client (~3 ms per call), the main display stream pre-opened at daemon start (`--fast` ~9 ms), parallel PNG encoding (full-size PNG 171 → 31 ms), JPEG / HEIC, `--diff` returns only what changed, and an MCP `batch` tool
-- 🪟 **v0.6.1**: window-locked background mode (`lock` / `--background` / MCP `lock`): window-only screenshots, AX-first clicks, typing, keys and scrolling that never move the pointer or activate the app
+- 🪟 **Window locks**: CLI and MCP share one persisted target; v0.7.0 tightens the original v0.6.1 background mode to refuse unsafe fallbacks.
 - ⚡ **v0.6.0**: the daemon keeps its own app table (`apps` 10 → 3 ms, `ax` 27 → 5 ms, `find` 21 → 8 ms), uncovered windows are cropped straight from the display stream (first window shot 114 → 25 ms), `ax --compact` + `click-el --ref` to save tokens, and a stale daemon restarts itself after an upgrade
 - 🖱 **Mouse**: click, right-click, double-click, move, drag, scroll
 - ⌨️ **Keyboard**: types Unicode text directly (Chinese, emoji; bypasses the input method), key combos like `cmd+shift+4`
@@ -103,7 +165,7 @@ Swift Package Manager works too: `swift build -c release`, which outputs into `.
 
 ## Requirements
 
-- macOS 13 Ventura or later (built for `macos13`; tested on macOS 27)
+- macOS 13 Ventura or later (built for `macos13`; historical regressions include macOS 27). macOS 13 window capture uses a one-frame SCStream; that OS-specific runtime path still needs manual acceptance.
 - Apple Silicon or Intel (`build.sh` and the release produce a universal binary)
 - Building from source needs Xcode or the Command Line Tools (`xcode-select --install`)
 
@@ -153,7 +215,7 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 | `screenshot … --region x,y,w,h` | Capture just a region (global points) | `xyzlcu screenshot /tmp/r.png --region 100,100,400,300` |
 | `screenshot … --base64` | No file: the image is base64 in the JSON `base64` field (JPEG by default when no path is given) | `xyzlcu screenshot --fast --base64` |
 | `screenshot … --stdout` | No file: raw image bytes on stdout, metadata JSON on stderr | `xyzlcu screenshot --window Safari --stdout > w.jpg` |
-| `screenshot … --diff` | Return only what changed since the previous capture of the same target and scale: `diff.rects` (global points) and `changedPercent`, with the image cropped to the changed area; no image when nothing changed. Daemon / MCP only | `xyzlcu screenshot --fast --diff --base64` |
+| `screenshot … --diff` | Return only what changed since the previous capture of the same target and scale: `diff.rects` (window-relative points for window captures; global points otherwise) and `changedPercent`, with the image cropped to the changed area; no image when nothing changed. Daemon / MCP only | `xyzlcu screenshot --fast --diff --base64` |
 | `screenshot … --out path` / `--timing` | `--out` also writes a file; `--timing` adds per-stage `timingMs` | `xyzlcu screenshot --fast --base64 --timing` |
 | `displays` | Displays and their coordinate ranges | `xyzlcu displays` |
 | `click x y [--right] [--double] [--hold ms]` | Click; default 60 ms hold after a 75 ms hover delay | `xyzlcu click 500 300 --hold 90` |
@@ -207,11 +269,11 @@ Notes:
 - **`run` / `batch`**: quoting works like the shell (`"…"`, `'…'`, `\` escapes); lines starting with `#` are comments. By default execution stops at the first failing command, with that command's exit code, and the error names the step number; with `--continue-on-error` the remaining steps still run and the exit code is that of the last failing step (0 if all succeed). `find`, `click-el`, `wait` and `sleep` can be mixed in.
 - **`--hold ms`**: override down/up hold for this command (0–60000 ms); defaults are 60 ms for clicks and 30 ms for keys. `XYZLCU_CLICK_HOLD` changes the click default; it does not change hover delay. Overrides do not leak to the next daemon request.
 - **`--delay N`**: gap between synthesized mouse/keyboard events in ms (default 2). Raise it if a slow app drops input, e.g. `xyzlcu --delay 20 type …` or `XYZLCU_DELAY=20`.
-- **Screenshots**: on macOS 14+ capture goes through ScreenCaptureKit (in-process, rendered directly at the `--scale` size; `--window` captures only that window, even when covered; `--region` only that area); otherwise, or with `--cli`, it falls back to the system `screencapture`. The `method` field tells you which path ran, and `originX/originY` is the image's top-left in global points.
+- **Screenshots**: targeted/locked windows use ScreenCaptureKit window-only capture, with no display crop or global fallback. Untargeted display/region capture retains the system `screencapture` fallback on unsupported OS versions or `--cli`. `method` reports the route; `originX/originY` are window-relative for every window capture and global for display/region capture.
 
 ## Multiple input paths (when keyboard events are blocked)
 
-Sometimes a process's keyboard event tap hangs: keyboard events are posted but take ages to reach the app, or queue up and burst out much later, while the mouse still works. Since v0.4.0, `type` and `key` check event-stream health first, pick a path that works, and report the path actually used in the `path` field of their JSON output.
+Sometimes a process's keyboard event tap hangs: keyboard events are posted but take ages to reach the app, or queue up and burst out much later, while the mouse still works. Since v0.4.0, `type` and `key` check event-stream health first, pick a path that works, and report the path actually used in the `path` field of their JSON output. The foreground routes below describe unlocked operation; strict lock always takes precedence, excludes clipboard/HID fallback and restricts app menus.
 
 **Health check**
 
@@ -232,7 +294,7 @@ Sometimes a process's keyboard event tap hangs: keyboard events are posted but t
 | `menu` | `key` only: finds the menu item with the same shortcut and AXPresses it (e.g. `cmd+a` → Edit>Select All) | No | see below | — |
 | `ax-menu` | The `menu` command: AXPress by menu path | No | see below | — |
 
-**`type --via auto` (default)**
+**`type --via auto` (unlocked default; strict lock excludes global/paste routes)**
 
 - Healthy stream: `ax` when focus is a standard text control (`AXTextField` / `AXTextArea` / `AXComboBox` / `AXSearchField`), otherwise `events`.
 - Blocked stream: tries `ax` → `pid` → `paste`, verifying each by reading back and moving on only if it had no effect. It **never** uses `events-hid` while blocked, because those keystrokes would queue and burst out once the stream recovers.
@@ -242,7 +304,7 @@ Sometimes a process's keyboard event tap hangs: keyboard events are posted but t
 - `--via ax|events|pid|paste` forces one path; `XYZLCU_TYPE_VIA` changes the default.
 - `--window title`: refuses (exit code 4) unless the focused element is in a window whose title contains this text, so you never type into another document.
 
-**`key --via auto` (default)**
+**`key --via auto` (unlocked default; strict lock restricts shortcuts/menus)**
 
 - Healthy stream: `events` (`events-pid` with `--app`).
 - Blocked stream: first looks for a menu item with the same shortcut (matching `AXMenuItemCmdChar` / `AXMenuItemCmdModifiers` / `AXMenuItemCmdGlyph`, enabled items first) and presses it; keys with no menu item (arrows, return, …) go through `CGEventPostToPid`.
@@ -265,69 +327,12 @@ xyzlcu value TextEdit --window "My notes"                                  # rea
 ```
 
 - Target: the app's focused element by default. `set-text` accepts `--role`, `--title`, `--contains`, `--index`, or `--ref N` from compact AX output; use an app name or `--pid N`, with the lock/window scope where applicable. `--window title` constrains the target window.
-- Inspect the readback and `verified`: only `true` proves the expected AX value landed. `false` or `"unknown"` must not be treated as confirmed input; failures include the tried routes.
-- Native Cocoa text controls (TextEdit, Notes, most input fields) support this; some web pages and custom-drawn UIs don't, and then only `pid` / `paste` remain.
+- Inspect the readback and `verified`: only `true` proves the expected AX value landed. `false` with `reason` means the effect was not verified and must not be treated as confirmed input; failures include the tried routes.
+- Native Cocoa text controls usually support AX writes; web pages and custom UI may need pid events, which may be ignored. Clipboard routes require explicit relaxation under a strict lock.
 
 **`check` output**: `paths` lists whether events / mouse / ax / menu / pid / paste / record are usable (events and mouse include the measured `probeMs`); `typeOrder` / `keyOrder` show the order auto would try right now; `keyboardBlockedBy` lists the hung taps.
 
 **Limits**: `events-pid`, `menu` and `paste` bypass taps on the HID stream; if the app's own main thread is stuck, no path helps. To really fix it, restart the hung process (the one with `blocking: true` in `xyzlcu taps`) or log out / reboot. XYZLCU never kills processes for you.
-
-## Background / window-locked mode (v0.7.0)
-
-Like a sandboxed agent window: lock **one** app window and every following command acts only on it. The **real mouse pointer never moves, the app is never activated, and you can keep using the Mac** with the keyboard and mouse at the same time.
-
-```bash
-xyzlcu lock --app Safari --window-title "Example"     # or --window-id N (see `xyzlcu windows`)
-xyzlcu screenshot --out shot.png                       # just that window, even when it is covered by other windows
-xyzlcu ax --compact                                    # its controls, content area first, window-relative centers
-xyzlcu click 841 33                                    # window-relative points (here: the address bar)
-xyzlcu type -- "https://example.com/"
-xyzlcu key return
-xyzlcu scroll 0 -5 --at 800,600
-xyzlcu lock --status
-xyzlcu unlock
-```
-
-- Turn it on with `lock` (state in `~/.xyzlcu/lock.json`, shared by the CLI, the daemon and MCP), or per command with `--background` / `XYZLCU_BACKGROUND=1` plus `--app App [--window-title T]`, or the MCP `lock` tool / `background: true` parameter. `--no-lock` makes one command ignore the lock.
-- **Coordinates are window-relative** (points from the window's top-left corner). `ax --compact` and `find` report them the same way.
-- **Every result carries `route`**, the path actually used, plus `cursorMoved` and `frontmostChanged` (both checked after the action):
-
-| Action | Routes, in order | Notes |
-|---|---|---|
-| `screenshot` | `sck-window` | ScreenCaptureKit captures the window by itself, so covered windows come out whole |
-| `click` | `ax-focus` / `ax-press` / `ax-select` / `ax-showmenu` (right click), then `pid-mouse` | Accessibility hit-test at the point, walking up to the nearest control; toolbar fields under a label are found with a small nearby search (`nearby: true`). `--via ax\|pid` forces one |
-| `type` | `ax-focus-value`, then AXSelectedText / menu paste | Focused AX text insertion is read back (`verified`); explicit `--via pid` remains available but WebViews may ignore it |
-| `key` | `ax-menu` for ⌘ combos with an enabled menu item; Esc / Return press the dialog's Cancel / default button (`ax-press-cancel` / `ax-press-default`); otherwise `pid-keys` | `--via pid\|menu` forces one |
-| `scroll` | `ax-scrollbar` (sets the scroll bar's value, ~40 pt per line), then `pid-scroll` | `--via ax\|pid` |
-| `drag`, `move`, `activate` … | refused (exit code 6) | they need the real pointer or the foreground; `--allow-foreground` activates the app and uses the normal path |
-
-Historical v0.6.1 measurements, before v0.7.0 timing and text-route changes: on an Apple Silicon Mac with the target window covered by another app (pointer stayed put and the frontmost app never changed in every case):
-
-| App | Action | Route | Time | Read back |
-|---|---|---|---:|---|
-| TextEdit | click the text area | `ax-focus` | 14 ms | focus moved |
-| TextEdit | type text | `ax-selected-text` | 10 ms | value contains the text |
-| TextEdit | `type --via pid` | `pid-keys` | 85 ms | value contains the text |
-| TextEdit | `key return` / `backspace` | `pid-keys` | 2–3 ms | value and screenshot |
-| TextEdit | Esc in the Open panel | `ax-press-cancel` | 232 ms | panel closed |
-| Finder | click the List view button | `ax-press` | 131 ms | button value 0 → 1 |
-| Finder | click Search, type a name | `ax-press`, `ax-selected-text` | 104 ms, 33 ms | result list shows the file |
-| Finder | window screenshot | `sck-window` | ~80 ms | full window |
-| Safari | click the address bar | `ax-focus` (`nearby`) | 171 ms | field focused |
-| Safari | type a URL, `key return` | `ax-selected-text`, `pid-keys` | 15 ms, 3 ms | page loaded |
-| Safari | click a link | `ax-press` | 7 ms | page navigated (after the network load) |
-| Safari | scroll | `ax-scrollbar` | 5 ms + 80 ms read-back | links moved by 200 pt for 5 lines |
-| Safari | window screenshot | `sck-window` | ~68 ms | full window |
-
-**Honest limits** (what does not work, or not reliably):
-
-- **Background apps can act late.** macOS throttles background apps (App Nap). A TextEdit ⌘S sent to the background was sometimes applied seconds later, or only after the next event. Verify the effect (read the file back, take a screenshot) instead of trusting `ok`, or use `--allow-foreground`.
-- **Menu items that act on the document are often disabled while the app is in the background** (e.g. Safari's Close Tab). `key` then falls back to `pid-keys`, which many apps ignore for ⌘ combos.
-- **Posted mouse events are often ignored.** Safari web content ignored `pid-mouse` clicks and `pid-scroll` wheel events in our tests; that is why the AX routes go first. `ax-focus` focuses a text field but does not move the caret to the clicked spot.
-- Esc in an open / save panel is done by pressing its Cancel button (found by title); keys posted to the panel's process are ignored while the app is in the background.
-- Hover-only controls (e.g. a tab's close button) and drag-and-drop are not reachable.
-- Minimized windows and windows on other Spaces are not supported. If the locked window closes, commands fail with exit code 4 until you `unlock`.
-- A permission prompt (TCC) or any system dialog is out of scope and never clicked.
 
 ## Driving WKWebView/Tauri/Electron apps in the background
 
@@ -349,7 +354,7 @@ xyzlcu wait-text --pid 1234 "Generating" --gone --timeout 60
 xyzlcu unlock
 ```
 
-`set-text` sets AXFocused on the control before writing AXValue (`route: "ax-focus-value"`). It may set the app's AXFocusedUIElement or window's AXMain, but never activates the app or posts global events for that route. On failed readback it tries AXSelectedText, then pid-scoped menu paste. It does not silently turn into global typing. `type` in background mode uses the same focus-first write logic while preserving insertion semantics.
+`set-text` sets AXFocused on the control and the app AXFocusedUIElement before writing AXValue (`route: "ax-focus-value"`), without activation. It can try AXSelectedText; background `type` can then use pid Unicode. Strict mode never falls back to clipboard/menu paste or global typing. AX readback verifies text, while an unsupported pid route reports its verification limit.
 
 Native HTML selects expose AXPopUpButton rather than a writable value. Their AXPress can block until the menu closes; `select` opens asynchronously, finds the app-owned AXMenuItem and presses it. `press --list` shows index, role, title, frame, enabled and focused so child-text labels and duplicate controls can be inspected first.
 
@@ -403,7 +408,7 @@ xyzlcu serve --stop     # stop it
 - **Capture streams (v0.4.2)**: the first time the daemon captures a window / display / region, it opens a ScreenCaptureKit stream for it in the background; later screenshots take the latest frame (`method: "screencapturekit-stream"`) instead of capturing again. Since v0.5.0 each scale has its own stream, scaled on the GPU (until a new scale's stream has a frame, an existing stream's frame is scaled on the CPU once). At most 4 streams at a time; a stream unused for 20 s is stopped (`XYZLCU_STREAM_IDLE=seconds`). A screenshot right after a click or typing waits for a newer frame (up to 0.12 s), so it never returns the pre-action picture. While a stream is open, macOS shows its screen-recording indicator in the menu bar; that is expected. `XYZLCU_STREAM=0` disables streams. `liveStreams` in `xyzlcu serve --status` lists the open streams.
 - **Prewarm the main display (v0.5.0)**: at start-up the daemon opens full-size and half-size streams for the main display (`XYZLCU_PREWARM_SCALES=1,0.5`), so even the first screenshot takes 25–35 ms instead of 170–210 ms. **Trade-off**: while the daemon runs, the menu bar shows the screen-recording indicator; the two streams use about 45 MB of memory and the GPU does a little scaling whenever the screen changes. Prewarmed streams close after 600 s unused (`XYZLCU_PREWARM_IDLE=seconds`) and reopen on demand. To opt out: `XYZLCU_PREWARM=0 xyzlcu serve --background`.
 - **PNG encoding (v0.5.0)**: a built-in multi-threaded PNG encoder (zlib level 1, bands compressed in parallel) keeps the capture's color space and embeds its ICC profile. Pixels are identical to ImageIO's output; files are somewhat larger. `XYZLCU_PNG=imageio` switches back to the system encoder, `XYZLCU_PNG_LEVEL=0-9` sets the compression level.
-- **Window shots cropped from the display stream (v0.6.0)**: when a window is not covered by other windows, lies inside one display, and that display's stream is running, `--window` crops it from the stream's latest frame (`method: "display-stream-crop"`), so even the first shot of a window takes about 25 ms. The area outside the rounded corners is desktop, not transparent. Disable with `XYZLCU_WINDOW_CROP=0`.
+- **Targeted window capture (v0.7.0)**: locked/targeted windows always use the desktop-independent ScreenCaptureKit window filter. The old v0.6.0 `display-stream-crop` optimization is bypassed for these captures so pixels from other apps cannot enter the image. Historical crop timings below do not describe this route.
 - **App table (v0.6.0)**: the daemon keeps its own list of running apps (updated from launch / terminate / activate / hide notifications, fully refreshed at most every 10 s), so `apps` and app lookups no longer query LaunchServices process by process.
 - To start it at login you can write your own LaunchAgent (`~/Library/LaunchAgents/*.plist` with `ProgramArguments` = `xyzlcu serve`). In that case the responsible process is the launchd-started xyzlcu binary itself, which then needs its own permissions in System Settings: grant them to the `xyzlcu-core` binary (and put `xyzlcu-core serve` in `ProgramArguments`). XYZLCU never installs a LaunchAgent for you.
 
@@ -505,7 +510,7 @@ Common commands (output is JSON or `ok`)
   `xyzlcu screenshot --window "App" --base64`, `xyzlcu screenshot /tmp/s.jpg --region x,y,w,h`
 - Press a control: `xyzlcu click-el "App" --role AXButton --title Save`
 - Token-cheap look: `xyzlcu ax "App" --compact` lists only actionable controls (`[3] Button "Save" @612,340`), then `xyzlcu click-el --ref 3` presses by number
-- Click a point: `xyzlcu click x y` (global points; convert screenshot pixels with pixelsPerPoint and originX/originY)
+- Click a point: `xyzlcu click x y` (window-relative points under lock, global points otherwise; convert image pixels with pixelsPerPoint and originX/originY)
 - Type: `xyzlcu type --app "App" --window "Window title" "text"` (check `path` and `verified` in the output)
 - Keys: `xyzlcu key --app "App" cmd+s`
 - Apps: `xyzlcu apps`, `xyzlcu activate "App"`
@@ -559,7 +564,7 @@ const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Bu
 
 - Read-only: `check`, `observe` (frontmost app, target window, compact AX text), `screenshot`, `apps`, `windows`, `cursor`, `ax`, `find`, `wait_text`
 - Actions: existing `click_element`, `click`, `type_text`, `key`, `activate`; new `set_text`, `press` (`nth`, `list`, `async`), `select_popup_item` (`popup`, `item`), `scroll_to`
-- Background: `lock` accepts `app` or `pid`, `window_title` / `window_id`, `unlock`, `status`. Targeted tools accept `pid` / `app` and `background`; omit the app when locked. `ax` accepts `focus` (`content` / `window` / `web`). Input tools accept `allow_global` and `expect_front`; the same CLI safety guards apply.
+- Background: `lock` accepts `app` / `pid`, `window_title` / `window_id`, `unsafe`, `unlock`, `status`. Tools accept `allow_foreground`, `allow_global`, `assert_no_contention` and `expect_front`; these map to the CLI policy. Omit the app when locked. `ax.focus` is `content`, `window` or `web`.
 - Batch: `batch` (`steps` is an array of command strings, e.g. `["click-el TextEdit --title Save", "wait TextEdit --role AXSheet", "screenshot --diff"]`; one call runs them in order and returns each step's output and images; `continue_on_error` keeps going after a failure). Saves round trips and model turns; screenshot steps default to half-size JPEG
 - `screenshot` defaults to fast JPEG, quality 0.6 and half scale, including locked windows. `max_side` caps the longest image dimension; `scale` overrides the default. `diff: true` returns only changed areas. Metadata includes coordinate conversion; use the returned scale, not an assumed 2× Retina factor.
 - Generic: `xyzlcu` (an `args` array, runs any subcommand except `mcp`, `serve`, `record`, `replay`, `batch` and `--stdout`)
@@ -644,7 +649,7 @@ Size of `ax --compact` output (same windows):
 
 - **The biggest bottleneck was NSRunningApplication**: sampling the daemon showed `apps` spending almost all of its time in synchronous `_LSCopyApplicationInformation` XPCs. `NSWorkspace.runningApplications` returns fresh objects every time, and the first property read on each one (even `processIdentifier`) asks LaunchServices, about 8–15 ms for 140 processes. A per-pid cache does not help (reading the pid is the slow part), so the daemon now keeps its own app table. `find`, `ax` and window screenshots all look up the app first, so they all got faster.
 - **Control tree**: 6–8 IPCs per control became one `AXUIElementCopyMultipleAttributeValues`.
-- **First window capture**: it used to take an `SCScreenshotManager` grab (~55 ms) and then open a window stream. Now, if the window is not covered, lies inside one display, and that display's stream is running (the daemon prewarms the main display by default), the window is cropped from the latest display frame. Covered windows keep the old path (~80 ms), since a crop would include whatever is in front. The coverage check ignores non-normal-layer windows that fill a whole display (the Dock, full-screen transparent overlays); otherwise every window would count as covered.
+- **Historical v0.6.0 first window capture** (removed in v0.7.0): it used to take an `SCScreenshotManager` grab (~55 ms) and then open a window stream. Now, if the window is not covered, lies inside one display, and that display's stream is running (the daemon prewarms the main display by default), the window is cropped from the latest display frame. Covered windows keep the old path (~80 ms), since a crop would include whatever is in front. The coverage check ignores non-normal-layer windows that fill a whole display (the Dock, full-screen transparent overlays); otherwise every window would count as covered.
 - **Not changed**:
   - The ~13 ms fixed cost of an in-process call (no daemon) is loading the Swift runtime and AppKit and friends; code cannot remove it. The answer is the daemon + C client (3 ms).
   - `--fast` already gets small frames straight from the GPU, ~9 ms, mostly encoding and transfer.
@@ -827,6 +832,7 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 | 3 | Screen is locked; mouse/keyboard input refused |
 | 4 | `find` / `click-el` found no control, `wait` timed out, `type` / `key` found no working input path, or the `--window` guard refused |
 | 5 | `XYZLCU_DAEMON=1` is set but the daemon can't be reached |
+| 6 | Strict background/global-input refusal, or contention assertion failure |
 
 ## Troubleshooting
 
@@ -863,8 +869,8 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 ## Safety
 
 - With Accessibility permission, anything can be clicked or typed. Use it only where you trust the setup, and turn the switch off when you don't need it.
-- **Global input guard (v0.7.0)**: locked/background `type`, `key` and `click` refuse `events-hid` unless `--allow-global` is explicit. `--allow-foreground` is separate and does not grant global input. Even with `--allow-global`, an intended `--app` / `--pid` must be frontmost before a global route; `--expect-front "App"` adds the same guard without changing the target. Untargeted foreground input still goes to the current frontmost app.
-- **Input evidence**: JSON input results include `frontmostBefore` / `frontmostAfter`. Check the route and readback: `verified: "unknown"` is not successful delivery, and frontmost reporting does not prove that the intended control changed.
+- **Strict lock (v0.7.0)**: AX/pid only by default; global input, pasteboard routes, foreground actions, app-wide/unknown menus and health probes are refused. `--allow-global` and `--allow-foreground` are explicit command-local escape hatches; `lock --unsafe` persists relaxation. See [the complete side-effect audit](#single-window-background-control).
+- **Input evidence**: JSON input results include `frontmostBefore` / `frontmostAfter`. Check the route and readback: `verified:false` with `reason` is not confirmed delivery, and frontmost reporting does not prove that the intended control changed.
 - **Lock-screen guard**: while the screen is locked, `click / move / drag / scroll / type / key` refuse to run and exit with code 3. `--force` overrides this but isn't recommended.
 - **Recordings may contain what you typed**: they stay on this Mac (mode 0600), and no keys are recorded in password fields or while locked; delete them when done and don't share them. Check the frontmost window before `replay`, `type` or `key`.
 - Don't let an agent auto-confirm payment, deletion or sending dialogs.
@@ -874,13 +880,13 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 ## Limitations
 
 - macOS only, and only the logged-in user's GUI session. Nothing works while the screen is locked, and screenshots come out black.
-- On macOS 13 there is no ScreenCaptureKit capture; it falls back to `/usr/sbin/screencapture` (`-l windowID` for `--window`, `-R` for `--region`).
+- On macOS 13 display/region capture can fall back to `/usr/sbin/screencapture`; targeted windows instead use a one-frame ScreenCaptureKit SCStream (`method: "screencapturekit-window-stream-once"`) and fail if unavailable. This OS-specific route has compiled but has not been runtime-verified here.
 - `press` searches substrings in title, description, value, identifier and child text (case-insensitive); use role + `--list` + `--nth` to disambiguate. Asynchronous acceptance means the AX action was started, not that a popup item was selected.
 - `type` bypasses the input method, so it doesn't suit cases that need IME suggestions.
 - No management of windows on other Spaces (desktops).
-- Background / window-locked mode: see the [limits](#background--window-locked-mode-v070) there (App Nap delays, menu items disabled in the background, ignored posted mouse events, no drag, no minimized windows).
+- Background/window locks: see [the limits](#single-window-background-control): app-dependent AX/pid support, App Nap, disabled menus, secure fields and OS-dependent minimized/other-Space capture.
 - The daemon's app table is refreshed at most every 10 s: a background process that becomes a regular app without being activated can take up to 10 s to show up in `apps` (looking an app up by name rescans immediately on a miss, so that is not affected).
-- A window shot cropped from the display stream shows the desktop outside the rounded corners instead of transparency. Covered windows, windows spanning displays, or displays without a running stream fall back to capturing the window on its own.
+- Targeted window shots use only the independent window surface, exclude window shadows, and do not include desktop pixels outside the window. Unavailable capture geometry fails explicitly; no display crop or global fallback is used.
 
 ## Uninstall
 
@@ -896,7 +902,7 @@ Then, in System Settings > Privacy & Security, turn off or remove any apps you n
 
 ## Changelog
 
-- **0.7.0**: focus-first AX writes, pid targeting, deep press and popup selection, AX scrolling and text waits, guarded HID input, timing controls, TCC host diagnostics, compact MCP observation and screenshot limits. See [CHANGELOG.md](CHANGELOG.md) for the release summary.
+- **0.7.0**: single-window background control with strict locks, AX/pid input, window-only screenshots, contention snapshots/assertions and an isolated TextEdit acceptance script; focused AX writes, deep controls, scroll/text waits and TCC diagnostics. See [CHANGELOG.md](CHANGELOG.md).
 
 - **0.6.1**: window-locked background mode and fixes.
   - **`lock` / `unlock` / `--background`**: lock one window; screenshots of that window only (ScreenCaptureKit, works when covered), clicks via Accessibility (focus / press / select / show menu) then posted to the process, typing via AX then process keys, ⌘ combos via the menu, Esc / Return via the dialog's Cancel / default button, scrolling via the scroll bar. Window-relative coordinates, a `route` field on every result, pointer and frontmost app checked after each action. `drag` / `move` / `activate` are refused unless `--allow-foreground`. MCP: new `lock` tool and a `background` parameter.
