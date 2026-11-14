@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1 — 2026-11-14
+
+- Add an unlocked global input safety gate across CLI, daemon and MCP: HID/session keyboard events, HID mouse click/move/drag/scroll, and activation (including implicit/open-to-front) require explicit `--allow-global` or an intended `--app` / `--pid` already frontmost. Recheck immediately before each event batch and stop if the frontmost target changes. Refuse before creating a global CGEvent with non-zero status, `ok:false`, `GLOBAL_INPUT_REFUSED`, and the actual frontmost app. AX-only and `postToPid` routes are unchanged; auto routing cannot bypass the gate.
+- Never accept `XYZLCU_ALLOW_GLOBAL=1` as authorization. MCP tools that can emit global input expose `allowGlobal` (boolean, default `false`) and use the same gate.
+- A failed `lock`, including bad/empty window IDs, unknown options or missing targets, writes a persistent `lock-failed` tombstone and updates daemon state. Subsequent input fails with `LOCK_FAILED` until explicit `unlock` or a successful `lock`. Empty/missing option values are hard argument errors and never consume the next option.
+- Keep health/check/probe diagnostics passive: they never emit global keyboard/mouse input.
+- Extend permission-free selftests with CLI/C-client/MCP refusal paths, failed-lock chaining, option validation and rejected environment bypass. Tests never emit global input or activate apps. Keep background AX/pid routes intact; GUI acceptance remains a separate check.
+
 ## 0.7.0 — 2026-11-14
 
 - Make **Single-window background control** the headline feature. `lock` / MCP `lock` default to strict process+window scope: AX/pid only, no activation/raise, pointer warp, global HID, clipboard fallback, broad app menus or silent foreground fallback. Reject conflicting target selectors and unsafe `--no-lock` bypasses; corrupt/unreadable lock state fails closed, and an exited target retains its lock until explicit recovery. Errors include `error: "refused: would use global input"` and an actionable `hint`.

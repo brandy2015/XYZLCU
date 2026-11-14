@@ -27,7 +27,7 @@ func out(_ obj: Any) {
     if let d = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
        let s = String(data: d, encoding: .utf8) { emit(s) } else { emit("\(obj)") }
 }
-struct XErr: Error { let msg: String; let code: Int32; var hint: String? = nil }
+struct XErr: Error { let msg: String; let code: Int32; var hint: String? = nil; var policyCode: String? = nil }
 /// 出错时抛出，由最外层决定退出码（守护进程里不能直接 exit）
 func fail(_ msg: String, code: Int32 = 1) throws -> Never { throw XErr(msg: msg, code: code) }
 func dbl(_ s: String) throws -> Double { guard let v = Double(s) else { try fail("不是数字: \(s)") }; return v }
@@ -45,6 +45,21 @@ func option(_ name: String) -> String? {
     let end = args.firstIndex(of: "--") ?? args.endIndex
     if let i = argumentOptionIndex(name), i + 1 < end { let v = args[i+1]; args.removeSubrange(i...i+1); return v }
     return nil
+}
+/// Validate before consuming any options: an absent/empty value must never eat the next flag.
+func validateOptionValues(_ argv: [String]) throws {
+    let valued: Set<String> = ["--app", "--at", "--delay", "--depth", "--display", "--duration", "--expect-front", "--focus", "--format", "--h", "--hold", "--id", "--index", "--item", "--label", "--limit", "--max", "--max-nodes", "--max-side", "--nth", "--path", "--permission", "--pid", "--popup", "--quality", "--ref", "--region", "--role", "--scale", "--speed", "--subrole", "--timeout", "--title", "--via", "--w", "--window", "--window-id", "--window-title", "--worker-window-id", "--out", "-o"]
+    let end = argv.firstIndex(of: "--") ?? argv.endIndex
+    var i = 1
+    while i < end {
+        if valued.contains(argv[i]) {
+            guard i + 1 < end, !argv[i + 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !argv[i + 1].hasPrefix("--"), !argv[i + 1].hasPrefix("-") || Double(argv[i + 1]) != nil else {
+                throw XErr(msg: "argument error: \(argv[i]) requires a non-empty value", code: 1, policyCode: "ARGUMENT_ERROR")
+            }
+            i += 2
+        } else { i += 1 }
+    }
 }
 /// 路径类选项（--out 等）：值不能以 - 开头（多半是漏了值，把下一个选项吃进来了）
 func pathOption(_ names: String...) throws -> String? {
@@ -139,19 +154,22 @@ func permissionDiagnostic() -> String? {
 // MARK: - 鼠标
 func mainDisplayHeight() -> CGFloat { CGDisplayBounds(CGMainDisplayID()).height }
 /// 键盘事件的目标：nil = 系统 HID 事件流（发给前台应用）；设了 pid 就直接投递给该进程（--app）
+var globalEventsCreated = 0, globalEventsPosted = 0
 var keyTargetPid: pid_t? = nil
-func post(_ e: CGEvent?) { lastInputAt = Date(); e?.post(tap: .cghidEventTap) }
-func postKey(_ e: CGEvent?) { lastInputAt = Date(); if let p = keyTargetPid { e?.postToPid(p) } else { e?.post(tap: .cghidEventTap) } }
-func mouse(_ type: CGEventType, _ p: CGPoint, _ btn: CGMouseButton = .left, clicks: Int64 = 1) {
+func post(_ e: CGEvent?) throws { try guardGlobalInput(); if e != nil { globalEventsPosted += 1 }; lastInputAt = Date(); e?.post(tap: .cghidEventTap) }
+func postKey(_ e: CGEvent?) throws { if keyTargetPid == nil { try guardGlobalInput() }; lastInputAt = Date(); if let p = keyTargetPid { e?.postToPid(p) } else { if e != nil { globalEventsPosted += 1 }; e?.post(tap: .cghidEventTap) } }
+func mouse(_ type: CGEventType, _ p: CGPoint, _ btn: CGMouseButton = .left, clicks: Int64 = 1) throws {
+    try guardGlobalInput()
+    globalEventsCreated += 1
     let e = CGEvent(mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: p, mouseButton: btn)
     e?.setIntegerValueField(.mouseEventClickState, value: clicks)
-    post(e)
+    try post(e)
 }
-func click(_ p: CGPoint, right: Bool, double: Bool) {
+func click(_ p: CGPoint, right: Bool, double: Bool) throws {
     let (down, up, btn): (CGEventType, CGEventType, CGMouseButton) = right ? (.rightMouseDown, .rightMouseUp, .right) : (.leftMouseDown, .leftMouseUp, .left)
-    mouse(.mouseMoved, p); sleepMs(max(stepDelay, hoverDelayMs))
-    mouse(down, p, btn, clicks: 1); sleepMs(clickHoldMs); mouse(up, p, btn, clicks: 1)
-    if double { sleepMs(max(stepDelay, 40)); mouse(down, p, btn, clicks: 2); sleepMs(clickHoldMs); mouse(up, p, btn, clicks: 2) }
+    try mouse(.mouseMoved, p); sleepMs(max(stepDelay, hoverDelayMs))
+    try mouse(down, p, btn, clicks: 1); sleepMs(clickHoldMs); try mouse(up, p, btn, clicks: 1)
+    if double { sleepMs(max(stepDelay, 40)); try mouse(down, p, btn, clicks: 2); sleepMs(clickHoldMs); try mouse(up, p, btn, clicks: 2) }
 }
 
 // MARK: - 键盘
@@ -182,13 +200,17 @@ func parseCombo(_ combo: String) throws -> (CGKeyCode, CGEventFlags, String) {
     guard let k = key else { try fail("组合键里没有主键: \(combo)") }
     return (k, flags, name)
 }
-func postCombo(_ k: CGKeyCode, _ flags: CGEventFlags) {
-    let d = CGEvent(keyboardEventSource: eventSource, virtualKey: k, keyDown: true); d?.flags = flags; postKey(d)
+func postCombo(_ k: CGKeyCode, _ flags: CGEventFlags) throws {
+    if keyTargetPid == nil { try guardGlobalInput() }
+    if keyTargetPid == nil { globalEventsCreated += 1 }
+    let d = CGEvent(keyboardEventSource: eventSource, virtualKey: k, keyDown: true); d?.flags = flags; try postKey(d)
     sleepMs(keyHoldMs)
-    let u = CGEvent(keyboardEventSource: eventSource, virtualKey: k, keyDown: false); u?.flags = flags; postKey(u)
+    if keyTargetPid == nil { try guardGlobalInput() }
+    if keyTargetPid == nil { globalEventsCreated += 1 }
+    let u = CGEvent(keyboardEventSource: eventSource, virtualKey: k, keyDown: false); u?.flags = flags; try postKey(u)
 }
-func pressCombo(_ combo: String) throws { let (k, f, _) = try parseCombo(combo); postCombo(k, f) }
-func typeText(_ text: String) {
+func pressCombo(_ combo: String) throws { let (k, f, _) = try parseCombo(combo); try postCombo(k, f) }
+func typeText(_ text: String) throws {
     let src = eventSource
     let units = Array(text.utf16)
     var i = 0
@@ -197,10 +219,12 @@ func typeText(_ text: String) {
         if end < units.count, UTF16.isLeadSurrogate(units[end - 1]) { end -= 1 } // 不拆开代理对
         var chunk = Array(units[i..<end])
         for down in [true, false] {
+            if keyTargetPid == nil { try guardGlobalInput() }
+            if keyTargetPid == nil { globalEventsCreated += 1 }
             let e = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: down)
             e?.flags = []
             e?.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
-            postKey(e)
+            try postKey(e)
             if down { sleepMs(keyHoldMs) }
         }
         i = end; if i < units.count { sleepMs(stepDelay) }
@@ -431,6 +455,9 @@ func findApp(_ name: String) -> NSRunningApplication? {
 // MARK: - Shared targeting and input safety (also exercised by selftest)
 var commandTargetPid: pid_t? = nil
 var allowGlobalInput = false
+var explicitGlobalApp: String? = nil
+var verifiedGlobalTarget: pid_t? = nil
+var commandHasLock = false
 var expectedFrontName: String? = nil
 var inputFrontmostBefore: [String: Any]? = nil
 var inputResultEmitted = false
@@ -512,19 +539,54 @@ func frontmostInfo() -> [String: Any] {
 }
 /// Pure policy: permission to use HID never overrides an explicit foreground target.
 func globalInputRefusal(background: Bool, allow: Bool, target: pid_t?, front: pid_t, expected: pid_t?) -> String? {
+    if !background && !allow && target == nil { return "No lock and no verified frontmost target" }
     if background && !allow { return "Global HID input refused in locked/background mode; use AX/pid or explicitly --allow-global." }
     if let p = target, p != front { return "Global HID input refused: frontmost pid \(front) differs from target pid \(p)." }
     if let p = expected, p != front { return "Global HID input refused: --expect-front pid \(p) differs from frontmost pid \(front)." }
     return nil
 }
 func guardGlobalInput(targetPid: pid_t? = nil) throws {
+    try guardLockFailure()
+    // A lock removed by another CLI must not keep authorizing a running sequence.
+    commandHasLock = !noLock && readLock() != nil
+    func deny(_ reason: String, front snapshot: [String: Any]? = nil) throws -> Never {
+        let front = snapshot ?? frontmostInfo()
+        if !commandHasLock {
+            throw XErr(msg: "global input refused: no lock and no verified frontmost target; pass --app/--pid (must be frontmost) or --allow-global; frontmost: \(front["name"] ?? "unknown") (\(front["bundleId"] ?? ""), pid \(front["pid"] ?? -1)); \(reason)", code: 6, policyCode: "GLOBAL_INPUT_REFUSED")
+        }
+        try refuseGlobal(reason)
+    }
+    var target = verifiedGlobalTarget ?? commandTargetPid
+    if target == nil, let name = explicitGlobalApp {
+        guard let app = findApp(name) else { try deny("cannot find intended app \(name)") }
+        target = app.processIdentifier
+    }
+    // Only a caller-supplied --app/--pid authorizes an unlocked global route.
+    if commandHasLock { target = targetPid ?? target }
     var expected: pid_t? = nil
     if let name = expectedFrontName {
-        guard let a = findApp(name) else { try fail("--expect-front: cannot find app \(name)", code: 4) }
+        guard let a = findApp(name) else { try deny("cannot find --expect-front app \(name)") }
         expected = a.processIdentifier
     }
-    if let reason = globalInputRefusal(background: inputPolicy.strict, allow: inputPolicy.permitsGlobal, target: targetPid ?? commandTargetPid,
-                                       front: frontPid(), expected: expected) { try refuseGlobal(reason) }
+    // Resolve selectors first (findApp can run the run loop), then sample focus last.
+    let front = frontmostInfo(), frontProcess = pid_t(front["pid"] as? Int ?? -1)
+    let allow = commandHasLock ? inputPolicy.permitsGlobal : allowGlobalInput
+    if let reason = globalInputRefusal(background: commandHasLock && inputPolicy.strict, allow: allow, target: target,
+                                       front: frontProcess, expected: expected) { try deny(reason, front: front) }
+    if let p = targetPid, p != frontProcess { try deny("frontmost differs from event target pid \(p)", front: front) }
+    if let p = target { verifiedGlobalTarget = p }
+}
+
+/// Activation can change focus with explicit opt-in; otherwise its actual destination
+/// must be the already-frontmost named target (an unrelated --app cannot authorize it).
+func guardActivation(_ app: NSRunningApplication?) throws {
+    try guardGlobalInput()
+    if allowGlobalInput || (commandHasLock && inputPolicy.permitsForeground) { return }
+    guard let app = app else {
+        let front = frontmostInfo()
+        throw XErr(msg: "global input refused: no lock and no verified frontmost target; pass --app/--pid (must be frontmost) or --allow-global; frontmost: \(front["name"] ?? "unknown") (pid \(front["pid"] ?? -1)); cannot verify activation destination", code: 6, policyCode: "GLOBAL_INPUT_REFUSED")
+    }
+    try guardGlobalInput(targetPid: app.processIdentifier)
 }
 
 /// Pure matching helper shared by regular and deep element searches.
@@ -675,36 +737,7 @@ struct InputHealth {
 }
 var cachedHealth: InputHealth? = nil
 var forceProbe = false
-let probeMagic: Int64 = 0x58595A4C
-var probeHit: Double? = nil
-/// 主动探测事件流：发一个没有副作用的带标记事件（键盘：右 Shift 松开的 flagsChanged；鼠标：原地 mouseMoved），
-/// 用排在最后的只监听监听计时，看它多久走完整条事件流。返回毫秒；超时 = infinity；建不了监听 = -1
-func probeStream(keyboard: Bool, timeoutMs: Int) -> Double {
-    let type: CGEventType = keyboard ? .flagsChanged : .mouseMoved
-    let cb: CGEventTapCallBack = { _, _, ev, _ in
-        if probeHit == nil && ev.getIntegerValueField(.eventSourceUserData) == probeMagic {
-            probeHit = CFAbsoluteTimeGetCurrent(); CFRunLoopStop(CFRunLoopGetCurrent())
-        }
-        return Unmanaged.passUnretained(ev)
-    }
-    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .tailAppendEventTap, options: .listenOnly,
-                                      eventsOfInterest: evBit(type), callback: cb, userInfo: nil) else { return -1 }
-    let src = CFMachPortCreateRunLoopSource(nil, tap, 0)
-    CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
-    CGEvent.tapEnable(tap: tap, enable: true)
-    defer { CGEvent.tapEnable(tap: tap, enable: false); CFRunLoopRemoveSource(CFRunLoopGetCurrent(), src, .commonModes); CFMachPortInvalidate(tap) }
-    probeHit = nil
-    let e: CGEvent?
-    if keyboard { e = CGEvent(keyboardEventSource: nil, virtualKey: 0x3C, keyDown: false); e?.type = .flagsChanged; e?.flags = [] }
-    else { e = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGEvent(source: nil)?.location ?? .zero, mouseButton: .left) }
-    e?.setIntegerValueField(.eventSourceUserData, value: probeMagic)
-    let t0 = CFAbsoluteTimeGetCurrent(), deadline = t0 + Double(timeoutMs) / 1000
-    e?.post(tap: .cghidEventTap)
-    while probeHit == nil && CFAbsoluteTimeGetCurrent() < deadline {
-        _ = CFRunLoopRunInMode(.defaultMode, deadline - CFAbsoluteTimeGetCurrent(), true)
-    }
-    return probeHit.map { ($0 - t0) * 1000 } ?? .infinity
-}
+// Health diagnostics never construct or post keyboard/mouse events.
 /// 读取系统事件监听列表判断键盘 / 鼠标事件流是否健康。守护进程里缓存 1.5 秒
 /// XYZLCU_EVENTS_HEALTH=bad 可模拟「事件流卡住」（测试备用路径），=good 忽略检测
 func inputHealth() -> InputHealth {
@@ -717,20 +750,10 @@ func inputHealth() -> InputHealth {
     h.mouseBlockedBy = blocking.filter { $0.mask & mouseEventsMask != 0 }.map(desc)
     h.keyboardOK = h.keyboardBlockedBy.isEmpty; h.mouseOK = h.mouseBlockedBy.isEmpty
     // 延迟统计是历史值，不能据此认定当前键盘被 Siri 等进程拦截。
-    // 主动探测会投递 HID 事件，因此仅 check --probe 明确请求时使用。
-    if ov == nil && !forceProbe {
+    // Historical tap statistics are diagnostic evidence only; no active probes are sent.
+    if ov == nil {
         h.suspectedTapStats = h.keyboardBlockedBy + h.mouseBlockedBy
         h.keyboardBlockedBy = []; h.mouseBlockedBy = []; h.keyboardOK = true; h.mouseOK = true
-    }
-    if ov == nil && forceProbe {
-        let km = probeStream(keyboard: true, timeoutMs: 400); h.keyboardProbeMs = km
-        let mm = probeStream(keyboard: false, timeoutMs: 400); h.mouseProbeMs = mm
-        if km >= 0 && km.isFinite { h.staleBlockers += h.keyboardBlockedBy; h.keyboardBlockedBy = []; h.keyboardOK = true }
-        else if km.isInfinite { h.keyboardOK = false; if h.keyboardBlockedBy.isEmpty { h.keyboardBlockedBy = [["process": "unknown", "pid": 0, "note": "probe timed out after 400 ms"]] } }
-        else { h.suspectedTapStats += h.keyboardBlockedBy; h.keyboardBlockedBy = []; h.keyboardOK = true }
-        if mm >= 0 && mm.isFinite { h.staleBlockers += h.mouseBlockedBy; h.mouseBlockedBy = []; h.mouseOK = true }
-        else if mm.isInfinite { h.mouseOK = false }
-        else { h.suspectedTapStats += h.mouseBlockedBy; h.mouseBlockedBy = []; h.mouseOK = true }
     }
     if ov == "bad" { h.keyboardOK = false; h.mouseOK = false } else if ov == "good" { h.keyboardOK = true; h.mouseOK = true }
     h.override = ov
@@ -893,7 +916,7 @@ func axWrite(_ el: AXUIElement, _ text: String, replaceAll: Bool) -> [String: An
 func pasteWrite(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceAll: Bool) throws -> [String: Any] {
     // The system pasteboard is shared global state even when AX invokes Paste.
     // Refuse before reading, snapshotting, clearing, or restoring it.
-    try guardGlobalInput(targetPid: nil)
+    if inputPolicy.strict && !inputPolicy.permitsGlobal { try refuseGlobal("Shared pasteboard requires --allow-global in locked mode") }
     let snap = snapshotPasteboard()
     var restore = true
     defer { if restore { restorePasteboard(snap) } }
@@ -994,6 +1017,7 @@ func jsonText(_ o: Any) -> String {
     return String(data: d, encoding: .utf8) ?? "\(o)"
 }
 func typeChain(_ appOpt: String?, _ text: String, via: String, window: String? = nil) throws -> [String: Any] {
+    let via = via == "hid" ? "events" : via
     guard ["auto", "ax", "events", "pid", "paste"].contains(via) else { try fail("--via 只能是 auto、ax、events、pid、paste") }
     let h = inputHealth()
     let (root, app) = try axRoot(appOpt)
@@ -1046,13 +1070,13 @@ func typeChain(_ appOpt: String?, _ text: String, via: String, window: String? =
             let (tp, pname) = eventTarget(appOpt, app, panel)
             if tp == nil { try guardGlobalInput(targetPid: appOpt != nil ? app.processIdentifier : nil) }
             keyTargetPid = tp
-            typeText(text); keyTargetPid = nil
+            try typeText(text); keyTargetPid = nil
             let v = waitValueChange(el, from: before, contains: text, ms: 300)
             return result(pname, v ?? false)
         case "pid":
             // CGEventPostToPid：直接投递到应用进程的事件队列，不经过系统 HID 事件流上的监听
             keyTargetPid = panel?.pid ?? app.processIdentifier
-            typeText(text); keyTargetPid = nil
+            try typeText(text); keyTargetPid = nil
             let v = waitValueChange(el, from: before, contains: text, ms: 600)
             if v == true || via == "pid" { return result("events-pid", v ?? false) }
             if v == nil { return result("events-pid", false, ["note": "读不到输入框内容，无法核对；为避免重复输入，不再尝试其它路径"]) }
@@ -1118,6 +1142,7 @@ func eventTarget(_ appOpt: String?, _ app: NSRunningApplication, _ panel: (pid: 
     return (pn.pid, "events-pid-panel")
 }
 func keyChain(_ appOpt: String?, _ combos: [String], via: String) throws -> [String: Any] {
+    let via = via == "hid" ? "events" : via
     guard ["auto", "events", "menu", "pid"].contains(via) else { try fail("--via 只能是 auto、events、menu、pid") }
     let h = inputHealth()
     let app: NSRunningApplication
@@ -1137,7 +1162,7 @@ func keyChain(_ appOpt: String?, _ combos: [String], via: String) throws -> [Str
                 let (tp, pname) = eventTarget(appOpt, app, panel)
                 if tp == nil { try guardGlobalInput(targetPid: appOpt != nil ? app.processIdentifier : nil) }
                 keyTargetPid = tp
-                postCombo(k, f); keyTargetPid = nil
+                try postCombo(k, f); keyTargetPid = nil
                 done = ["key": c, "path": pname]
             case "menu":
                 let ax = AXUIElementCreateApplication(app.processIdentifier); AXUIElementSetMessagingTimeout(ax, 3)
@@ -1148,7 +1173,7 @@ func keyChain(_ appOpt: String?, _ combos: [String], via: String) throws -> [Str
                 } else { tried.append(["path": "menu", "result": "\(app.xName ?? "应用") 的菜单栏里没有快捷键为 \(c) 的菜单项"]) }
             case "pid":
                 keyTargetPid = panel?.pid ?? app.processIdentifier
-                postCombo(k, f); keyTargetPid = nil
+                try postCombo(k, f); keyTargetPid = nil
                 done = ["key": c, "path": panel != nil ? "events-pid-panel" : "events-pid", "note": "按键已直接投递给应用进程，无法核对是否生效"]
             default: break
             }
@@ -1306,6 +1331,8 @@ func replaySession(path: String, speed: Double, force: Bool, noKeys: Bool) throw
         if wait > 0 { usleep(useconds_t(wait * 1_000_000)) }
         if screenLocked() { try fail("屏幕被锁定，回放已停止（已回放 \(n) / \(evs.count) 个事件）", code: 3) }
         let p = CGPoint(x: numv(ev, "x") ?? 0, y: numv(ev, "y") ?? 0)
+        try guardGlobalInput()
+        globalEventsCreated += 1
         var e: CGEvent?
         switch type {
         case .keyDown, .keyUp:
@@ -1325,7 +1352,7 @@ func replaySession(path: String, speed: Double, force: Bool, noKeys: Bool) throw
             e?.setIntegerValueField(.mouseEventClickState, value: Int64(numv(ev, "clicks") ?? 1))
         }
         if let f = ev["flags"] as? NSNumber { e?.flags = CGEventFlags(rawValue: f.uint64Value) }
-        e?.post(tap: .cghidEventTap); n += 1
+        try post(e); n += 1
     }
     out(["path": path, "events": n, "ms": Int((CFAbsoluteTimeGetCurrent() - t0) * 1000), "speed": sp, "keysSkipped": noKeys])
 }
@@ -2046,6 +2073,25 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
 // 锁定状态存在 ~/.xyzlcu/lock.json（守护进程、CLI、MCP 共用），坐标在锁定模式下都是相对窗口左上角的点坐标。
 struct LockInfo { var pid: pid_t; var app: String; var bundleId: String; var windowId: CGWindowID; var title: String; var at: Double; var unsafe: Bool = false }
 func lockPath() -> String { (socketPath() as NSString).deletingLastPathComponent + "/lock.json" }
+var volatileLockFailure = false
+func lockFailed() -> Bool {
+    if volatileLockFailure { return true }
+    guard let d = FileManager.default.contents(atPath: lockPath()),
+          let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { return false }
+    return j["state"] as? String == "lock-failed"
+}
+func guardLockFailure() throws {
+    if lockFailed() { throw XErr(msg: "input refused: previous lock failed; unlock or successfully lock a target first", code: 6, policyCode: "LOCK_FAILED") }
+}
+func writeLockFailure() throws {
+    volatileLockFailure = true
+    let p = lockPath()
+    try FileManager.default.createDirectory(atPath: (p as NSString).deletingLastPathComponent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    let data = try JSONSerialization.data(withJSONObject: ["state": "lock-failed", "at": Date().timeIntervalSince1970])
+    try data.write(to: URL(fileURLWithPath: p), options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: p)
+    volatileLockFailure = false // The file is shared with CLI, daemon and MCP.
+}
 func readLock() -> LockInfo? {
     guard let d = FileManager.default.contents(atPath: lockPath()),
           let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
@@ -2056,13 +2102,17 @@ func readLock() -> LockInfo? {
 }
 func writeLock(_ l: LockInfo?) throws {
     let p = lockPath()
-    guard let l = l else { try? FileManager.default.removeItem(atPath: p); return }
+    guard let l = l else {
+        if FileManager.default.fileExists(atPath: p) { try FileManager.default.removeItem(atPath: p) }
+        volatileLockFailure = false; return
+    }
     try? FileManager.default.createDirectory(atPath: (p as NSString).deletingLastPathComponent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     let o: [String: Any] = ["pid": Int(l.pid), "app": l.app, "bundleId": l.bundleId, "windowId": Int(l.windowId), "title": l.title, "at": l.at, "unsafe": l.unsafe]
     guard let d = try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys]) else { try fail("写不了锁定文件") }
     do {
         try d.write(to: URL(fileURLWithPath: p), options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: p)
+        volatileLockFailure = false
     } catch { try fail("Cannot persist window lock: \(error)") }
 }
 /// 这一条命令是不是后台模式：--background / XYZLCU_BACKGROUND=1 / 有锁定（--no-lock 跳过锁定）
@@ -2163,7 +2213,7 @@ func bgTarget(appHint: String? = nil, titleHint: String? = nil, windowIdHint: In
     bgCache = t2; return t2
 }
 func frontPid() -> pid_t { drainRunLoop(); return NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1 }
-func cursorPos() -> CGPoint { CGEvent(source: nil)?.location ?? .zero }
+func cursorPos() -> CGPoint { let p = NSEvent.mouseLocation; return CGPoint(x: p.x, y: mainDisplayHeight() - p.y) }
 /// 后台事件用私有事件源，不和真实键鼠的 HID 状态（按住的修饰键等）混在一起
 let bgSource = CGEventSource(stateID: .privateState)
 /// 锁定模式的结果都带上：route、窗口、坐标系、真实鼠标有没有动、前台应用有没有变
@@ -2390,14 +2440,15 @@ func bgEnsureKeyWindow(_ t: BGTarget) throws {
 func bgType(_ t: BGTarget, _ text: String, via: String) throws -> (String, [String: Any]) {
     guard ["auto", "ax", "pid", "paste", "events", "hid"].contains(via) else { try fail("后台模式下 --via 只能是 auto、ax、pid、paste、events、hid") }
     // Refuse forbidden routes before changing AX focus or reading the pasteboard.
-    if via == "paste" || via == "events" || via == "hid" { try guardGlobalInput(targetPid: t.pid) }
+    if via == "events" || via == "hid" { try guardGlobalInput(targetPid: t.pid) }
+    if via == "paste" && inputPolicy.strict && !inputPolicy.permitsGlobal { try refuseGlobal("Shared pasteboard requires --allow-global in locked mode") }
     try bgEnsureKeyWindow(t)
     let (el, _) = try inputTarget("pid:\(t.pid)", role: nil, subrole: nil, title: nil, window: nil, index: 1)
     guard sameWindow(el, t) else { try fail("Text target is outside the locked window", code: 4) }
     var info: [String: Any] = ["element": describe(el)]
     if via == "events" || via == "hid" {
         let before = axStringValue(el)
-        keyTargetPid = nil; typeText(text)
+        keyTargetPid = nil; try typeText(text)
         let verified = waitValueChange(el, from: before, contains: text, ms: 600) == true
         info["verified"] = verified
         if !verified { info["reason"] = "HID was explicitly permitted but no matching AX text change was observed" }
@@ -2517,8 +2568,10 @@ func bgRefuse(_ what: String) throws {
     try refuseGlobal("\(what) requires app activation, pointer movement, or app-wide state. Use --allow-foreground explicitly for this command, or create an --unsafe lock.")
 }
 /// --allow-foreground：把目标应用 / 窗口提到前面，再走原来的 HID 路线
-func bgForeground(_ t: BGTarget) {
+func bgForeground(_ t: BGTarget) throws {
+    try guardActivation(t.app)
     if let w = t.axWin { AXUIElementPerformAction(w, kAXRaiseAction as CFString) }
+    try guardActivation(t.app)
     t.app?.activate(options: [])
     for _ in 0..<20 where frontPid() != t.pid { RunLoop.current.run(until: Date().addingTimeInterval(0.03)) }
 }
@@ -2581,7 +2634,16 @@ func runSelftest() throws {
     try check(globalInputRefusal(background: true, allow: true, target: 42, front: 7, expected: nil) != nil, "allow does not override wrong target")
     try check(globalInputRefusal(background: false, allow: false, target: 42, front: 7, expected: nil) != nil, "foreground wrong target denied")
     try check(globalInputRefusal(background: false, allow: false, target: nil, front: 7, expected: 42) != nil, "expect-front guard")
-    try check(globalInputRefusal(background: false, allow: false, target: nil, front: 7, expected: nil) == nil, "legacy unscoped foreground input")
+    try check(globalInputRefusal(background: false, allow: false, target: nil, front: 7, expected: nil) != nil, "unscoped foreground input refused")
+    try check(globalInputRefusal(background: false, allow: true, target: nil, front: 7, expected: nil) == nil, "explicit unlocked opt-in")
+    try check(globalInputRefusal(background: false, allow: false, target: 42, front: 42, expected: nil) == nil, "verified named front target")
+    let sequenceFronts: [pid_t] = [42, 42, 7, 42]
+    var acceptedBatches = 0
+    for front in sequenceFronts {
+        if globalInputRefusal(background: false, allow: false, target: 42, front: front, expected: nil) != nil { break }
+        acceptedBatches += 1
+    }
+    try check(acceptedBatches == 2, "focus change stops sequence before next batch")
     try check(insertedTextValue("A😀B", "文", location: 1, length: 2) == "A文B", "UTF16 selection replacement")
     try check(insertedTextValue("abc", "X", location: 1, length: 0) == "aXbc", "insertion preserves surrounding text")
     try check(insertedTextValue("abc", "X", location: 8, length: 0) == nil, "invalid selection denied")
@@ -2835,7 +2897,7 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   observe ["App"] [--max 80]  只返回文字：前台应用、目标窗口、AX 控件摘要
   selftest  无 GUI / 权限的纯逻辑自测
   AX 目标可用 --pid N 替代应用名；输入结果带 frontmostBefore / frontmostAfter
-  输入安全: 后台全局 HID 必须 --allow-global；全局输入前核对 --app/--pid 和 --expect-front "App"
+  输入安全: 无锁全局输入须 --allow-global 或 --app/--pid 已在前台；每次事件前复核，失败 lock 后须 unlock/重新 lock
   输入时序: --hold ms（点击默认 60，按键默认 30）；XYZLCU_CLICK_HOLD；移动后 hover 等待 75 ms
   截图大小: screenshot --max-side N（限制最长像素边）
   screenshot [path] [--scale 0.5] [--display N] [--format png|jpg|heic] [--quality 0.7] [--fast] [--cli]
@@ -2859,7 +2921,8 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   click-el --ref N ["App"]   按上一次 ax --compact 的编号点（需要守护进程）
   wait "App" --title X [--role R] [--timeout 5] [--gone]   |   wait 毫秒 | sleep 毫秒
   --assert-no-contention  Fail if frontmost application or pointer changes during a command
-  --allow-global / --allow-foreground  Explicit per-command escape from strict background policy
+  --allow-global  Explicit global-input opt-in (no environment bypass)
+  --allow-foreground  Per-command escape from strict locked foreground policy
   lock --app "App" [--window-title 标题 | --window-id N | --pid P] [--unsafe] | lock --status | unlock
                  锁定一个窗口（后台模式）：之后 screenshot / click / type / key / scroll / ax / find / click-el 只作用于它，
                  坐标相对窗口左上角，不动真实鼠标、不激活应用；结果里 route = 实际走的路（ax-press / pid-mouse / pid-keys …）
@@ -2881,14 +2944,28 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
             XYZLCU_PNG=imageio 用系统 PNG 编码器；XYZLCU_PNG_LEVEL 压缩级别 1–9（默认 1）
             XYZLCU_CONNECT_WAIT_MS 守护进程正在启动时最多等多久（默认 3000）；XYZLCU_CORE 客户端调用的主程序路径
 """
-let version = "0.7.0"
+let version = "0.7.1"
 var inBatch = false
 let startedAt = Date()
 
+func commandVerb(_ argv: [String]) -> String? {
+    var i = 0
+    while i < argv.count && ["--hold", "--delay"].contains(argv[i]) { i += 2 }
+    return i < argv.count ? argv[i] : nil
+}
 func execute(_ argv: [String]) throws {
+    defer { keyTargetPid = nil; verifiedGlobalTarget = nil }
+    globalEventsCreated = 0; globalEventsPosted = 0
     inputFrontmostBefore = nil; inputPointerBefore = nil; inputResultEmitted = false
     observedContention = false; assertNoContention = false; actionProducesVerification = false
-    try executeCommand(argv)
+    do { try executeCommand(argv) }
+    catch {
+        if commandVerb(argv) == "lock" {
+            do { try writeLockFailure() }
+            catch { try fail("Lock failed and tombstone could not be persisted: \(error)", code: 6) }
+        }
+        throw error
+    }
     if inputFrontmostBefore != nil {
         let evidence = contentionEvidence([:])
         if var meta = binMeta.flatMap({ $0.data(using: .utf8) }).flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] {
@@ -2904,6 +2981,10 @@ func executeCommand(_ argv: [String]) throws {
 inputFrontmostBefore = nil; inputResultEmitted = false
 forceProbe = false
 args = argv
+commandTargetPid = nil; keyTargetPid = nil; explicitGlobalApp = nil; verifiedGlobalTarget = nil
+allowGlobalInput = false; expectedFrontName = nil; commandHasLock = false
+try validateOptionValues(argv)
+if let i = argumentOptionIndex("--app") { explicitGlobalApp = args[i + 1] }
 try configureHold(option("--hold"))
 if let d = option("--delay") { stepDelay = Int(try dbl(d)) }
 guard !args.isEmpty else { return }
@@ -2927,13 +3008,15 @@ bgCache = nil; coordOrigin = nil; screenshotExtra = nil
 allowForeground = flag("--allow-foreground"); noLock = flag("--no-lock")
 let bgFlag = flag("--background")
 let heldLock = readLock()
+commandHasLock = !noLock && heldLock != nil
 bgMode = bgFlag || envv("XYZLCU_BACKGROUND") == "1" || (!noLock && heldLock != nil)
 inputPolicy = InputPolicy(background: bgMode, unsafeLock: !noLock && (heldLock?.unsafe ?? false),
                           allowGlobal: allowGlobalInput, allowForeground: allowForeground)
 bgCaptureOnly = false
 assertNoContention = flag("--assert-no-contention")
-let actionCommands: Set<String> = ["click", "click-el", "move", "drag", "scroll", "type", "key", "set-text", "settext", "insert", "menu", "press", "select", "scroll-to", "activate", "open", "hide", "movewin", "replay", "request"]
+let actionCommands: Set<String> = ["click", "click-el", "move", "drag", "scroll", "type", "key", "set-text", "settext", "insert", "menu", "press", "select", "scroll-to", "activate", "open", "hide", "movewin", "replay", "request", "__ax-press"]
 actionProducesVerification = actionCommands.contains(cmd)
+if actionProducesVerification { try guardLockFailure() }
 // Capture evidence for every JSON command, including diagnostics and refused actions.
 if !["selftest", "version", "--version", "-v", "help", "--help", "-h", "mcp", "serve"].contains(cmd) {
     inputFrontmostBefore = frontmostInfo(); inputPointerBefore = cursorPos()
@@ -2941,7 +3024,7 @@ if !["selftest", "version", "--version", "-v", "help", "--help", "-h", "mcp", "s
 if noLock, let held = heldLock, !held.unsafe, !allowForeground && !allowGlobalInput {
     try refuseGlobal("--no-lock would bypass the strict window lock. Unlock first, or explicitly use --allow-foreground / --allow-global with this command.")
 }
-if FileManager.default.fileExists(atPath: lockPath()), heldLock == nil,
+if FileManager.default.fileExists(atPath: lockPath()), heldLock == nil, !lockFailed(),
    !["unlock", "lock", "help", "--help", "version", "--version", "selftest"].contains(cmd) {
     try fail("refused: invalid lock file; explicitly unlock or replace the lock before continuing", code: 6)
 }
@@ -2953,6 +3036,27 @@ if inputPolicy.strict && !inputPolicy.permitsGlobal {
     if ["click", "type", "key", "insert", "set-text", "settext"].contains(cmd),
        let route = via, ["hid", "events", "paste"].contains(route) {
         try refuseGlobal("The requested \(route) route uses global HID input or the shared pasteboard. Use AX/pid, or explicitly --allow-global for this command.")
+    }
+}
+// Deny obvious global routes before permission checks, focus changes or event construction.
+let rawVia = argumentOptionIndex("--via").map { args[$0 + 1].lowercased() }
+    ?? envv(cmd == "type" ? "XYZLCU_TYPE_VIA" : "XYZLCU_KEY_VIA")?.lowercased() ?? "auto"
+let hasNamedTarget = explicitGlobalApp != nil || commandTargetPid != nil
+let globalCommand = ["move", "drag", "activate", "open", "movewin", "replay"].contains(cmd)
+    || (cmd == "request" && argumentOptionIndex("--open") != nil)
+    || (cmd == "menu" && argumentOptionIndex("--activate") != nil)
+    || (cmd == "click" && !bgMode)
+    || (cmd == "scroll" && !bgMode && !hasNamedTarget && argumentOptionIndex("--ax") == nil)
+    || (["type", "key"].contains(cmd) && !bgMode && !hasNamedTarget && (["hid", "events"].contains(rawVia) || (cmd == "key" && rawVia == "auto")))
+if globalCommand { try guardGlobalInput() }
+// These commands accept a named safety target in addition to their positional arguments.
+if ["move", "drag", "activate", "open", "movewin", "replay"].contains(cmd) && !bgMode {
+    _ = option("--app")
+    if ["activate", "open"].contains(cmd), args.isEmpty {
+        if let name = explicitGlobalApp { args.append(name) }
+        else if let pid = commandTargetPid {
+            args.append(cmd == "open" ? (NSRunningApplication(processIdentifier: pid)?.bundleURL?.path ?? "pid:\(pid)") : "pid:\(pid)")
+        }
     }
 }
 let front0 = bgMode ? frontPid() : 0, cur0 = bgMode ? cursorPos() : .zero, bt0 = Date()
@@ -2984,6 +3088,8 @@ case "observe":
 case "lock":
     // xyzlcu lock --app Safari [--window-title 标题 | --window-id N]   |   lock --status   |   unlock
     if flag("--status") {
+        try rejectUnknownOptions("lock --status")
+        if lockFailed() { out(["locked": false, "state": "lock-failed", "code": "LOCK_FAILED"]); break }
         guard let l = readLock() else {
             if FileManager.default.fileExists(atPath: lockPath()) { out(["locked": true, "valid": false, "strict": true, "error": "invalid lock file", "hint": "Explicitly unlock or replace the lock."]) }
             else { out(["locked": false]) }
@@ -2997,7 +3103,6 @@ case "lock":
         } else { o["windowGone"] = true }
         out(o); break
     }
-    guard axTrusted() else { try fail("没有辅助功能权限，先运行 xyzlcu check / xyzlcu request", code: 2) }
     let appName = option("--app") ?? args.first
     let unsafe = flag("--unsafe")
     let title = option("--window-title") ?? option("--title")
@@ -3009,6 +3114,7 @@ case "lock":
     try rejectUnknownOptions("lock")
     guard let a = appName else { try fail("用法: xyzlcu lock --app App [--window-title 标题 | --window-id N]  |  lock --status  |  unlock") }
     guard let app = findApp(a) else { try fail("找不到应用: \(a)", code: 4) }
+    guard axTrusted() else { try fail("没有辅助功能权限，先运行 xyzlcu check / xyzlcu request", code: 2) }
     let (w, r, t) = try pickWindow(app, title: title, id: wid)
     try writeLock(LockInfo(pid: app.processIdentifier, app: app.xName ?? a, bundleId: app.bundleIdentifier ?? "", windowId: w, title: t, at: Date().timeIntervalSince1970, unsafe: unsafe))
     if !unsafe {
@@ -3029,7 +3135,7 @@ case "check":
     forceProbe = flag("--probe")
     defer { forceProbe = false }
     try rejectUnknownOptions("check")
-    if forceProbe { try guardGlobalInput() }
+
     cachedHealth = nil  // check 总是重新检测
     let h = inputHealth(), ax = axTrusted()
     forceProbe = false
@@ -3050,7 +3156,7 @@ case "check":
     o["typeOrder"] = h.keyboardOK ? ["ax（标准文本框）", "events"] : ["ax", "pid", "paste"]
     o["keyOrder"] = h.keyboardOK ? ["events"] : ["menu", "pid"]
     if let ov = h.override { o["healthOverride"] = ov }
-    if !h.suspectedTapStats.isEmpty { o["suspectedTapStats"] = h.suspectedTapStats; o["note"] = "Historical tap latency is not proof of blocked input; check --probe explicitly tests the HID stream." }
+    if !h.suspectedTapStats.isEmpty { o["suspectedTapStats"] = h.suspectedTapStats; o["note"] = "Historical tap latency is not proof of blocked input; health checks are passive and never post input." }
     if let diagnostic = permissionDiagnostic() { o["permissionDiagnostic"] = diagnostic }
     if !h.staleBlockers.isEmpty { o["staleTapStats"] = h.staleBlockers; o["note"] = "这些监听的延迟统计偏高，但实测事件能正常走完（统计是历史值），按健康处理" }
     out(o)
@@ -3068,6 +3174,7 @@ case "request":
     if openPane {
         let chosen = permission ?? (!ax ? "accessibility" : !sr ? "screen-recording" : !im ? "input-monitoring" : "accessibility")
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?" + panes[chosen]!)!
+        try guardActivation(findApp("com.apple.systempreferences"))
         result["openedPane"] = chosen; result["opened"] = NSWorkspace.shared.open(url)
     }
     out(result)
@@ -3158,7 +3265,7 @@ case "click":
         let g = try bgGlobal(t, try dbl(args[0]), try dbl(args[1]))
         if via == "hid" || via == "events" {
             try guardGlobalInput(targetPid: t.pid)
-            click(g, right: right, double: double)
+            try click(g, right: right, double: double)
             bgOut(t, "events-hid", ["global": ["x": Int(g.x), "y": Int(g.y)]]); break
         }
         let (route, info) = try bgClick(t, g, right: right, double: double, via: via)
@@ -3171,7 +3278,7 @@ case "click":
     try rejectUnknownOptions("click")
     try need(2, "click x y [--right] [--double] [--app App]")
     try guardGlobalInput(targetPid: clickPid)
-    click(CGPoint(x: try dbl(args[0]), y: try dbl(args[1])), right: right, double: double)
+    try click(CGPoint(x: try dbl(args[0]), y: try dbl(args[1])), right: right, double: double)
     var result: [String: Any] = ["ok": true, "route": "events-hid"]
     if let p = clickPid { result["pid"] = Int(p) }
     out(result)
@@ -3182,10 +3289,10 @@ case "move":
     try rejectUnknownOptions("move")
     try need(2, "move x y")
     var p = CGPoint(x: try dbl(args[0]), y: try dbl(args[1]))
-    if let t = bgT { p = try bgGlobal(t, p.x, p.y); bgForeground(t) }
+    if let t = bgT { p = try bgGlobal(t, p.x, p.y); try bgForeground(t) }
     try guardGlobalInput(targetPid: bgT?.pid)
     CGWarpMouseCursorPosition(p); CGAssociateMouseAndMouseCursorPosition(1)
-    mouse(.mouseMoved, p)
+    try mouse(.mouseMoved, p)
     if let t = bgT { bgOut(t, "events-hid-foreground") } else { emit("ok") }
 case "drag":
     try guardUnlocked()
@@ -3194,12 +3301,12 @@ case "drag":
     try rejectUnknownOptions("drag")
     try need(4, "drag x1 y1 x2 y2")
     var a = CGPoint(x: try dbl(args[0]), y: try dbl(args[1])), b = CGPoint(x: try dbl(args[2]), y: try dbl(args[3]))
-    if let t = bgT { a = try bgGlobal(t, a.x, a.y); b = try bgGlobal(t, b.x, b.y); bgForeground(t) }
+    if let t = bgT { a = try bgGlobal(t, a.x, a.y); b = try bgGlobal(t, b.x, b.y); try bgForeground(t) }
     try guardGlobalInput(targetPid: bgT?.pid)
     let dd = max(stepDelay, 8)  // 拖拽需要一点时间让应用识别
-    mouse(.mouseMoved, a); sleepMs(dd); mouse(.leftMouseDown, a); sleepMs(dd)
-    for i in 1...12 { let t = CGFloat(i) / 12; mouse(.leftMouseDragged, CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)); sleepMs(dd) }
-    mouse(.leftMouseUp, b)
+    try mouse(.mouseMoved, a); sleepMs(dd); try mouse(.leftMouseDown, a); sleepMs(dd)
+    for i in 1...12 { let t = CGFloat(i) / 12; try mouse(.leftMouseDragged, CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)); sleepMs(dd) }
+    try mouse(.leftMouseUp, b)
     if let t = bgT { bgOut(t, "events-hid-foreground") } else { emit("ok") }
 case "scroll":
     try guardUnlocked()
@@ -3285,7 +3392,9 @@ case "scroll":
     }
     try rejectUnknownOptions("scroll")
     try need(2, "scroll dx dy  （正 dy 向上滚，单位：行）")
-    post(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: Int32(try dbl(args[1])), wheel2: Int32(try dbl(args[0])), wheel3: 0)); emit("ok")
+    try guardGlobalInput()
+    globalEventsCreated += 1
+    try post(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 2, wheel1: Int32(try dbl(args[1])), wheel2: Int32(try dbl(args[0])), wheel3: 0)); emit("ok")
 case "type", "key":
     try guardUnlocked()
     // --app "App"：目标应用（默认前台应用）。--via 选路，默认 auto：按事件流健康状态自动选择并逐条回退，输出 JSON 里的 path 是实际走的路
@@ -3302,7 +3411,7 @@ case "type", "key":
             if via == "events" || via == "hid" {
                 try guardGlobalInput(targetPid: t.pid)
                 var keys: [[String: Any]] = []
-                for combo in args { let (k, f, _) = try parseCombo(combo); keyTargetPid = nil; postCombo(k, f); keys.append(["key": combo, "path": "events-hid"]) }
+                for combo in args { let (k, f, _) = try parseCombo(combo); keyTargetPid = nil; try postCombo(k, f); keys.append(["key": combo, "path": "events-hid"]) }
                 bgOut(t, "events-hid", ["keys": keys])
             } else {
                 let (route, keys) = try bgKeys(t, args, via: via)
@@ -3329,7 +3438,7 @@ case "insert", "settext", "set-text":
     let replaceAll = cmd != "insert"
     let via = (option("--via") ?? "auto").lowercased()
     guard ["auto", "ax", "paste", "pid"].contains(via) else { try fail("--via requires auto, ax, pid, paste") }
-    if via == "paste" { try guardGlobalInput() }
+    if via == "paste" && inputPolicy.strict && !inputPolicy.permitsGlobal { try refuseGlobal("Shared pasteboard requires --allow-global in locked mode") }
     let role = option("--role"), subrole = option("--subrole"), title = option("--title") ?? option("--id"), win = option("--window")
     let idx = Int(try option("--index").map(dbl) ?? 1)
     let contains = flag("--contains"), ref = option("--ref")
@@ -3375,6 +3484,7 @@ case "menu":
     let wasActive = findApp(args[0])?.isActive ?? false
     var activated = false
     if doActivate && !wasActive, let a = findApp(args[0]) {
+        try guardActivation(a)
         a.activate()
         // isActive 靠 KVO 更新，需要跑 run loop 才会刷新；以前台应用的 pid 为准
         for _ in 0..<20 where NSWorkspace.shared.frontmostApplication?.processIdentifier != a.processIdentifier {
@@ -3402,7 +3512,7 @@ case "menu":
     if !h.keyboardOK { o["warning"] = "检测到卡住的事件监听（\(h.blockerNames.joined(separator: ", "))），请确认菜单动作的效果" }
     out(o)
 case "cursor":
-    let p = CGEvent(source: nil)?.location ?? .zero; out(["x": Int(p.x), "y": Int(p.y)])
+    let p = cursorPos(); out(["x": Int(p.x), "y": Int(p.y)])
 case "sleep":
     try need(1, "sleep 毫秒"); sleepMs(Int(try dbl(args[0]))); emit("ok")
 case "wait":
@@ -3466,7 +3576,7 @@ case "click-el":
             guard let f = n.frame else { try fail("元素没有位置信息，无法点击") }
             let c = CGPoint(x: f["x"]! + f["w"]! / 2, y: f["y"]! + f["h"]! / 2)
             if bgMode { let t = try bgTarget(); try bgEnsureKeyWindow(t); pidMouse(t, c, right: right, double: double); how = "pid-mouse" }
-            else { try guardGlobalInput(targetPid: axRefsPid); click(c, right: right, double: double); how = "click" }
+            else { try guardGlobalInput(targetPid: axRefsPid); try click(c, right: right, double: double); how = "click" }
         }
         if bgMode {
             let t = try bgTarget(); coordOrigin = t.frame.origin
@@ -3494,7 +3604,7 @@ case "click-el":
     if forceClick || right || double || AXUIElementPerformAction(el, kAXPressAction as CFString) != .success {
         guard let c = r.matches[0]["center"] as? [String: Int] else { try fail("元素没有位置信息，无法点击") }
         if let t = bgT { try bgEnsureKeyWindow(t); pidMouse(t, CGPoint(x: c["x"]!, y: c["y"]!), right: right, double: double); how = "pid-mouse" }
-        else { try guardGlobalInput(targetPid: r.app.processIdentifier); click(CGPoint(x: c["x"]!, y: c["y"]!), right: right, double: double); how = "click" }
+        else { try guardGlobalInput(targetPid: r.app.processIdentifier); try click(CGPoint(x: c["x"]!, y: c["y"]!), right: right, double: double); how = "click" }
     }
     if let t = bgT {
         coordOrigin = t.frame.origin
@@ -3510,13 +3620,17 @@ case "apps":
     out(appEntries().filter { $0.regular }.map { appInfo($0, front: front ?? -1) })
 case "open":
     try need(1, "open \"App\"")
+    try rejectUnknownOptions("open")
     let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/open"); p.arguments = ["-a", args[0]]
+    try guardActivation(findApp(args[0]))
     try? p.run(); p.waitUntilExit()
     if p.terminationStatus != 0 { try fail("打开失败: \(args[0])") }; out(["ok": true, "route": "open-foreground"])
 case "activate":
     try need(1, "activate \"App\"")
     guard let a = findApp(args[0]) else { try fail("没在运行: \(args[0])，可先 xyzlcu open") }
-    a.unhide(); a.activate(options: [.activateAllWindows]); out(["ok": true, "route": "activate-foreground"])
+    try rejectUnknownOptions("activate")
+    try guardActivation(a)
+    a.unhide(); try guardActivation(a); a.activate(options: [.activateAllWindows]); out(["ok": true, "route": "activate-foreground"])
 case "hide":
     try need(1, "hide \"App\"")
     guard let a = findApp(args[0]) else { try fail("没在运行: \(args[0])") }
@@ -3546,7 +3660,9 @@ case "movewin":
         var sz = CGSize(width: wOpt ?? Double(cur["w"]!), height: hOpt ?? Double(cur["h"]!))
         if let v = AXValueCreate(.cgSize, &sz) { AXUIElementSetAttributeValue(w, kAXSizeAttribute as CFString, v) }
     }
+    try guardActivation(app)
     AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+    try guardActivation(app)
     app.activate(options: [])
     var res: [String: Any] = ["app": app.xName ?? "", "title": str(w, kAXTitleAttribute) ?? ""]
     if let f = frame(w) { res["frame"] = f }
@@ -3627,6 +3743,7 @@ case "__ax-press":
                               axWin: axWindowFor(axApp, wid, frame: bounds, title: ""), locked: true)
         guard sameWindow(el, target) else { try fail("Asynchronous AX target is outside its original window", code: 4) }
     }
+    try guardLockFailure()
     let result = AXUIElementPerformAction(el, kAXPressAction as CFString)
     guard result == .success else { try fail("AXPress failed: \(result.rawValue)", code: 5) }
 case "press":
@@ -3831,7 +3948,12 @@ func parseScript(_ text: String) -> [[String]] {
 func batchOptions(_ rest: [String]) throws -> (rest: [String], delay: Int?, coe: Bool) {
     var r = rest, d: Int? = nil, coe = false
     if let i = r.firstIndex(of: "--continue-on-error") { coe = true; r.remove(at: i) }
-    if let i = r.firstIndex(of: "--delay"), i + 1 < r.count { d = Int(try dbl(r[i + 1])); r.removeSubrange(i...i+1) }
+    if let i = r.firstIndex(of: "--delay") {
+        guard i + 1 < r.count, !r[i + 1].isEmpty, !r[i + 1].hasPrefix("--") else {
+            throw XErr(msg: "argument error: --delay requires a non-empty value", code: 1, policyCode: "ARGUMENT_ERROR")
+        }
+        d = Int(try dbl(r[i + 1])); r.removeSubrange(i...i+1)
+    }
     return (r, d, coe)
 }
 
@@ -3841,9 +3963,10 @@ let readOnlyCommands: Set<String> = ["help", "-h", "--help", "version", "--versi
                                      "selftest", "observe", "wait-text", "sleep", "wait", "find", "apps", "displays", "windows", "ax", "taps", "__status", "serve"]
 func markIfMutating(_ argv: [String]) { if let c = argv.first, !readOnlyCommands.contains(c) { lastInputAt = Date() } }
 func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) -> Int32 {
-    func inputError(_ message: String, _ code: Int32, hint: String? = nil) {
+    func inputError(_ message: String, _ code: Int32, hint: String? = nil, policyCode: String? = nil) {
         if !inputResultEmitted {
-            var result: [String: Any] = ["ok": false, "error": message, "code": Int(code)]
+            var result: [String: Any] = ["ok": false, "error": message, "code": policyCode.map { $0 as Any } ?? Int(code),
+                                       "globalEventsCreated": globalEventsCreated, "globalEventsPosted": globalEventsPosted]
             if let hint = hint { result["hint"] = hint }
             out(result)
         }
@@ -3863,7 +3986,7 @@ func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) ->
                 defer { markIfMutating(c) }
                 do { try execute(c) } catch let e as XErr {
                     err("error: 第 \(n + 1) 步（\(c.joined(separator: " "))）: \(e.msg)")
-                    inputError(e.msg, e.code, hint: e.hint)
+                    inputError(e.msg, e.code, hint: e.hint, policyCode: e.policyCode)
                     if !coe { return e.code }
                     worst = e.code
                 }
@@ -3872,7 +3995,7 @@ func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) ->
         }
         defer { markIfMutating(top) }
         try execute(top); return 0
-    } catch let e as XErr { err("error: " + e.msg); inputError(e.msg, e.code, hint: e.hint); return e.code }
+    } catch let e as XErr { err("error: " + e.msg); inputError(e.msg, e.code, hint: e.hint, policyCode: e.policyCode); return e.code }
     catch { err("error: \(error)"); inputError("\(error)", 1); return 1 }
 }
 
@@ -4201,6 +4324,7 @@ func mcpTools() -> [[String: Any]] {
         }
         p["assert_no_contention"] = b
         p["allow_foreground"] = b; p["allow_global"] = b
+        if !readOnly { p["allowGlobal"] = ["type": "boolean", "default": false] }
         if !readOnly { p["expect_front"] = s }
         var schema: [String: Any] = ["type": "object", "properties": p]
         if !req.isEmpty { schema["required"] = req }
@@ -4250,7 +4374,7 @@ func mcpImageContent(_ r: RunResult) -> [[String: Any]] {
     return content
 }
 /// MCP batch：一次调用执行多条命令（比如 截图 + 点击 + 验证），省掉每一步一个来回
-func mcpBatch(_ steps: [String], continueOnError: Bool) -> [String: Any] {
+func mcpBatch(_ steps: [String], continueOnError: Bool, allowGlobal: Bool = false) -> [String: Any] {
     let t0 = Date()
     var content: [[String: Any]] = []
     var failed = false, n = 0
@@ -4269,6 +4393,7 @@ func mcpBatch(_ steps: [String], continueOnError: Bool) -> [String: Any] {
                 if !argv.contains("--format") && !argv.contains("--fast") { argv += ["--format", "jpg"] }
                 if !argv.contains("--scale") && !argv.contains("--fast") { argv.append("--fast") }
             }
+            if allowGlobal { argv.insert("--allow-global", at: argv.firstIndex(of: "--") ?? argv.endIndex) }
             let ts = Date()
             let r = mcpRunSelf(argv)
             let ms = Int(Date().timeIntervalSince(ts) * 1000)
@@ -4289,7 +4414,7 @@ func mcpBatch(_ steps: [String], continueOnError: Bool) -> [String: Any] {
     return ["content": content, "isError": failed]
 }
 func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
-    func str(_ k: String) -> String? { if let v = a[k] as? String, !v.isEmpty { return v }; if let v = a[k] as? NSNumber { return v.stringValue }; return nil }
+    func str(_ k: String) -> String? { if let v = a[k] as? String { return v }; if let v = a[k] as? NSNumber { return v.stringValue }; return nil }
     func on(_ k: String) -> Bool { (a[k] as? Bool) ?? false }
     func text(_ s: String, _ isErr: Bool = false) -> [String: Any] { ["content": [["type": "text", "text": s]], "isError": isErr] }
     func target(positional: Bool = true) -> [String] {
@@ -4301,7 +4426,7 @@ func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
     case "check", "apps", "windows", "cursor": argv = [name]
     case "lock":
         if on("unlock") { argv = ["unlock"] }
-        else if on("status") || (str("app") == nil && str("pid") == nil) { argv = ["lock", "--status"] }
+        else if on("status") || (a.isEmpty) { argv = ["lock", "--status"] }
         else {
             argv = ["lock"] + target(positional: false)
             if let t = str("window_title") { argv += ["--window-title", t] }
@@ -4321,7 +4446,7 @@ func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
     case "observe":
         argv = ["observe"] + target()
         if let m = str("max") { argv += ["--max", m] }
-    case "batch": return mcpBatch((a["steps"] as? [String]) ?? [], continueOnError: on("continue_on_error"))
+    case "batch": return mcpBatch((a["steps"] as? [String]) ?? [], continueOnError: on("continue_on_error"), allowGlobal: on("allowGlobal") || on("allow_global"))
     case "ax":
         argv = ["ax"] + target()
         for k in ["depth", "max", "focus"] { if let v = str(k) { argv += ["--\(k)", v] } }
@@ -4351,7 +4476,9 @@ func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
         if let w = str("window") { argv += ["--window", w] }
         argv += ["--", str("text") ?? ""]
     case "key": argv = ["key"] + ((a["keys"] as? [String]) ?? []) + target(positional: false)
-    case "activate": argv = ["activate", str("app") ?? ""]
+    case "activate":
+        argv = ["activate", str("app") ?? ""]
+        if !on("allowGlobal") && !on("allow_global") { argv += target(positional: false) }
     case "xyzlcu":
         argv = (a["args"] as? [String]) ?? []
         if argv.contains("--stdout") { return text("Use the screenshot tool for image output.", true) }
@@ -4360,7 +4487,7 @@ func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
     }
     var common: [String] = []
     if on("background") { common.append("--background") }
-    if on("allow_global") { common.append("--allow-global") }
+    if on("allowGlobal") || on("allow_global") { common.append("--allow-global") }
     if on("allow_foreground") { common.append("--allow-foreground") }
     if on("assert_no_contention") { common.append("--assert-no-contention") }
     if let v = str("expect_front") { common += ["--expect-front", v] }
@@ -4398,7 +4525,7 @@ func mcpServe() -> Never {
             send(["jsonrpc": "2.0", "id": id, "result": [
                 "protocolVersion": pv, "capabilities": ["tools": ["listChanged": false]],
                 "serverInfo": ["name": "xyzlcu", "version": version],
-                "instructions": "macOS GUI control. Call check first; errors name the host app needing TCC access. Prefer pid targeting plus lock and AX routes: observe/ax, set_text, press, select_popup_item, scroll_to, wait_text. Locks are strict by default: one process/window, no activation, global HID or pasteboard fallback. allow_global/allow_foreground are command-local escapes; unsafe relaxes a lock. Use assert_no_contention to fail on observed frontmost/pointer changes; a global route also requires the intended target to be frontmost. Inspect verified and frontmostBefore/frontmostAfter; posted pid events may be ignored. Use screenshot only when needed (half-scale JPEG; max_side caps size). Ask before irreversible actions; stop at captchas."]])
+                "instructions": "macOS GUI control. Call check first; errors name the host app needing TCC access. Prefer pid targeting plus lock and AX routes: observe/ax, set_text, press, select_popup_item, scroll_to, wait_text. Locks are strict by default: one process/window, no activation, global HID or pasteboard fallback. Without a lock global input requires allowGlobal=true or an explicit app/pid verified frontmost before each event. Failed locks latch LOCK_FAILED until unlock or a successful lock. allowGlobal defaults false; allow_global is a legacy alias, and allow_foreground only relaxes an active lock; unsafe relaxes a lock. Use assert_no_contention to fail on observed frontmost/pointer changes; a global route also requires the intended target to be frontmost. Inspect verified and frontmostBefore/frontmostAfter; posted pid events may be ignored. Use screenshot only when needed (half-scale JPEG; max_side caps size). Ask before irreversible actions; stop at captchas."]])
         case "ping": send(["jsonrpc": "2.0", "id": id, "result": [:]])
         case "tools/list": send(["jsonrpc": "2.0", "id": id, "result": ["tools": mcpTools()]])
         case "tools/call":

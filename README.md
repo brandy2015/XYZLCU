@@ -4,7 +4,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-**Version 0.7.0** — single-window background control with a strict default lock, AX/pid routes and contention evidence. See [CHANGELOG.md](CHANGELOG.md).
+**Version 0.7.1** — global input safety gate, failed-lock protection and strict single-window background control. See [CHANGELOG.md](CHANGELOG.md).
 
 [![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#requirements) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#requirements) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![Agents: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#supported-agents)
 
@@ -34,9 +34,9 @@ xyzlcu lock --status
 xyzlcu unlock
 ```
 
-Use `lock --pid P --window-id N` when an app has multiple windows. An unreadable/corrupt persisted lock fails closed; an exited app or closed window does not silently clear the lock. Recover explicitly with `unlock` or a new `lock`. The lock persists next to `XYZLCU_SOCKET` (default `~/.xyzlcu/lock.json`) and is shared by CLI/daemon/MCP using that socket. Explicit app/pid/window selectors must agree with it. `--background --app A [--window-title T]` applies the policy to one command. Coordinates and AX centers under lock, and origins/diffs for every targeted window screenshot, are **window-relative points**, with `(0,0)` at the window's top left; image pixels still need the reported scale conversion.
+Use `lock --pid P --window-id N` when an app has multiple windows. An unreadable/corrupt persisted lock fails closed; an exited app or closed window does not silently clear the lock. Recover explicitly with `unlock` or a successful new `lock`. A failed `lock` (including invalid/empty selectors or unknown options) persists a `lock-failed` tombstone in the same state location and daemon: subsequent input commands fail with `LOCK_FAILED` until `unlock` or a successful `lock`. Empty or missing option values are argument errors; they never consume the next option as a value. The lock persists next to `XYZLCU_SOCKET` (default `~/.xyzlcu/lock.json`) and is shared by CLI/daemon/MCP using that socket. Explicit app/pid/window selectors must agree with it. `--background --app A [--window-title T]` applies the policy to one command. Coordinates and AX centers under lock, and origins/diffs for every targeted window screenshot, are **window-relative points**, with `(0,0)` at the window's top left; image pixels still need the reported scale conversion.
 
-For MCP, call `lock` with `{"app":"TextEdit","window_title":"Notes"}` or `{"pid":1234,"window_id":5678}`, then `set_text` with `{"role":"AXTextArea","text":"Hello","assert_no_contention":true}`, `type_text` with `{"text":"你好","via":"pid","assert_no_contention":true}`, and `screenshot` with `{}`. Tool arguments `allow_foreground`, `allow_global` and `assert_no_contention` correspond to CLI flags; `lock` accepts `unsafe:true` and `unlock:true`. The generic `xyzlcu` tool accepts CLI arguments when a dedicated tool lacks a flag.
+For MCP, call `lock` with `{"app":"TextEdit","window_title":"Notes"}` or `{"pid":1234,"window_id":5678}`, then `set_text` with `{"role":"AXTextArea","text":"Hello","assert_no_contention":true}`, `type_text` with `{"text":"你好","via":"pid","assert_no_contention":true}`, and `screenshot` with `{}`. Tools that can emit global input expose `allowGlobal` (boolean, default `false`), corresponding to `--allow-global`; `allow_foreground` and `assert_no_contention` correspond to their CLI flags; `lock` accepts `unsafe:true` and `unlock:true`. The generic `xyzlcu` tool accepts CLI arguments when a dedicated tool lacks a flag.
 
 | Action | Strict background route | Evidence / limits |
 |---|---|---|
@@ -51,10 +51,12 @@ Pid mouse events convert window points to global event locations, set target win
 
 Every JSON object includes `frontmostBefore`, `frontmostAfter` and `contention` (pointer or frontmost pid changed); legacy list/plain/binary output formats retain their shape. `--assert-no-contention` / MCP `assert_no_contention:true` makes detected contention a failure. These are before/after snapshots, not continuous monitoring: they cannot detect a temporary focus switch that switches back or attribute a user's own mouse movement. A target app can activate itself in response to an AX action; XYZLCU reports observed contention but cannot undo an already executed action. For asynchronous `press` and popup workers, the parent result only covers dispatch-time snapshots: worker completion, delayed app effects and later contention remain unobserved. Re-observe/read back after completion. The guarantee is the input policy, not control over another app's implementation.
 
-**Explicit escape hatches and compatibility changes.** `--allow-global` permits global HID/pasteboard use for **this command only**; global HID still requires the target already frontmost. `--allow-foreground` permits foreground/global routes for **this command only**, intentionally leaving the no-contention contract. `lock --unsafe` persistently relaxes the lock's safety policy until replaced/unlocked. Neither override is needed for normal AX/pid control. Strict locks reject `--no-lock` unless an explicit escape flag is also provided. Old scripts relying on clipboard fallback, broad app menus, activation, dragging, full-display captures, or `--no-lock` under a strict lock must change. Refusal is JSON, for example:
+**Global input gate (v0.7.1).** Without a lock, global keyboard input (`events-hid` / session tap), HID mouse click/move/drag/scroll, and app activation (including open-to-front or implicit activation) require either an explicit `--allow-global` for this command or an intended target named with `--app <name|bundleId>` / `--pid <pid>` that is already frontmost. XYZLCU verifies the target immediately before each event batch and stops with an error if the frontmost app changes during a sequence. Refusal happens before a global CGEvent is created, returns non-zero with `ok:false` and `code:"GLOBAL_INPUT_REFUSED"`, and reports the actual frontmost app. `--expect-front`, `--allow-foreground`, and `XYZLCU_ALLOW_GLOBAL=1` do not opt into unlocked global input. Automatic routing must pass the same gate before choosing a global route. AX-only and `postToPid` routes are unaffected. MCP uses the same policy with `allowGlobal:false` by default.
+
+**Explicit escape hatches and compatibility changes.** `--allow-global` permits global HID/pasteboard use for **this command only**, subject to the active lock policy. `--allow-foreground` relaxes locked foreground routes for **this command only**, intentionally leaving the no-contention contract; unlocked global actions still require the gate above. `lock --unsafe` persistently relaxes the lock's safety policy until replaced/unlocked. Neither override is needed for normal AX/pid control. Strict locks reject `--no-lock` unless an explicit escape flag is also provided. Old scripts relying on clipboard fallback, broad app menus, activation, dragging, full-display captures, or `--no-lock` under a strict lock must change. Refusal is JSON, for example:
 
 ```json
-{"error":"refused: would use global input","hint":"Use AX/pid, or explicitly opt in for this command."}
+{"ok":false,"error":"global input refused: no lock and no verified frontmost target; pass --app/--pid (must be frontmost) or --allow-global; frontmost: Terminal (pid 1234)","code":"GLOBAL_INPUT_REFUSED"}
 ```
 
 **Side-effect audit (strict lock).**
@@ -66,7 +68,7 @@ Every JSON object includes `frontmostBefore`, `frontmostAfter` and `contention` 
 | `move`, `drag`, ordinary mouse paths | CGWarpMouse / global mouse-down, up, wheel | Refuse; use window AX/pid routes for click/scroll |
 | `open`, `activate`, `hide`, `movewin`, `menu --activate` | Activation, raise, visible window/layout changes | Refuse without foreground override |
 | `menu`, shortcut menu lookup, `press/select` targeting menus | App-wide commands can escape a document or open dialogs | Window-scoped AX only; safe edit-menu allowlist; ambiguous app menus and unrelated popup roots refused |
-| `check --probe` | Tagged Shift-up and mouse-move HID health probes | Refuse; ordinary `check` only reads health metadata |
+| `check`, `check --probe`, health checks | Permission / historical event-tap metadata | Never create or post global input events; probe requests remain passive |
 | `request`, `request --open` | System permission prompts / opening System Settings | Refuse while strictly locked; grant permissions before locking |
 | `replay` | Recorded global key/mouse events | Refuse without explicit escape |
 | `screenshot` | Accidental full display / desktop crop exposing other apps | Confine to locked window; conflicting display/region/window selectors refused |
@@ -80,7 +82,7 @@ Manual acceptance on an authorized Mac: `./scripts/bg_selftest.sh`. Keep another
 
 ## Why XYZLCU (highlights)
 
-The numbers below are historical v0.5.0–0.6.1 measurements, not v0.7.0 timings: clicks now include a 60 ms hold and 75 ms hover delay, and keys a 30 ms hold. All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see [Benchmark](#benchmark-vs-lcu) for the method and full data. The LCU numbers come from the 0.4.2 round on the same machine (LCU 0.13.4). LCU does some things better than XYZLCU too, and those are listed in [Benchmark](#benchmark-vs-lcu) as well.
+The numbers below are historical v0.5.0–0.6.1 measurements, not v0.7.1 timings: clicks now include a 60 ms hold and 75 ms hover delay, and keys a 30 ms hold. All numbers are medians measured on the same Apple Silicon Mac (macOS 26+); see [Benchmark](#benchmark-vs-lcu) for the method and full data. The LCU numbers come from the 0.4.2 round on the same machine (LCU 0.13.4). LCU does some things better than XYZLCU too, and those are listed in [Benchmark](#benchmark-vs-lcu) as well.
 
 - 🔌 **Supports Grok, Codex, ChatGPT, Claude, DeepSeek** and other major agents: anything that runs shell commands can use it, and MCP-only clients get the built-in `xyzlcu mcp`. Tested: Grok Bot, Codex CLI, OpenCode, an MCP client (full handshake), Python / Node, and shell scripts; ChatGPT, Claude and DeepSeek use the same interface and are compatible (not yet tested first-hand). See [Supported agents](#supported-agents).
 - 🪟 **Single-window background control** (v0.7.0): strict `lock` confines actions/capture to one window and refuses global input, clipboard changes and activation by default. See [the policy, routes and limits](#single-window-background-control).
@@ -109,7 +111,7 @@ The numbers below are historical v0.5.0–0.6.1 measurements, not v0.7.0 timings
 
 ## Features
 
-- **v0.7.0**: strict single-window background control; `--pid`; verified `set-text`; deep `press` / `select`; AX scroll / text waits; contention assertions; permission-aware MCP. See the headline section for safety changes.
+- **v0.7.1**: unlocked global input gate, failed-lock tombstones, passive diagnostics and MCP `allowGlobal:false`; strict single-window background control; `--pid`; verified `set-text`; deep `press` / `select`; AX scroll / text waits; contention assertions; permission-aware MCP. See the headline section for safety changes.
 
 - 📸 **Screenshots**: a whole display, a single window (`--window`) or a region (`--region`), optional downscaling, `--fast` for a small JPEG in one flag; prints the point/pixel mapping
 - 🧠 **In-memory screenshots** (v0.4.2): `--base64` / `--stdout` produce the image in memory without writing a file; the daemon keeps capture streams on demand, so repeated captures of the same window take about 20 ms
@@ -120,7 +122,7 @@ The numbers below are historical v0.5.0–0.6.1 measurements, not v0.7.0 timings
 - ⌨️ **Keyboard**: types Unicode text directly (Chinese, emoji; bypasses the input method), key combos like `cmd+shift+4`
 - 🌳 **Accessibility tree**: dumps any app window's control tree (role, title, value, frame); `find` returns a control's frame and center by role/title, `click-el` finds and presses in one call, `wait` waits for a control to appear or disappear
 - 🪟 **Apps & windows**: list, open, activate and hide apps; list windows; move and resize windows; list displays
-- 🛣 **Multiple input paths**: Accessibility writes, keyboard events, direct-to-process delivery and menu paste, with route reporting and readback when available. Only `check --probe` actively posts test events; normal health checks inspect metadata.
+- 🛣 **Multiple input paths**: Accessibility writes, keyboard events, direct-to-process delivery and menu paste, with route reporting and readback when available. Health checks and `check --probe` inspect metadata without posting input.
 - ⏺ **Record / replay**: listen-only recording of keyboard and mouse (never intercepts input; no keys recorded in password fields or while locked), replayed with the original timing
 - 🔒 **Lock-screen guard**: refuses mouse and keyboard input while the screen is locked, so nothing gets typed into the password field
 - 📊 **Measured**: a per-operation speed comparison with LCU is in [Benchmark](#benchmark-vs-lcu), with a reproducible script
@@ -198,7 +200,7 @@ This prints the parent process chain and `responsiblePath`. The `.app` that `res
 
 `check` keeps the existing `responsibleProcess` path string and adds `responsibleProcessInfo` (`pid`, `name`, `path`, `bundleId`). MCP permission failures identify this host and explain which Privacy & Security switches it needs; restart that host after granting access. Terminal permissions do not automatically authorize a separate MCP host.
 
-`xyzlcu request` brings up system permission prompts. `xyzlcu request --open` also opens the first missing permission pane; select one with `--permission accessibility|screen-recording|input-monitoring`. Input Monitoring is needed for the recorder and explicit event-stream probes. XYZLCU never edits the TCC database or bypasses permissions.
+`xyzlcu request` brings up system permission prompts. `xyzlcu request --open` also opens the first missing permission pane; select one with `--permission accessibility|screen-recording|input-monitoring`. Input Monitoring is needed for the recorder. XYZLCU never edits the TCC database or bypasses permissions.
 
 ## Commands
 
@@ -279,7 +281,7 @@ Sometimes a process's keyboard event tap hangs: keyboard events are posted but t
 
 - Reads the system tap list (`CGGetEventTapList`): an active (not listen-only) tap with average latency above 1000 ms (`XYZLCU_TAP_THRESHOLD_MS`) is suspicious.
 - Those stats are historical: a high average does not prove that Siri or another process is currently blocking input. Normal checks report `suspectedTapStats` and do not synthesize any events.
-- Only explicit `check --probe` posts a tagged Shift-up and in-place mouse-move probe, timing each through a listen-only tap (400 ms deadline). Use it when diagnosing input, outside a background task. Passing probes clear stale blockers; normal daemon health metadata is cached for 1.5 s.
+- Health checks, `check` and `check --probe` are passive: they never create or post global keyboard/mouse input. Tap statistics are diagnostic metadata, not proof of successful event delivery; normal daemon health metadata is cached for 1.5 s.
 - `XYZLCU_EVENTS_HEALTH=bad` / `good` forces blocked / healthy, for testing the fallback paths (works with the daemon too; the client forwards these variables with each request).
 
 **The paths**
@@ -296,7 +298,7 @@ Sometimes a process's keyboard event tap hangs: keyboard events are posted but t
 
 **`type --via auto` (unlocked default; strict lock excludes global/paste routes)**
 
-- Healthy stream: `ax` when focus is a standard text control (`AXTextField` / `AXTextArea` / `AXComboBox` / `AXSearchField`), otherwise `events`.
+- Healthy stream: `ax` when focus is a standard text control (`AXTextField` / `AXTextArea` / `AXComboBox` / `AXSearchField`), otherwise `events` only if the global input gate passes; refusal never silently posts to the foreground.
 - Blocked stream: tries `ax` → `pid` → `paste`, verifying each by reading back and moving on only if it had no effect. It **never** uses `events-hid` while blocked, because those keystrokes would queue and burst out once the stream recovers.
 - If the field can't be read back (no way to verify), it stops at the current path instead of trying another, so the same text is never entered twice.
 - If no path worked: exit code 4, with each path's result in `tried`.
@@ -306,7 +308,7 @@ Sometimes a process's keyboard event tap hangs: keyboard events are posted but t
 
 **`key --via auto` (unlocked default; strict lock restricts shortcuts/menus)**
 
-- Healthy stream: `events` (`events-pid` with `--app`).
+- Healthy stream: `events` only if the global input gate passes (`events-pid` with `--app`).
 - Blocked stream: first looks for a menu item with the same shortcut (matching `AXMenuItemCmdChar` / `AXMenuItemCmdModifiers` / `AXMenuItemCmdGlyph`, enabled items first) and presses it; keys with no menu item (arrows, return, …) go through `CGEventPostToPid`.
 - If nothing works: exit code 4, suggesting `menu` with an explicit item. `--via events|menu|pid` forces a path; `XYZLCU_KEY_VIA` changes the default.
 - Output `keys[]`: the `path` used for each combo, plus `menuItem` when a menu item was pressed.
@@ -330,13 +332,13 @@ xyzlcu value TextEdit --window "My notes"                                  # rea
 - Inspect the readback and `verified`: only `true` proves the expected AX value landed. `false` with `reason` means the effect was not verified and must not be treated as confirmed input; failures include the tried routes.
 - Native Cocoa text controls usually support AX writes; web pages and custom UI may need pid events, which may be ignored. Clipboard routes require explicit relaxation under a strict lock.
 
-**`check` output**: `paths` lists whether events / mouse / ax / menu / pid / paste / record are usable (events and mouse include the measured `probeMs`); `typeOrder` / `keyOrder` show the order auto would try right now; `keyboardBlockedBy` lists the hung taps.
+**`check` output**: `paths` lists permissions and health metadata for events / mouse / ax / menu / pid / paste / record (`probeMs` is not an active delivery test); `typeOrder` / `keyOrder` show the order auto would try right now; `keyboardBlockedBy` lists the hung taps.
 
 **Limits**: `events-pid`, `menu` and `paste` bypass taps on the HID stream; if the app's own main thread is stuck, no path helps. To really fix it, restart the hung process (the one with `blocking: true` in `xyzlcu taps`) or log out / reboot. XYZLCU never kills processes for you.
 
 ## Driving WKWebView/Tauri/Electron apps in the background
 
-Use the process that owns the actual window, not a same-name watchdog. Start with `windows` / `apps`, lock that pid, then inspect the AX tree. These examples are a manual test recipe; v0.7.0 GUI acceptance is pending testing on a permission-enabled Mac.
+Use the process that owns the actual window, not a same-name watchdog. Start with `windows` / `apps`, lock that pid, then inspect the AX tree. These examples are a manual test recipe; v0.7.1 GUI acceptance is pending testing on a permission-enabled Mac.
 
 ```bash
 xyzlcu lock --pid 1234 --window-title XYZStudio
@@ -523,7 +525,7 @@ Exit codes
   4 control not found, wait timed out, input had no effect or --window mismatch; 5 daemon required but unreachable.
 
 Safety rules
-- Prefer `lock --pid N` and AX controls/text writes. Never permit global input silently; use `--expect-front "App"` for foreground workflows and inspect frontmostBefore/frontmostAfter plus verified.
+- Prefer `lock --pid N` and AX controls/text writes. Never permit global input silently; name the already-frontmost target with `--app "App"` / `--pid N` (or explicitly opt in with `--allow-global`) for foreground workflows and inspect frontmostBefore/frontmostAfter plus verified.
 - Loop: observe → locate → act → verify. Re-run find / screenshot after acting to confirm the result.
 - Ask the user before irreversible actions such as paying, deleting, sending or submitting.
 - Never use `--force` to get around the lock-screen guard.
@@ -564,7 +566,7 @@ const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Bu
 
 - Read-only: `check`, `observe` (frontmost app, target window, compact AX text), `screenshot`, `apps`, `windows`, `cursor`, `ax`, `find`, `wait_text`
 - Actions: existing `click_element`, `click`, `type_text`, `key`, `activate`; new `set_text`, `press` (`nth`, `list`, `async`), `select_popup_item` (`popup`, `item`), `scroll_to`
-- Background: `lock` accepts `app` / `pid`, `window_title` / `window_id`, `unsafe`, `unlock`, `status`. Tools accept `allow_foreground`, `allow_global`, `assert_no_contention` and `expect_front`; these map to the CLI policy. Omit the app when locked. `ax.focus` is `content`, `window` or `web`.
+- Background: `lock` accepts `app` / `pid`, `window_title` / `window_id`, `unsafe`, `unlock`, `status`. Global-input tools accept `allowGlobal` (default `false`); `allow_foreground`, `assert_no_contention` and `expect_front` map to the CLI policy. The generic tool accepts `--allow-global` in its CLI arguments. Omit the app when locked. `ax.focus` is `content`, `window` or `web`.
 - Batch: `batch` (`steps` is an array of command strings, e.g. `["click-el TextEdit --title Save", "wait TextEdit --role AXSheet", "screenshot --diff"]`; one call runs them in order and returns each step's output and images; `continue_on_error` keeps going after a failure). Saves round trips and model turns; screenshot steps default to half-size JPEG
 - `screenshot` defaults to fast JPEG, quality 0.6 and half scale, including locked windows. `max_side` caps the longest image dimension; `scale` overrides the default. `diff: true` returns only changed areas. Metadata includes coordinate conversion; use the returned scale, not an assumed 2× Retina factor.
 - Generic: `xyzlcu` (an `args` array, runs any subcommand except `mcp`, `serve`, `record`, `replay`, `batch` and `--stdout`)
@@ -612,7 +614,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 
 ## Benchmark (vs LCU)
 
-These tables preserve earlier version measurements. v0.7.0 has longer click/key holds and different AX routes; no v0.7.0 GUI benchmark is claimed here.
+These tables preserve earlier version measurements. v0.7.0 has longer click/key holds and different AX routes; no v0.7.1 GUI benchmark is claimed here.
 
 **Where LCU still has the edge** (up front):
 
@@ -864,12 +866,15 @@ Without the daemon, v0.3.0 is on par with v0.2.0 (within measurement noise); mos
 - Each app request times out after 3 seconds, and output is capped at 3000 nodes.
 
 **Keys went to the wrong window?**
-- Global keyboard events go to the frontmost app. Prefer lock + AX/pid, or add `--expect-front "App"`. A named target that differs from the frontmost app is rejected before a global route runs; inspect `frontmostBefore` / `frontmostAfter`.
+- Global keyboard events go to the frontmost app. Prefer lock + AX/pid. Unlocked global routes require `--app` / `--pid` matching the current frontmost app before every event batch, or explicit `--allow-global`; `--expect-front` alone is not authorization. A mismatched target is rejected before a global route runs; inspect `frontmostBefore` / `frontmostAfter`.
 
 ## Safety
 
 - With Accessibility permission, anything can be clicked or typed. Use it only where you trust the setup, and turn the switch off when you don't need it.
-- **Strict lock (v0.7.0)**: AX/pid only by default; global input, pasteboard routes, foreground actions, app-wide/unknown menus and health probes are refused. `--allow-global` and `--allow-foreground` are explicit command-local escape hatches; `lock --unsafe` persists relaxation. See [the complete side-effect audit](#single-window-background-control).
+- **Unlocked global input (v0.7.1)**: global keyboard/mouse events and activation require explicit `--allow-global` or an already-frontmost `--app` / `--pid`, rechecked before every event batch. Otherwise return `GLOBAL_INPUT_REFUSED` with the actual frontmost app before creating an event. `XYZLCU_ALLOW_GLOBAL=1` is ignored. MCP `allowGlobal` defaults to `false`; auto routes obey the same gate. AX/pid routes remain available.
+- **Failed locks fail closed**: a failed `lock` persists a `lock-failed` tombstone in the shared lock file and daemon. Input then returns `LOCK_FAILED` until `unlock` or a successful `lock`; empty/missing option values are hard argument errors.
+- **Passive diagnostics**: health checks, `check` and probe paths never emit global input.
+- **Strict lock**: AX/pid only by default; global input, pasteboard routes, foreground actions and app-wide/unknown menus are refused. `--allow-global` and `--allow-foreground` are explicit command-local lock escape hatches; `lock --unsafe` persists relaxation. See [the complete side-effect audit](#single-window-background-control).
 - **Input evidence**: JSON input results include `frontmostBefore` / `frontmostAfter`. Check the route and readback: `verified:false` with `reason` is not confirmed delivery, and frontmost reporting does not prove that the intended control changed.
 - **Lock-screen guard**: while the screen is locked, `click / move / drag / scroll / type / key` refuse to run and exit with code 3. `--force` overrides this but isn't recommended.
 - **Recordings may contain what you typed**: they stay on this Mac (mode 0600), and no keys are recorded in password fields or while locked; delete them when done and don't share them. Check the frontmost window before `replay`, `type` or `key`.
@@ -902,6 +907,7 @@ Then, in System Settings > Privacy & Security, turn off or remove any apps you n
 
 ## Changelog
 
+- **0.7.1**: global input gate for unlocked CLI/daemon/MCP, explicit `--allow-global` / frontmost target verification, failed-lock tombstones and passive diagnostics.
 - **0.7.0**: single-window background control with strict locks, AX/pid input, window-only screenshots, contention snapshots/assertions and an isolated TextEdit acceptance script; focused AX writes, deep controls, scroll/text waits and TCC diagnostics. See [CHANGELOG.md](CHANGELOG.md).
 
 - **0.6.1**: window-locked background mode and fixes.

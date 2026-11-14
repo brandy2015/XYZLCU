@@ -4,7 +4,7 @@
 
 [English](README.md) | **中文**
 
-**当前版本 0.7.0**：单窗口后台控制，默认严格锁、AX/pid 路线与争用证据。见 [CHANGELOG.md](CHANGELOG.md)。
+**当前版本 0.7.1**：全局输入安全门、锁定失败保护与严格单窗口后台控制。见 [CHANGELOG.md](CHANGELOG.md)。
 
 [![License: MIT](https://img.shields.io/github/license/brandy2015/XYZLCU)](LICENSE) [![Platform: macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey)](#系统要求) [![Universal: Apple Silicon + Intel](https://img.shields.io/badge/arch-Apple%20Silicon%20%2B%20Intel-blue)](#系统要求) [![Release](https://img.shields.io/github/v/release/brandy2015/XYZLCU)](https://github.com/brandy2015/XYZLCU/releases/latest) [![智能体: Grok · Codex · ChatGPT · Claude · DeepSeek](https://img.shields.io/badge/agents-Grok%20%C2%B7%20Codex%20%C2%B7%20ChatGPT%20%C2%B7%20Claude%20%C2%B7%20DeepSeek-8A2BE2)](#支持的智能体)
 
@@ -34,9 +34,9 @@ xyzlcu lock --status
 xyzlcu unlock
 ```
 
-多窗口应用建议 `lock --pid P --window-id N`。持久锁损坏/无法读取时按拒绝执行处理；应用退出或窗口关闭不会静默清除锁，需要显式 `unlock` 或重新 `lock` 恢复。锁保存在 `XYZLCU_SOCKET` 同目录（默认 `~/.xyzlcu/lock.json`），使用同一 socket 的 CLI、守护进程与 MCP 共用。显式指定的 app/pid/window 必须与锁一致。单条命令可用 `--background --app A [--window-title T]`。锁定下的坐标/AX 中心点，以及每张指定窗口截图的原点/差异区域统一是**窗口相对点坐标**，左上角 `(0,0)`；图像像素仍需按返回的比例换算。
+多窗口应用建议 `lock --pid P --window-id N`。持久锁损坏/无法读取时按拒绝执行处理；应用退出或窗口关闭不会静默清除锁，需要显式 `unlock` 或成功重新 `lock` 恢复。`lock` 失败（包括无效/空选择器、未知选项）会在同一状态文件及守护进程写入 `lock-failed` 标记，之后输入命令返回 `LOCK_FAILED`，直到 `unlock` 或成功 `lock`。选项值为空或缺失属于硬参数错误，不会把下一个选项当作值。锁保存在 `XYZLCU_SOCKET` 同目录（默认 `~/.xyzlcu/lock.json`），使用同一 socket 的 CLI、守护进程与 MCP 共用。显式指定的 app/pid/window 必须与锁一致。单条命令可用 `--background --app A [--window-title T]`。锁定下的坐标/AX 中心点，以及每张指定窗口截图的原点/差异区域统一是**窗口相对点坐标**，左上角 `(0,0)`；图像像素仍需按返回的比例换算。
 
-MCP 先调 `lock`：`{"app":"TextEdit","window_title":"Notes"}` 或 `{"pid":1234,"window_id":5678}`；再调 `set_text`：`{"role":"AXTextArea","text":"你好","assert_no_contention":true}`、`type_text`：`{"text":"世界","via":"pid","assert_no_contention":true}` 和 `screenshot`：`{}`。`allow_foreground`、`allow_global`、`assert_no_contention` 对应 CLI 选项；`lock` 支持 `unsafe:true` 和 `unlock:true`。专用工具缺少某个选项时，可用通用 `xyzlcu` 工具的 CLI 参数。
+MCP 先调 `lock`：`{"app":"TextEdit","window_title":"Notes"}` 或 `{"pid":1234,"window_id":5678}`；再调 `set_text`：`{"role":"AXTextArea","text":"你好","assert_no_contention":true}`、`type_text`：`{"text":"世界","via":"pid","assert_no_contention":true}` 和 `screenshot`：`{}`。可能发送全局输入的工具提供 `allowGlobal`（布尔值，默认 `false`），对应 `--allow-global`；`allow_foreground`、`assert_no_contention` 对应各自 CLI 选项；`lock` 支持 `unsafe:true` 和 `unlock:true`。专用工具缺少某个选项时，可用通用 `xyzlcu` 工具的 CLI 参数。
 
 | 操作 | 严格后台路线 | 证据 / 限制 |
 |---|---|---|
@@ -51,10 +51,12 @@ pid 鼠标投递把窗口点换成事件所需全局位置，填入窗口号并�
 
 每个 JSON 对象带 `frontmostBefore`、`frontmostAfter`、`contention`（鼠标位置或前台 pid 变化）；旧的列表/纯文本/二进制输出保持格式。`--assert-no-contention` / MCP `assert_no_contention:true` 检测到争用就失败。这只是前后快照，并非连续监测：无法发现短暂切换又切回，也无法区分用户自己移动鼠标。目标应用可能因 AX 动作自行激活；工具报告观察到的变化，但不能撤销已执行动作。异步 `press` 和下拉菜单 worker 的父进程结果只覆盖派发时快照；worker 完成、应用延迟效果和之后的争用不在监测范围，完成后应重新观察/读回。保证的是投递策略，不能替其他应用保证内部行为。
 
-**显式退出保护与兼容性变化。** `--allow-global` 只对**本条命令**放行全局 HID / 剪贴板；全局 HID 仍要求目标已在前台。`--allow-foreground` 只对**本条命令**放行前台/全局路线，主动退出无争用约束。`lock --unsafe` 持续放宽锁策略，直到重新锁定或解除。普通 AX/pid 操作不需要这些选项。严格锁下 `--no-lock` 必须同时给显式放行选项。旧脚本若依赖剪贴板回退、任意应用菜单、激活、拖拽、整屏截图或 `--no-lock`，需调整。拒绝时返回明确 JSON，例如：
+**全局输入安全门（v0.7.1）。** 未锁定时，全局键盘输入（`events-hid` / session tap）、HID 鼠标点击/移动/拖拽/滚动，以及应用激活（含打开到前台、隐式激活），必须显式传入本条命令的 `--allow-global`，或用 `--app <名称|bundleId>` / `--pid <pid>` 指定已经处于前台的目标。每批事件发送前立即核对前台目标，序列中前台改变就停止并报错。拒绝决策发生在创建全局 CGEvent 之前：非零退出，JSON 含 `ok:false`、`code:"GLOBAL_INPUT_REFUSED"` 及实际前台应用。`--expect-front`、`--allow-foreground`、`XYZLCU_ALLOW_GLOBAL=1` 都不能放行未锁定的全局输入。自动路线选择同样必须通过安全门，AX-only 和 `postToPid` 不受影响。MCP 执行相同策略，`allowGlobal` 默认为 `false`。
+
+**显式退出保护与兼容性变化。** `--allow-global` 只对**本条命令**放行全局 HID / 剪贴板，仍受当前锁策略约束。`--allow-foreground` 只对**本条命令**放宽锁定时的前台路线，主动退出无争用约束；未锁定的全局动作仍须通过上面的安全门。`lock --unsafe` 持续放宽锁策略，直到重新锁定或解除。普通 AX/pid 操作不需要这些选项。严格锁下 `--no-lock` 必须同时给显式放行选项。旧脚本若依赖剪贴板回退、任意应用菜单、激活、拖拽、整屏截图或 `--no-lock`，需调整。拒绝时返回明确 JSON，例如：
 
 ```json
-{"error":"refused: would use global input","hint":"Use AX/pid, or explicitly opt in for this command."}
+{"ok":false,"error":"global input refused: no lock and no verified frontmost target; pass --app/--pid (must be frontmost) or --allow-global; frontmost: Terminal (pid 1234)","code":"GLOBAL_INPUT_REFUSED"}
 ```
 
 **隐含副作用审计（严格锁）。**
@@ -66,7 +68,7 @@ pid 鼠标投递把窗口点换成事件所需全局位置，填入窗口号并�
 | `move`、`drag`、普通鼠标路线 | CGWarpMouse / 全局按下、抬起、滚轮 | 拒绝；点击/滚动走窗口 AX/pid |
 | `open`、`activate`、`hide`、`movewin`、`menu --activate` | 激活、抬升、可见窗口布局改变 | 无前台放行则拒绝 |
 | `menu`、快捷键菜单查找、`press/select` 菜单 | 应用级操作可能逃出文稿或新开对话框 | 限窗口 AX；安全编辑菜单白名单；作用域不明则拒绝 |
-| `check --probe` | 带标记 Shift 抬起和鼠标移动 HID 探针 | 拒绝；普通 `check` 只读健康状态 |
+| `check`、`check --probe`、健康检查 | 权限 / 历史事件监听元数据 | 不创建、不发送全局输入事件；probe 请求也保持被动 |
 | `request`、`request --open` | 权限弹窗 / 打开系统设置 | 严格锁下拒绝；先授权再锁定 |
 | `replay` | 录制的全局键鼠事件 | 无显式放行则拒绝 |
 | `screenshot` | 整屏或桌面裁剪可能泄露其他应用 | 只截锁定窗口；冲突的 display/region/window 拒绝 |
@@ -80,7 +82,7 @@ ScreenCaptureKit 可以截被覆盖窗口，以及系统仍提供背板内容的
 
 ## 为什么选 XYZLCU（核心优势）
 
-下面保留的是 v0.5.0–0.6.1 历史测速，不代表 v0.7.0：新版点击默认增加 75 毫秒悬停和 60 毫秒按住时间，按键默认按住 30 毫秒。数字都是在同一台 Apple Silicon Mac（macOS 26+）上实测的中位数，测法和完整数据见[性能对比](#性能对比与-lcu)。LCU 的数字是 0.4.2 那一轮在同一台机器上测的（LCU 0.13.4）。LCU 也有比 XYZLCU 强的地方，同样写在[性能对比](#性能对比与-lcu)里。
+下面保留的是 v0.5.0–0.6.1 历史测速，不代表 v0.7.1：新版点击默认增加 75 毫秒悬停和 60 毫秒按住时间，按键默认按住 30 毫秒。数字都是在同一台 Apple Silicon Mac（macOS 26+）上实测的中位数，测法和完整数据见[性能对比](#性能对比与-lcu)。LCU 的数字是 0.4.2 那一轮在同一台机器上测的（LCU 0.13.4）。LCU 也有比 XYZLCU 强的地方，同样写在[性能对比](#性能对比与-lcu)里。
 
 - 🔌 **支持 Grok、Codex、ChatGPT、Claude、DeepSeek** 等主流智能体：能跑 shell 命令就能用，只认 MCP 的客户端用内置的 `xyzlcu mcp`。已实测：Grok Bot、Codex CLI、OpenCode、MCP 客户端（完整握手）、Python / Node、shell 脚本；ChatGPT、Claude、DeepSeek 走同一接口，兼容（还没亲自实测）。见[支持的智能体](#支持的智能体)。
 - 🪟 **单窗口后台控制**（v0.7.0）：严格 `lock` 把操作与截图限制在一个窗口，默认拒绝全局输入、剪贴板改动及激活。见[策略、路线和限制](#单窗口后台控制single-window-background-control)。
@@ -109,7 +111,7 @@ ScreenCaptureKit 可以截被覆盖窗口，以及系统仍提供背板内容的
 
 ## 功能
 
-- **v0.7.0**：严格单窗口后台控制、`--pid`、可核对的 `set-text`、深层 `press` / `select`、AX 滚动 / 文字等待、争用断言与宿主权限诊断 MCP。安全变化见开头章节。
+- **v0.7.1**：未锁定全局输入安全门、锁定失败标记、被动诊断及 MCP `allowGlobal:false`；严格单窗口后台控制、`--pid`、可核对的 `set-text`、深层 `press` / `select`、AX 滚动 / 文字等待、争用断言与宿主权限诊断 MCP。安全变化见开头章节。
 
 - 📸 **截屏**：截整块屏、单个窗口（`--window`）或一块区域（`--region`），可缩小；`--fast` 一键出小 JPEG；会输出点坐标与像素的换算关系
 - 🧠 **内存截图**（v0.4.2）：`--base64` / `--stdout` 直接在内存里出图，不写文件；守护进程按需保持截图流，重复截同一个窗口约 20 毫秒
@@ -120,7 +122,7 @@ ScreenCaptureKit 可以截被覆盖窗口，以及系统仍提供背板内容的
 - ⌨️ **键盘**：直接输入 Unicode 文字（中文、emoji 都行，不经过输入法），支持组合键（`cmd+shift+4`）
 - 🌳 **辅助功能树**：导出任意应用窗口的控件树（角色、标题、值、坐标）；`find` 按角色/标题直接返回坐标和中心点，`click-el` 一步找到并按下，`wait` 等控件出现或消失
 - 🪟 **应用与窗口**：列出、打开、激活、隐藏应用；列出窗口；移动和调整窗口大小；列出显示器
-- 🛣 **多条输入路径**：辅助功能写值、键盘事件、直接投递进程、菜单粘贴，输出实际路线并在可读时核对。只有显式的 `check --probe` 才发送探测事件，普通检查只读取状态。
+- 🛣 **多条输入路径**：辅助功能写值、键盘事件、直接投递进程、菜单粘贴，输出实际路线并在可读时核对。健康检查和 `check --probe` 只读取元数据，不发送输入。
 - ⏺ **录制 / 回放**：只监听地录下键鼠操作（不拦截输入，密码框和锁屏时不录按键），按原节奏回放
 - 🔒 **锁屏保护**：屏幕锁定时拒绝键鼠操作，防止把字打进锁屏密码框
 - 📊 **实测数据**：和 LCU 的逐项速度对比见[性能对比](#性能对比与-lcu)，脚本可复现
@@ -279,7 +281,7 @@ xyzlcu whoami
 
 - 读系统事件监听列表（`CGGetEventTapList`）：主动拦截（不是只监听）、平均延迟超过 1000 毫秒（`XYZLCU_TAP_THRESHOLD_MS` 可改）的监听算可疑。
 - 这些统计是历史值，平均延迟高不能证明 Siri 等进程此刻拦住输入。普通检查输出 `suspectedTapStats`，不会发送任何合成探测事件。
-- 只有显式 `check --probe` 才发送带标记的 Shift 抬起和原地鼠标移动，用只监听的 tap 计时（400 毫秒截止）。应在排查输入问题时单独使用，不放进后台任务。探测通过就清除过时的拦截判断；普通守护进程状态缓存 1.5 秒。
+- 健康检查、`check`、`check --probe` 均为被动诊断，不创建、不发送任何全局键鼠输入。监听统计是诊断元数据，不代表事件已成功送达；普通守护进程状态缓存 1.5 秒。
 - `XYZLCU_EVENTS_HEALTH=bad` / `good` 强制当作卡住 / 正常，用来测试备用路径（守护进程模式下也生效，客户端会把这些环境变量随请求转发过去）。
 
 **各条路**
@@ -296,7 +298,7 @@ xyzlcu whoami
 
 **`type --via auto`（未锁定默认；严格锁排除全局/粘贴路线）**
 
-- 事件流正常：焦点是标准文本框（`AXTextField` / `AXTextArea` / `AXComboBox` / `AXSearchField`）时走 `ax`，否则走 `events`。
+- 事件流正常：焦点是标准文本框（`AXTextField` / `AXTextArea` / `AXComboBox` / `AXSearchField`）时走 `ax`，否则仅在通过全局输入安全门后走 `events`；拒绝时不会静默向前台投递。
 - 事件流卡住：依次试 `ax` → `pid` → `paste`，每一步都读回核对，没生效才换下一条。卡住时**不会**用 `events-hid`，那些按键会排队，事件流恢复后突然打出来。
 - 读不到输入框内容、没法核对时，就停在当前这条路，不再换路，避免同一段文字被输入两次。
 - 所有路都没生效：退出码 4，错误里列出每条路的结果（`tried`）。
@@ -306,7 +308,7 @@ xyzlcu whoami
 
 **`key --via auto`（未锁定默认；严格锁限制快捷键/菜单）**
 
-- 事件流正常：`events`（带 `--app` 时是 `events-pid`）。
+- 事件流正常：通过全局输入安全门后才走 `events`（带 `--app` 时是 `events-pid`）。
 - 事件流卡住：先在应用菜单栏里找快捷键相同的菜单项（比对 `AXMenuItemCmdChar` / `AXMenuItemCmdModifiers` / `AXMenuItemCmdGlyph`，优先可用的项）并按下；找不到对应菜单项（方向键、return 等）就用 `CGEventPostToPid`。
 - 都不行：退出码 4，提示改用 `menu` 指定菜单项。`--via events|menu|pid` 指定一条路，`XYZLCU_KEY_VIA` 改默认值。
 - 输出 `keys[]`：每个组合键实际走的 `path`，走菜单时还有 `menuItem`。
@@ -330,13 +332,13 @@ xyzlcu value TextEdit --window 我的笔记                         # 读回核�
 - 检查读回值和 `verified`：只有 `true` 才证明预期的 AX 值已写入；`false` 加 `reason` 表示效果未核实，不能算输入已确认，失败会列出尝试路线。
 - 原生 Cocoa 文本框通常支持 AX 写入；网页和自绘界面可能需要 pid 事件，也可能忽略它。严格锁下剪贴板路线必须显式放宽。
 
-**`check` 输出**：`paths` 里列出 events / mouse / ax / menu / pid / paste / record 是否可用（events、mouse 带实测的 `probeMs`），`typeOrder` / `keyOrder` 是当前 auto 会按什么顺序试，`keyboardBlockedBy` 是卡住的监听。
+**`check` 输出**：`paths` 里列出 events / mouse / ax / menu / pid / paste / record 的权限及健康元数据（`probeMs` 不是主动送达测试），`typeOrder` / `keyOrder` 是当前 auto 会按什么顺序试，`keyboardBlockedBy` 是卡住的监听。
 
 **限制**：`events-pid`、`menu`、`paste` 绕开的是 HID 事件流上的监听；如果应用自己的主线程卡住了，哪条路都没用。要真正修好，需要重启卡住的进程（`xyzlcu taps` 里 `blocking: true` 的那个）或者注销/重启。XYZLCU 不会替你结束任何进程。
 
 ## 在后台操控 WKWebView / Tauri / Electron 应用
 
-先用 `windows` / `apps` 找到真正拥有窗口的进程，避免选到同名 watchdog，再按 pid 锁定并观察 AX。下面是人工验收步骤；v0.7.0 的真实 GUI 行为仍需在有权限的 Mac 上验收。
+先用 `windows` / `apps` 找到真正拥有窗口的进程，避免选到同名 watchdog，再按 pid 锁定并观察 AX。下面是人工验收步骤；v0.7.1 的真实 GUI 行为仍需在有权限的 Mac 上验收。
 
 ```bash
 xyzlcu lock --pid 1234 --window-title XYZStudio
@@ -523,7 +525,7 @@ XYZLCU 是**通用的**：它不依赖任何智能体框架，也不需要插件
   4 找不到控件、wait 超时、输入没生效或 --window 不符；5 要求守护进程但连不上。
 
 安全规则
-- 优先 `lock --pid N` 和 AX 控件/写值；绝不静默放行全局输入。前台流程用 `--expect-front "App"`，检查 frontmostBefore/frontmostAfter 和 verified。
+- 优先 `lock --pid N` 和 AX 控件/写值；绝不静默放行全局输入。前台流程用 `--app "App"` / `--pid N` 指定已在前台的目标（或显式 `--allow-global`），检查 frontmostBefore/frontmostAfter 和 verified。
 - 循环：观察 → 定位 → 操作 → 验证。操作后重新 find / 截图确认结果。
 - 付款、删除、发送、提交等不可撤销的操作先征得用户同意。
 - 不要用 `--force` 绕过锁屏保护。
@@ -564,7 +566,7 @@ const jpeg = execFileSync("xyzlcu", ["screenshot", "--fast", "--stdout"]); // Bu
 
 - 只读：`check`、`observe`（前台应用、目标窗口、简洁 AX 文字）、`screenshot`、`apps`、`windows`、`cursor`、`ax`、`find`、`wait_text`
 - 操作：保留 `click_element`、`click`、`type_text`、`key`、`activate`；新增 `set_text`、`press`（`nth`、`list`、`async`）、`select_popup_item`（`popup`、`item`）、`scroll_to`
-- 后台：`lock` 支持 `app` / `pid`、`window_title` / `window_id`、`unsafe`、`unlock`、`status`。工具支持 `allow_foreground`、`allow_global`、`assert_no_contention`、`expect_front`，对应 CLI 策略。锁定后可省应用名；`ax.focus` 为 `content` / `window` / `web`。
+- 后台：`lock` 支持 `app` / `pid`、`window_title` / `window_id`、`unsafe`、`unlock`、`status`。可能发送全局输入的工具支持 `allowGlobal`（默认 `false`）；`allow_foreground`、`assert_no_contention`、`expect_front` 对应 CLI 策略。通用工具可在 CLI 参数中传入 `--allow-global`。锁定后可省应用名；`ax.focus` 为 `content` / `window` / `web`。
 - 批量：`batch`（`steps` 是命令字符串数组，比如 `["click-el TextEdit --title 保存", "wait TextEdit --role AXSheet", "screenshot --diff"]`，一次调用按顺序执行，返回每一步的输出和图片；`continue_on_error` 出错后继续）。省掉多次往返和模型多轮生成；截图步骤默认半尺寸 JPEG
 - `screenshot` 默认 fast JPEG、质量 0.6、缩放 0.5，锁定窗口也一样；`max_side` 限制图片最长边，`scale` 覆盖默认缩放。`diff: true` 只返回变化区域。元数据给出坐标换算，应按返回比例计算，不要假定 Retina 一定为 2 倍。
 - 通用：`xyzlcu`（`args` 数组，执行任意子命令；不允许 `mcp`、`serve`、`record`、`replay`、`batch` 和 `--stdout`）
@@ -864,12 +866,15 @@ v0.3.0 新增常驻守护进程（`serve`）、窗口 / 区域截图、`--fast`�
 - 每个应用的请求超时是 3 秒，最多输出 3000 个节点。
 
 **按键发到了别的窗口？**
-- 全局键盘事件发给当前前台应用。优先用锁定 + AX/pid，前台流程可加 `--expect-front "App"`。明确目标与前台不同就拒绝全局输入；检查 `frontmostBefore` / `frontmostAfter`。
+- 全局键盘事件发给当前前台应用。优先用锁定 + AX/pid。未锁定全局路线需要 `--app` / `--pid` 与每批事件前的前台应用一致，或显式 `--allow-global`；单独 `--expect-front` 不构成放行。明确目标与前台不同就拒绝全局输入；检查 `frontmostBefore` / `frontmostAfter`。
 
 ## 安全须知
 
 - 有了辅助功能权限，就能模拟任何键鼠操作。只在你信任的环境里使用；不用时可以到系统设置里关掉开关。
-- **严格锁（v0.7.0）**：默认仅 AX/pid；全局输入、剪贴板、前台操作、应用级/未知菜单及健康探针拒绝。`--allow-global` / `--allow-foreground` 为单条命令显式放行，`lock --unsafe` 持续放宽。见[完整副作用审计](#单窗口后台控制single-window-background-control)。
+- **未锁定全局输入（v0.7.1）**：全局键鼠事件及激活必须显式 `--allow-global`，或指定已经处于前台的 `--app` / `--pid`，并在每批事件前复核；否则创建事件前即返回 `GLOBAL_INPUT_REFUSED`，附实际前台应用。`XYZLCU_ALLOW_GLOBAL=1` 无效。MCP `allowGlobal` 默认 `false`，自动路线也遵守同一安全门；AX/pid 路线不受影响。
+- **锁定失败保持拒绝**：`lock` 失败会在共享锁文件及守护进程写入 `lock-failed` 标记，之后输入返回 `LOCK_FAILED`，直到 `unlock` 或成功 `lock`；空/缺失选项值是硬参数错误。
+- **被动诊断**：健康检查、`check` 和 probe 路径不会发送全局输入。
+- **严格锁**：默认仅 AX/pid；全局输入、剪贴板、前台操作、应用级/未知菜单拒绝。`--allow-global` / `--allow-foreground` 为单条命令的锁策略显式放行，`lock --unsafe` 持续放宽。见[完整副作用审计](#单窗口后台控制single-window-background-control)。
 - **输入证据**：输入 JSON 带 `frontmostBefore` / `frontmostAfter`；要同时检查 route 和读回值。`verified:false` 加 `reason` 不代表已确认送达，前台应用没变也不代表目标控件已改变。
 - **锁屏保护**：锁屏时 `click / move / drag / scroll / type / key` 返回码 3 并拒绝执行。`--force` 可以强制执行，但不建议。
 - **录制文件可能含有你打的字**：只存本机（权限 0600），密码框和锁屏时不录按键；用完删掉，不要分享。回放、`type`、`key` 前同样先确认前台窗口。
@@ -902,6 +907,7 @@ rm -rf ~/.xyzlcu
 
 ## 更新记录
 
+- **0.7.1**：CLI/守护进程/MCP 未锁定全局输入安全门，显式 `--allow-global` / 前台目标复核、锁定失败标记及被动诊断。
 - **0.7.0**：单窗口后台控制、默认严格锁、AX/pid 输入、单窗口截图、争用快照/断言与隔离 TextEdit 验收脚本；AX 聚焦写值、深层控件、滚动/文字等待、TCC 诊断。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 - **0.6.1**：锁定窗口的后台模式和若干修复。

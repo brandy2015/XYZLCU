@@ -1,11 +1,12 @@
 # XYZLCU TODO
 
-> 0.7.0：已勾选表示实现完成；本轮仅做无 GUI 自测和编译，真实应用回归仍需在已授权的 macOS 会话验收。`responsibleProcess` 保留旧路径字符串，结构化名称/路径/bundle id 在 `responsibleProcessInfo`。
+> 0.7.1：已勾选表示实现完成；本轮仅做无 GUI 自测和编译，真实应用回归仍需在已授权的 macOS 会话验收。`responsibleProcess` 保留旧路径字符串，结构化名称/路径/bundle id 在 `responsibleProcessInfo`。
 
 > 来源：2026-11-14 在 LM Studio 0.4.28（Electron）里接入 `xyzlcu mcp` 的实测。只记录，不代表已排期。
 
-## P0 · 0.7.0 单窗口后台控制验收
+## P0 · 0.7.1 全局输入安全门与单窗口后台控制验收
 
+- [x] 无锁全局输入须显式 `--allow-global` 或已在前台的 `--app` / `--pid`；每个事件前复核；失败 lock 持久化 `LOCK_FAILED`，CLI/守护进程/MCP 共用。
 - [x] 默认严格 `lock` / MCP `lock`，目标 pid/window 不一致拒绝；全局输入、剪贴板、前台操作和作用域不明菜单无静默回退。
 - [x] 单条命令 `--allow-global` / `--allow-foreground`、持久 `lock --unsafe`；严格锁下无显式放行不能 `--no-lock`；锁损坏拒绝执行，目标退出保留锁直到显式恢复。
 - [x] 审计 type/key/click/drag/scroll/menu/set-text/press/select/paste/screenshot/open/activate/hide/movewin/replay/request/check --probe，双语 README 列出副作用与拒绝策略。
@@ -17,7 +18,7 @@
 - [ ] 手工测试两个同进程窗口：锁定一个并覆盖，确认输入/AX 值/截图均不落到另一窗口；关闭目标后必须拒绝而非改找窗口。
 - [ ] 对 Safari/WKWebView、Electron、原生 Cocoa 分别记录 AX/pid 支持、verified/reason 和 App Nap 延迟；被忽略的 pid 事件不算成功。
 - [ ] 覆盖窗口、部分屏外、最小化、其他 Space、受保护内容逐项核对图像及明确失败；不切 Space、不取消最小化；macOS 13 单帧 SCStream 与 14+ 捕获路线分别验收。
-- [ ] 检查每个拒绝路径无 HID、指针移动、激活、共享剪贴板改动；确认普通 check 不发探针、严格 check --probe 拒绝。
+- [ ] 检查每个拒绝路径无 HID、指针移动、激活、共享剪贴板改动；确认 check / check --probe / 健康检查均为被动诊断，不创建或投递输入事件。
 - [ ] 手工验证 contention 断言及 MCP 宿主 TCC 归属；记录前后快照无法发现短暂切换、异步 worker 完成及之后延迟效果/争用未被父进程监测这些限制。
 
 ## P0 · 点击 / 按键在 Electron（Chromium）里不生效
