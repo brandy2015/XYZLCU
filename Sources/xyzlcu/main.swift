@@ -19,15 +19,15 @@ var outBuf: String? = nil
 func emit(_ s: String) { if outBuf != nil { outBuf! += s; outBuf! += "\n" } else { print(s) } }
 func out(_ obj: Any) {
     var payload = obj
-    if let before = inputFrontmostBefore, var dict = obj as? [String: Any] {
-        inputResultEmitted = true
-        dict["frontmostBefore"] = before; dict["frontmostAfter"] = frontmostInfo()
+    if var dict = obj as? [String: Any] {
+        dict = contentionEvidence(dict)
+        if inputFrontmostBefore != nil { inputResultEmitted = true }
         payload = dict
     }
     if let d = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
        let s = String(data: d, encoding: .utf8) { emit(s) } else { emit("\(obj)") }
 }
-struct XErr: Error { let msg: String; let code: Int32 }
+struct XErr: Error { let msg: String; let code: Int32; var hint: String? = nil }
 /// 出错时抛出，由最外层决定退出码（守护进程里不能直接 exit）
 func fail(_ msg: String, code: Int32 = 1) throws -> Never { throw XErr(msg: msg, code: code) }
 func dbl(_ s: String) throws -> Double { guard let v = Double(s) else { try fail("不是数字: \(s)") }; return v }
@@ -432,6 +432,77 @@ var allowGlobalInput = false
 var expectedFrontName: String? = nil
 var inputFrontmostBefore: [String: Any]? = nil
 var inputResultEmitted = false
+var inputPointerBefore: CGPoint? = nil
+var assertNoContention = false
+var observedContention = false
+var actionProducesVerification = false
+func contentionDetected(beforePid: Int, afterPid: Int, before: CGPoint, after: CGPoint) -> Bool {
+    beforePid != afterPid || before != after
+}
+func contentionEvidence(_ object: [String: Any]) -> [String: Any] {
+    guard let before = inputFrontmostBefore, let pointer = inputPointerBefore else { return object }
+    let after = frontmostInfo(), current = cursorPos()
+    let detected = contentionDetected(beforePid: before["pid"] as? Int ?? -1, afterPid: after["pid"] as? Int ?? -1, before: pointer, after: current)
+    observedContention = observedContention || detected
+    var result = object
+    result["frontmostBefore"] = before; result["frontmostAfter"] = after
+    result["pointerBefore"] = ["x": pointer.x, "y": pointer.y]
+    result["pointerAfter"] = ["x": current.x, "y": current.y]
+    result["contention"] = observedContention
+    if bgMode, let target = bgCache {
+        if result["windowId"] == nil { result["windowId"] = Int(target.windowId) }
+        if result["coords"] == nil { result["coords"] = "window" }
+        result["locked"] = target.locked
+    }
+    if actionProducesVerification && result["route"] != nil && result["verified"] == nil {
+        result["verified"] = false; result["reason"] = "Action dispatched; no application state change was verified."
+    }
+    if actionProducesVerification && result["verified"] as? Bool == false && result["reason"] == nil {
+        result["reason"] = "No verified target state change; inspect per-route evidence and read back the target before retrying."
+    }
+    if assertNoContention && observedContention {
+        result["ok"] = false; result["error"] = "contention detected"
+        result["hint"] = "Frontmost application or pointer changed during the action. Snapshot comparison cannot attribute changes or detect transient changes; inspect target state before retrying."
+    }
+    return result
+}
+func refuseGlobal(_ hint: String) throws -> Never {
+    throw XErr(msg: "refused: would use global input", code: 6, hint: hint)
+}
+// Menus are app-wide. Restrict strict locks to known document-scoped editing actions.
+func guardScopedMenu(_ path: [[String]]) throws {
+    guard inputPolicy.strict && !inputPolicy.permitsForeground else { return }
+    let levels = path.map { Set($0.map(menuNorm)) }
+    guard levels.count == 2, !levels[0].isEmpty, !levels[1].isEmpty,
+          levels[0].isSubset(of: ["edit", "编辑"]),
+          levels[1].isSubset(of: ["select all", "全选", "undo", "撤销", "redo", "重做"]) else {
+        try fail("refused: menu is not confined to the locked window; use --allow-foreground for an intentional app-wide menu action", code: 6)
+    }
+}
+func scopedShortcutMenuAllowed(_ path: String) -> Bool {
+    guard inputPolicy.strict && !inputPolicy.permitsForeground else { return true }
+    let parts = path.components(separatedBy: ">").map(menuNorm).filter { !$0.isEmpty }
+    guard let first = parts.first, let last = parts.last, parts.count >= 2 else { return false }
+    if inputPolicy.permitsGlobal && ["copy", "cut", "paste", "拷贝", "复制", "剪切", "粘贴"].contains(last) { return true }
+    if ["edit", "编辑"].contains(first) {
+        return ["select all", "全选"].contains(last) || ["undo", "redo", "撤销", "重做"].contains { last == $0 || last.hasPrefix($0 + " ") }
+    }
+    return ["format", "格式", "font", "字体"].contains(first) && ["bold", "italic", "underline", "粗体", "斜体", "下划线"].contains(last)
+}
+func guardScopedKey(key: String, flags: CGEventFlags) throws {
+    guard inputPolicy.strict else { return }
+    if flags.contains(.maskCommand) && ["c", "x", "v"].contains(key) {
+        if !inputPolicy.permitsGlobal { try refuseGlobal("Clipboard shortcuts affect the system pasteboard. Use AX text routes, or explicitly --allow-global.") }
+        return
+    }
+    if inputPolicy.permitsForeground { return }
+    let navigation: Set<String> = ["left", "right", "up", "down", "home", "end", "pageup", "pagedown", "delete", "backspace", "forwarddelete"]
+    if flags.contains(.maskControl) || flags.contains(.maskSecondaryFn) ||
+        (flags.contains(.maskCommand) && !Set(["a", "z", "b", "i", "u"]).union(navigation).contains(key)) {
+        try fail("refused: shortcut may escape the locked window; use --allow-foreground for an intentional app-wide shortcut", code: 6)
+    }
+}
+
 func frontmostInfo() -> [String: Any] {
     drainRunLoop()
     guard let a = NSWorkspace.shared.frontmostApplication else { return ["pid": -1, "name": "", "bundleId": ""] }
@@ -450,9 +521,10 @@ func guardGlobalInput(targetPid: pid_t? = nil) throws {
         guard let a = findApp(name) else { try fail("--expect-front: cannot find app \(name)", code: 4) }
         expected = a.processIdentifier
     }
-    if let reason = globalInputRefusal(background: bgMode, allow: allowGlobalInput, target: targetPid ?? commandTargetPid,
-                                       front: frontPid(), expected: expected) { try fail(reason, code: 4) }
+    if let reason = globalInputRefusal(background: inputPolicy.strict, allow: inputPolicy.permitsGlobal, target: targetPid ?? commandTargetPid,
+                                       front: frontPid(), expected: expected) { try refuseGlobal(reason) }
 }
+
 /// Pure matching helper shared by regular and deep element searches.
 func candidateMatches(role: String?, wantedRole: String?, texts: [String], title: String?, contains: Bool) -> Bool {
     if let r = wantedRole, role?.lowercased() != r.lowercased() { return false }
@@ -501,7 +573,7 @@ func axFind(_ appName: String?, _ q: Query) throws -> (matches: [[String: Any]],
     if let we = q.winEl { wins = [we] }
     if let wt = q.windowTitle { wins = wins.filter { (str($0, kAXTitleAttribute) ?? "").localizedCaseInsensitiveContains(wt) } }
     queue.append(contentsOf: wins)
-    if q.menu, let mb = attr(root, kAXMenuBarAttribute) { queue.append(mb as! AXUIElement) }
+    if q.menu && q.winEl == nil, let mb = attr(root, kAXMenuBarAttribute) { queue.append(mb as! AXUIElement) }
     if wins.isEmpty && !q.menu && q.windowTitle == nil { queue.append(root) }
     let sl = q.subrole?.lowercased()
     var head = 0, visited = 0, seen = 0
@@ -686,15 +758,7 @@ func inputTarget(_ appName: String?, role: String?, subrole: String?, title: Str
         el = e
     }
     if let t = scoped {
-        guard let w = t.axWin else { try fail("Cannot resolve locked AX window", code: 4) }
-        var cursor: AXUIElement? = el, inside = false
-        for _ in 0..<80 {
-            guard let e = cursor else { break }
-            if CFEqual(e, w) { inside = true; break }
-            cursor = axElement(attr(e, kAXParentAttribute))
-        }
-        if let ew = axElement(attr(el, kAXWindowAttribute)), CFEqual(ew, w) { inside = true }
-        guard inside else { try fail("Element is outside the locked window; refusing input", code: 4) }
+        guard sameWindow(el, t) else { try fail("Element is outside the locked process/window; refusing input", code: 4) }
     } else if let w = window {
         let wt = windowTitle(of: el) ?? ""
         guard wt.localizedCaseInsensitiveContains(w) else { try fail("焦点元素在窗口「\(wt)」里，不是「\(w)」，已拒绝输入", code: 4) }
@@ -744,6 +808,7 @@ func pressMenu(_ appName: String?, _ path: [[String]]) throws -> [String] {
         if i == path.count - 1 {
             // AXEnabled 可能是上次打开菜单时的旧状态（应用不在前台时尤其如此），所以只记录、仍然尝试按下
             if let en = attr(hit, kAXEnabledAttribute) as? Bool, !en { lastMenuWasDisabled = true } else { lastMenuWasDisabled = false }
+            if inputPolicy.strict && lastMenuWasDisabled { try fail("Scoped background menu item is disabled; no action sent", code: 4) }
             let r = AXUIElementPerformAction(hit, kAXPressAction as CFString)
             guard r == .success else { try fail("按下菜单项失败: AXError \(r.rawValue)") }
         } else {
@@ -774,56 +839,56 @@ func axSelectionRange(_ el: AXUIElement) -> CFRange? {
     return AXValueGetValue(raw as! AXValue, .cfRange, &range) ? range : nil
 }
 /// AX focus changes neither NSRunningApplication activation nor the mouse/global event stream.
-func focusTextElement(_ el: AXUIElement) {
+@discardableResult
+func focusTextElement(_ el: AXUIElement) -> Bool {
+    // AX focus belongs only to this process. Never set AXFrontmost, raise, or activate.
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(el, &pid) == .success, pid > 0 else { return false }
+    let app = AXUIElementCreateApplication(pid)
     _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    if (attr(el, kAXFocusedAttribute) as? Bool) != true {
-        if let w = axElement(attr(el, kAXWindowAttribute)) { _ = AXUIElementSetAttributeValue(w, kAXMainAttribute as CFString, kCFBooleanTrue) }
-        var pid: pid_t = 0; AXUIElementGetPid(el, &pid)
-        let app = AXUIElementCreateApplication(pid)
-        _ = AXUIElementSetAttributeValue(app, kAXFocusedUIElementAttribute as CFString, el)
-        _ = AXUIElementSetAttributeValue(el, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    }
+    _ = AXUIElementSetAttributeValue(app, kAXFocusedUIElementAttribute as CFString, el)
+    if let focused = axElement(attr(app, kAXFocusedUIElementAttribute)), CFEqual(focused, el) { return true }
+    return false
 }
 func axWrite(_ el: AXUIElement, _ text: String, replaceAll: Bool) -> [String: Any]? {
-    let before = axStringValue(el), selection = axSelectionRange(el)
-    let selected = attr(el, kAXSelectedTextAttribute) as? String
-    let expected = replaceAll ? text : before.flatMap { value in selection.flatMap { insertedTextValue(value, text, location: $0.location, length: $0.length) } }
     focusTextElement(el)
-    var attempted = false
-    if let value = expected {
-        attempted = true
-        let error = AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, value as CFString)
-        if error == .success {
-            for _ in 0..<10 {
-                if axStringValue(el) == value { return ["method": "ax-value", "route": "ax-focus-value", "verified": true, "length": value.count] }
-                sleepMs(10)
-            }
-        }
-        // A partial write must not be followed by another insertion.
-        if !replaceAll, axStringValue(el) != before { return ["method": "ax-value", "route": "ax-focus-value", "verified": false, "length": (axStringValue(el) ?? "").count] }
-    }
-    if replaceAll, let value = axStringValue(el) {
-        var range = CFRange(location: 0, length: value.utf16.count)
-        if let ax = AXValueCreate(.cfRange, &range) { _ = AXUIElementSetAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, ax) }
-        guard axSelectionRange(el).map({ $0.location == 0 && $0.length == value.utf16.count }) == true else {
-            return attempted ? ["method": "ax-value", "route": "ax-focus-value", "verified": false, "length": value.count] : nil
-        }
-    }
-    let error = AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFString)
-    if error == .success {
+    let before = axStringValue(el), selection = axSelectionRange(el)
+    let expected = replaceAll ? text : before.flatMap { value in selection.flatMap { insertedTextValue(value, text, location: $0.location, length: $0.length) } }
+    func result(_ method: String, _ route: String, _ expected: String?) -> [String: Any] {
         for _ in 0..<10 {
-            let after = axStringValue(el)
-            let verified = expected.map { after == $0 } ?? (after.map { $0.contains(text) && $0.utf16.count == (before?.utf16.count ?? 0) - (selected?.utf16.count ?? 0) + text.utf16.count } ?? false)
-            if verified { return ["method": "ax-selected-text", "route": "ax-selected-text", "verified": true, "length": (after ?? "").count] }
+            if let expected = expected, axStringValue(el) == expected {
+                return ["method": method, "route": route, "verified": true, "length": expected.count]
+            }
             sleepMs(10)
         }
-        attempted = true
+        return ["method": method, "route": route, "verified": false, "length": (axStringValue(el) ?? "").count,
+                "reason": expected == nil ? "AX does not expose the original value and exact selection; insertion cannot be verified" : "AX accepted the write but the value did not match the expected value; no duplicate fallback was sent"]
     }
-    return attempted ? ["method": "ax-selected-text", "route": "ax-selected-text", "verified": false, "length": (axStringValue(el) ?? "").count] : nil
+    if let value = expected {
+        if AXUIElementSetAttributeValue(el, kAXValueAttribute as CFString, value as CFString) == .success {
+            return result("ax-value", "ax-focus-value", value)
+        }
+        if axStringValue(el) != before { return result("ax-value", "ax-focus-value", value) }
+    }
+    if replaceAll {
+        // SelectedText can replace a whole field only after reading back its full selection.
+        guard let value = before else { return nil }
+        var range = CFRange(location: 0, length: value.utf16.count)
+        guard let ax = AXValueCreate(.cfRange, &range),
+              AXUIElementSetAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, ax) == .success,
+              axSelectionRange(el).map({ $0.location == 0 && $0.length == value.utf16.count }) == true else { return nil }
+    }
+    if AXUIElementSetAttributeValue(el, kAXSelectedTextAttribute as CFString, text as CFString) == .success {
+        return result("ax-selected-text", "ax-selected-text", expected)
+    }
+    return axStringValue(el) != before ? result("ax-selected-text", "ax-selected-text", expected) : nil
 }
 
 /// 剪贴板 + 菜单「编辑>粘贴」：不用 cmd+v，不经过键盘事件；结束后恢复剪贴板
 func pasteWrite(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceAll: Bool) throws -> [String: Any] {
+    // The system pasteboard is shared global state even when AX invokes Paste.
+    // Refuse before reading, snapshotting, clearing, or restoring it.
+    try guardGlobalInput(targetPid: nil)
     let snap = snapshotPasteboard()
     var restore = true
     defer { if restore { restorePasteboard(snap) } }
@@ -870,16 +935,39 @@ func pasteWrite(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceA
 
 /// 先试辅助功能写值，不行（或 --via paste）再走剪贴板 + 菜单粘贴
 func writeText(_ appName: String?, _ el: AXUIElement?, _ text: String, replaceAll: Bool, via: String) throws -> [String: Any] {
-    if via != "paste", let el = el {
-        let before = axStringValue(el)
-        if let r = axWrite(el, text, replaceAll: replaceAll) {
-            // 已核对成功，或者值确实变了（不重复粘贴，避免写两遍）
-            if (r["verified"] as? Bool) == true || via == "ax" || (!replaceAll && axStringValue(el) != before) { return r }
-        } else if via == "ax" {
-            try fail("这个元素不支持用辅助功能写入（\(replaceAll ? "AXValue" : "AXSelectedText") 不可写），试试 --via paste")
+    if via == "paste" { return try pasteWrite(appName, el, text, replaceAll: replaceAll) }
+    if let el = el, via != "pid", let result = axWrite(el, text, replaceAll: replaceAll) { return result }
+    if via == "ax" { try fail("AXValue / AXSelectedText is not writable; use --via pid with a target text element", code: 4) }
+    if bgMode || via == "pid" {
+        let t = try bgTarget(appHint: appName, titleHint: bgMode ? nil : el.flatMap(windowTitle))
+        guard let el = el, sameWindow(el, t) else { try fail("No text element inside the target window; refusing PID text input", code: 4) }
+        try bgEnsureKeyWindow(t)
+        guard focusTextElement(el), let focused = axElement(attr(t.axApp, kAXFocusedUIElementAttribute)), CFEqual(focused, el), sameWindow(focused, t) else {
+            try fail("Cannot verify AX focus inside the target window; refusing PID text input", code: 4)
         }
+        let before = axStringValue(el)
+        var selection = axSelectionRange(el)
+        if replaceAll {
+            guard let value = before else { try fail("Cannot replace text via PID without a readable value and verifiable full selection", code: 4) }
+            var full = CFRange(location: 0, length: value.utf16.count)
+            guard let ax = AXValueCreate(.cfRange, &full),
+                  AXUIElementSetAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, ax) == .success,
+                  axSelectionRange(el).map({ $0.location == 0 && $0.length == value.utf16.count }) == true else {
+                try fail("Cannot verify full-field selection; refusing PID replacement", code: 4)
+            }
+            selection = full
+        }
+        let expected = replaceAll ? text : before.flatMap { value in selection.flatMap { insertedTextValue(value, text, location: $0.location, length: $0.length) } }
+        typeTextBG(text, pid: t.pid, windowId: t.windowId)
+        var verified = false
+        for _ in 0..<60 {
+            if let expected = expected, axStringValue(el) == expected { verified = true; break }
+            sleepMs(10)
+        }
+        var result: [String: Any] = ["method": "pid-unicode", "route": "pid-keys", "verified": verified, "length": (axStringValue(el) ?? "").count]
+        if !verified { result["reason"] = expected == nil ? "AX does not expose the value and exact selection; PID delivery has no acknowledgement" : "Posted Unicode events to the target PID, but AXValue did not match the expected text; the app may ignore background events" }
+        return result
     }
-    if via == "ax" { try fail("没有可写入的焦点元素") }
     return try pasteWrite(appName, el, text, replaceAll: replaceAll)
 }
 // MARK: - 多条输入路径：type / key 自动选路
@@ -927,8 +1015,9 @@ func typeChain(_ appOpt: String?, _ text: String, via: String, window: String? =
     } else { order = [via] }
     var tried: [[String: Any]] = []
     func result(_ path: String, _ verified: Any, _ extra: [String: Any] = [:]) -> [String: Any] {
-        var o: [String: Any] = ["ok": true, "path": path, "route": path, "verified": verified, "app": app.xName ?? "", "pid": Int(app.processIdentifier),
+        var o: [String: Any] = ["ok": true, "path": path, "route": path, "verified": (verified as? Bool) ?? false, "app": app.xName ?? "", "pid": Int(app.processIdentifier),
                                 "role": role, "eventsHealthy": h.keyboardOK, "tried": tried]
+        if (verified as? Bool) != true { o["reason"] = "No matching AX text readback; event delivery has no acknowledgement" }
         if let pn = panel { o["remotePanel"] = ["pid": Int(pn.pid), "process": pn.name, "windowId": pn.windowId] }
         if let el = el, let w = windowTitle(of: el) { o["window"] = w }
         if !h.keyboardOK { o["blockedBy"] = h.blockerNames }
@@ -954,14 +1043,14 @@ func typeChain(_ appOpt: String?, _ text: String, via: String, window: String? =
             keyTargetPid = tp
             typeText(text); keyTargetPid = nil
             let v = waitValueChange(el, from: before, contains: text, ms: 300)
-            return result(pname, v.map { $0 as Any } ?? "unknown")
+            return result(pname, v ?? false)
         case "pid":
             // CGEventPostToPid：直接投递到应用进程的事件队列，不经过系统 HID 事件流上的监听
             keyTargetPid = panel?.pid ?? app.processIdentifier
             typeText(text); keyTargetPid = nil
             let v = waitValueChange(el, from: before, contains: text, ms: 600)
-            if v == true || via == "pid" { return result("events-pid", v.map { $0 as Any } ?? "unknown") }
-            if v == nil { return result("events-pid", "unknown", ["note": "读不到输入框内容，无法核对；为避免重复输入，不再尝试其它路径"]) }
+            if v == true || via == "pid" { return result("events-pid", v ?? false) }
+            if v == nil { return result("events-pid", false, ["note": "读不到输入框内容，无法核对；为避免重复输入，不再尝试其它路径"]) }
             tried.append(["path": "events-pid", "result": "600 毫秒内没有生效（事件可能在排队，稍后才出现）"])
         case "paste":
             let r = try pasteWrite(appKey, el, text, replaceAll: false)
@@ -1440,20 +1529,25 @@ func waitSignal(_ sem: DispatchSemaphore, timeout: Double) -> Bool {
     }
     return true
 }
-/// ScreenCaptureKit 回调超时过一次就不再重试，直接改用 screencapture。
+/// ScreenCaptureKit 回调超时过一次就不再重试。只有无窗口目标的截图允许改用 screencapture。
 /// 实测：同一路径的 xyzlcu 守护进程在运行时，XYZLCU_DAEMON=0 的进程内截图拿不到回调。
 var sckTimedOut = false
+var lastSCKError: String? = nil
 var sckTimeout: Double { daemonMode ? 5 : 1.5 }
 /// SCShareableContent 取一次要几十毫秒；守护进程里缓存起来复用
 var cachedContent: AnyObject? = nil
 var cachedAt = Date.distantPast
-@available(macOS 14.0, *)
+@available(macOS 13.0, *)
 func shareableContent(maxAge: Double) -> SCShareableContent? {
     if maxAge > 0, daemonMode, let c = cachedContent as? SCShareableContent, Date().timeIntervalSince(cachedAt) < maxAge { return c }
     let sem = DispatchSemaphore(value: 0)
     var result: SCShareableContent?
-    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { c, _ in result = c; sem.signal() }
-    if !waitSignal(sem, timeout: sckTimeout) { sckTimedOut = true; return nil }
+    // Window filters can capture covered / partially off-screen windows. Let SCK, rather than
+    // an on-screen-only enumeration, decide which other-Space / minimized windows are available.
+    SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { c, error in
+        result = c; if let error = error { lastSCKError = error.localizedDescription }; sem.signal()
+    }
+    if !waitSignal(sem, timeout: sckTimeout) { sckTimedOut = true; lastSCKError = "ScreenCaptureKit enumeration timed out"; return nil }
     if let r = result { cachedContent = r; cachedAt = Date() }
     return result
 }
@@ -1461,11 +1555,92 @@ func shareableContent(maxAge: Double) -> SCShareableContent? {
 func grab(_ filter: SCContentFilter, _ cfg: SCStreamConfiguration) -> CGImage? {
     let sem = DispatchSemaphore(value: 0)
     var result: CGImage?
-    SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg) { img, _ in result = img; sem.signal() }
-    if !waitSignal(sem, timeout: sckTimeout) { sckTimedOut = true; return nil }
+    SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg) { img, error in
+        result = img; if let error = error { lastSCKError = error.localizedDescription }; sem.signal()
+    }
+    if !waitSignal(sem, timeout: sckTimeout) { sckTimedOut = true; lastSCKError = "ScreenCaptureKit capture timed out"; return nil }
     return result
 }
 enum Target { case display(CGDirectDisplayID), region(CGDirectDisplayID, CGRect), window(CGWindowID, CGRect) }
+/// macOS 13 lacks SCScreenshotManager. A one-frame SCStream uses the identical
+/// window-only filter, without capturing a display or using screencapture.
+@available(macOS 13.0, *)
+final class WindowCaptureFrame: NSObject, SCStreamOutput, SCStreamDelegate {
+    let signal = DispatchSemaphore(value: 0)
+    private let stateLock = NSLock()
+    private var finished = false
+    private var image: CGImage?
+    private var failure: String?
+    func finish(_ result: CGImage?, _ error: String?) {
+        stateLock.lock()
+        guard !finished else { stateLock.unlock(); return }
+        finished = true; image = result; failure = error
+        stateLock.unlock(); signal.signal()
+    }
+    func result() -> (CGImage?, String?) {
+        stateLock.lock(); defer { stateLock.unlock() }; return (image, failure)
+    }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { finish(nil, error.localizedDescription) }
+    func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen,
+              let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
+              let buffer = CMSampleBufferGetImageBuffer(sample) else { return }
+        var captured: CGImage?
+        let status = VTCreateCGImageFromCVPixelBuffer(buffer, options: nil, imageOut: &captured)
+        guard status == noErr, let captured = captured else { finish(nil, "Unable to decode the window frame (\(status))"); return }
+        // macOS 13 has no ignoreShadowsSingleWindow. SCStream.h defines contentRect
+        // as points in the output surface and scaleFactor as pixels per point.
+        // Crop only the declared content; never assume the surface is shadow-free.
+        let info = attachments[0]
+        let contentRect: CGRect? = {
+            if let dictionary = info[.contentRect] as? [String: Any] { return CGRect(dictionaryRepresentation: dictionary as CFDictionary) }
+            return (info[.contentRect] as? NSValue)?.rectValue
+        }()
+        guard let contentRect = contentRect, let factor = (info[.scaleFactor] as? NSNumber)?.doubleValue,
+              factor.isFinite, factor > 0, !contentRect.isEmpty, !contentRect.isNull,
+              [contentRect.minX, contentRect.minY, contentRect.width, contentRect.height].allSatisfy({ $0.isFinite }) else {
+            finish(nil, "Window content geometry is unavailable; cannot map capture pixels to window coordinates"); return
+        }
+        let pixels = CGRect(x: contentRect.minX * factor, y: contentRect.minY * factor,
+                            width: contentRect.width * factor, height: contentRect.height * factor)
+        let bounds = CGRect(x: 0, y: 0, width: captured.width, height: captured.height)
+        guard pixels.minX >= -1, pixels.minY >= -1, pixels.maxX <= bounds.maxX + 1, pixels.maxY <= bounds.maxY + 1,
+              let cropped = captured.cropping(to: pixels.integral.intersection(bounds)) else {
+            finish(nil, "Window content geometry exceeds the capture surface; cannot map pixels safely"); return
+        }
+        finish(cropped, nil)
+    }
+}
+@available(macOS 13.0, *)
+func captureWindowStream(_ target: Target, scale: Double) -> (CGImage, CGRect)? {
+    guard case .window(let wid, _) = target else { return nil }
+    guard !sckTimedOut, let content = shareableContent(maxAge: 0),
+          let window = content.windows.first(where: { $0.windowID == wid }) else {
+        if lastSCKError == nil { lastSCKError = "Target window is not available to ScreenCaptureKit" }; return nil
+    }
+    let rect = window.frame
+    let display = activeDisplays().first { CGDisplayBounds($0).contains(CGPoint(x: rect.midX, y: rect.midY)) } ?? CGMainDisplayID()
+    let pixelScale = pixelsPerPoint(display)
+    let config = SCStreamConfiguration()
+    config.showsCursor = false; config.pixelFormat = kCVPixelFormatType_32BGRA
+    config.scalesToFit = true
+    config.width = max(1, Int(rect.width * pixelScale * scale)); config.height = max(1, Int(rect.height * pixelScale * scale))
+    config.queueDepth = 2; config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+    let receiver = WindowCaptureFrame()
+    let stream = SCStream(filter: SCContentFilter(desktopIndependentWindow: window), configuration: config, delegate: receiver)
+    do { try stream.addStreamOutput(receiver, type: .screen, sampleHandlerQueue: DispatchQueue(label: "xyzlcu.window-once")) }
+    catch { lastSCKError = error.localizedDescription; return nil }
+    stream.startCapture { error in if let error = error { receiver.finish(nil, error.localizedDescription) } }
+    defer { stream.stopCapture { _ in } }
+    guard waitSignal(receiver.signal, timeout: sckTimeout) else {
+        lastSCKError = "ScreenCaptureKit window stream timed out"; return nil
+    }
+    let (image, error) = receiver.result()
+    guard let image = image else { lastSCKError = error ?? "No complete window frame received"; return nil }
+    lastCaptureMethod = "screencapturekit-window-stream-once"
+    return (image, rect)
+}
 // MARK: - 常驻截图流（只在守护进程里）
 // 同一目标、同一缩放第一次截图走 SCScreenshotManager，同时在后台开一路 SCStream（由 GPU 缩放到目标尺寸）；
 // 之后的截图直接取流里最新的一帧（内存里，几毫秒）。同一目标已有原始分辨率的流时，新的缩放先从它缩（vImage），同时开新流。
@@ -1579,9 +1754,9 @@ func liveKeyOf(_ target: Target) -> (String, CGRect) {
     case .window(let wid, let r): return ("w\(wid)", r)
     }
 }
-/// 快路径：ScreenCaptureKit（macOS 14+），在进程内截图，直接按目标尺寸输出
+/// ScreenCaptureKit：14+ 使用 screenshot API / 常驻流，13 的窗口目标使用单帧窗口流。
 func captureSCK(_ target: Target, scale: Double, startOnly: Bool = false) -> (CGImage, CGRect)? {
-    guard #available(macOS 14.0, *) else { return nil }
+    guard #available(macOS 14.0, *) else { return startOnly ? nil : captureWindowStream(target, scale: scale) }
     let (baseKey, liveRect) = liveKeyOf(target)
     let native = abs(scale - 1) < 0.001
     let liveKey = native ? baseKey : baseKey + "@\(scale)"
@@ -1613,12 +1788,17 @@ func captureSCK(_ target: Target, scale: Double, startOnly: Bool = false) -> (CG
             if case .region(_, let r) = target { cfg.sourceRect = CGRect(x: r.minX - b.minX, y: r.minY - b.minY, width: r.width, height: r.height) }
             filter = SCContentFilter(display: d, excludingWindows: [])
         case .window(let wid, let want):
-            guard let w = content.windows.first(where: { $0.windowID == wid }) else { continue }
+            guard let w = content.windows.first(where: { $0.windowID == wid }) else { lastSCKError = "Target window is not available to ScreenCaptureKit"; continue }
             let f = w.frame
             if attempt == 0, abs(f.minX - want.minX) > 0.5 || abs(f.minY - want.minY) > 0.5 || abs(f.width - want.width) > 0.5 || abs(f.height - want.height) > 0.5 { continue }
             filter = SCContentFilter(desktopIndependentWindow: w)
-            let r = filter.contentRect, pps = Double(filter.pointPixelScale)
-            cfg = config(r.width * pps, r.height * pps)
+            let pps = Double(filter.pointPixelScale)
+            cfg = config(w.frame.width * pps, w.frame.height * pps)
+            // SCStream.h: single-window framing includes shadows unless ignored;
+            // disable it so image (0,0) maps to the window frame, not its shadow.
+            cfg.ignoreShadowsSingleWindow = true
+            cfg.ignoreGlobalClipSingleWindow = true
+            cfg.scalesToFit = true
             rect = w.frame
         }
         if startOnly || bridge != nil {
@@ -1633,7 +1813,7 @@ func captureSCK(_ target: Target, scale: Double, startOnly: Bool = false) -> (CG
 }
 /// 守护进程启动时给主屏开常驻流（不截图，只开流）
 func prewarmMainDisplay() {
-    guard #available(macOS 14.0, *), streamsEnabled, ProcessInfo.processInfo.environment["XYZLCU_PREWARM"] != "0", screenTrusted() else { return }
+    guard #available(macOS 14.0, *), streamsEnabled, readLock() == nil, ProcessInfo.processInfo.environment["XYZLCU_PREWARM"] != "0", screenTrusted() else { return }
     let did = CGMainDisplayID()
     let scales = (ProcessInfo.processInfo.environment["XYZLCU_PREWARM_SCALES"] ?? "1,0.5").split(separator: ",")
         .compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }.filter { $0 > 0 && $0 <= 1 }
@@ -1654,57 +1834,34 @@ func captureCLI(_ extra: [String], tmp: String) -> CGImage? {
     return CGImageSourceCreateImageAtIndex(src, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
 }
 /// 找应用最前面的普通窗口（可按标题过滤）。appName 是 "#窗口号" 时按 windows 列出的 id 找。
-/// 顺便判断窗口有没有被别的窗口挡住（lastWindowClear）：没挡住就能直接从主屏常驻流里裁出来，不用单独截窗口
-var lastWindowClear = false
 /// 锁定 / 后台模式下截图结果里额外带的字段（route、窗口坐标说明）
 var screenshotExtra: [String: Any]? = nil
 func appWindow(_ appName: String, title: String?) throws -> (CGWindowID, CGRect, String) {
-    lastWindowClear = false
     let byId: Int? = appName.hasPrefix("#") ? Int(appName.dropFirst()) : nil
     var pid: Int = -1, label = appName
     if byId == nil {
         guard let app = findApp(appName) else { try fail("找不到应用: \(appName)") }
         pid = Int(app.processIdentifier); label = app.xName ?? appName
     }
-    let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+    let list = (CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
     func bounds(_ w: [String: Any]) -> CGRect {
         let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
         return CGRect(x: b["X"] as? Double ?? 0, y: b["Y"] as? Double ?? 0, width: b["Width"] as? Double ?? 0, height: b["Height"] as? Double ?? 0)
     }
-    for (i, w) in list.enumerated() {
+    for w in list {
         let num = w[kCGWindowNumber as String] as? Int ?? 0
         if let id = byId { if num != id { continue } }
         else {
             guard (w[kCGWindowOwnerPID as String] as? Int) == pid && (w[kCGWindowLayer as String] as? Int ?? 0) == 0 else { continue }
-            if let want = title, !(w[kCGWindowName as String] as? String ?? "").localizedCaseInsensitiveContains(want) { continue }
         }
+        if let want = title, !(w[kCGWindowName as String] as? String ?? "").localizedCaseInsensitiveContains(want) { continue }
         let t = w[kCGWindowName as String] as? String ?? ""
         let r = bounds(w)
         if r.width < 2 || r.height < 2 { if byId != nil { break }; continue }
-        // 前面（列表里更靠前）的窗口和它有重叠就算挡住；铺满整块屏幕的非普通层窗口（程序坞、全屏透明覆盖层）不算
-        let screens = activeDisplays().map { CGDisplayBounds($0) }
-        lastWindowClear = !list.prefix(i).contains { o in
-            let ob = bounds(o)
-            guard ob.width >= 1, ob.height >= 1, ob.intersects(r), (o[kCGWindowAlpha as String] as? Double ?? 1) > 0.01 else { return false }
-            if (o[kCGWindowLayer as String] as? Int ?? 0) != 0 && screens.contains(ob) { return false }
-            return true
-        }
         return (CGWindowID(num), r, t)
     }
-    if let id = byId { try fail("没有 id 为 \(id) 的可见窗口（见 xyzlcu windows）") }
-    try fail("\(label) 没有可见窗口" + (title.map { "（标题含 \($0)）" } ?? ""))
-}
-/// 窗口没被挡住、整个在某块屏幕里、那块屏幕有常驻流：直接从流的最新一帧裁出窗口（几毫秒，不用另开窗口流）。
-/// 和单独截窗口的差别：圆角外面是桌面而不是透明。XYZLCU_WINDOW_CROP=0 关闭。
-func cropFromDisplayStream(_ r: CGRect) -> CGImage? {
-    guard #available(macOS 14.0, *), lastWindowClear, streamsEnabled, ProcessInfo.processInfo.environment["XYZLCU_WINDOW_CROP"] != "0" else { return nil }
-    guard let did = activeDisplays().first(where: { CGDisplayBounds($0).contains(r) }) else { return nil }
-    let b = CGDisplayBounds(did), key = liveKeyOf(.display(did)).0
-    guard liveStreams[key] != nil, let img = liveFrame(key, rect: b) else { return nil }
-    let pps = Double(img.width) / b.width
-    let px = CGRect(x: ((r.minX - b.minX) * pps).rounded(), y: ((r.minY - b.minY) * pps).rounded(),
-                    width: (r.width * pps).rounded(), height: (r.height * pps).rounded())
-    return img.cropping(to: px)
+    if let id = byId { try fail("没有 id 为 \(id) 的窗口（见 xyzlcu windows）") }
+    try fail("\(label) 没有可截图窗口" + (title.map { "（标题含 \($0)）" } ?? ""))
 }
 func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, window: (String, String?)?, format: ImgFormat, quality: Double, forceCLI: Bool,
                 base64: Bool = false, toStdout: Bool = false, timing: Bool = false, diff: Bool = false, maxSide: Int? = nil) throws {
@@ -1720,6 +1877,8 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
     var cliArgs: [String]
     var rect: CGRect
     var extra: [String: Any] = [:]
+    let windowOnly = window != nil
+    if windowOnly && forceCLI { try fail("Window screenshots require ScreenCaptureKit; --cli is unavailable for a window target", code: 4) }
     if let (app, title) = window {
         let (wid, r, t) = try appWindow(app, title: title)
         target = .window(wid, r); cliArgs = ["-o", "-l", String(wid)]; rect = r
@@ -1737,11 +1896,12 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
     var method = "screencapturekit"
     var img: CGImage? = nil
     lastCaptureMethod = nil
+    lastSCKError = nil
     mark("resolved")
-    if !forceCLI, case .window(_, let wr) = target, screenTrusted(), let c = cropFromDisplayStream(wr) {
-        img = abs(s - 1) > 0.001 ? scaled(c, s) : c; method = "display-stream-crop"
+    if !forceCLI && screenTrusted(), let (i, currentRect) = captureSCK(target, scale: s) { img = i; rect = currentRect; method = lastCaptureMethod ?? method }
+    if img == nil && windowOnly {
+        try fail("Window-only ScreenCaptureKit capture failed: \(lastSCKError ?? "requires Screen Recording permission and an available window"). No display crop or CLI fallback was used; minimized windows and other Spaces depend on macOS availability.", code: 2)
     }
-    if img == nil && !forceCLI && screenTrusted(), let (i, _) = captureSCK(target, scale: s) { img = i; method = lastCaptureMethod ?? method }
     if img == nil {
         method = "screencapture"
         img = captureCLI(cliArgs, tmp: NSTemporaryDirectory() + "xyzlcu-raw-\(getpid()).png")
@@ -1753,10 +1913,18 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
     let cg0 = maxSide.map { $0 < longest ? scaled(captured, Double($0) / Double(longest)) : captured } ?? captured
     // 锁屏时截图全黑；没有屏幕录制权限时只能拍到桌面和菜单栏
     let pps0 = rect.width > 0 ? Double(cg0.width) / Double(rect.width) : 1
+    let coordinateOrigin = windowOnly ? CGPoint.zero : rect.origin
     var o: [String: Any] = ["pixelWidth": cg0.width, "pixelHeight": cg0.height,
-         "originX": Int(rect.minX), "originY": Int(rect.minY), "pointWidth": Int(rect.width), "pointHeight": Int(rect.height),
+         "originX": Int(coordinateOrigin.x), "originY": Int(coordinateOrigin.y), "pointWidth": Int(rect.width), "pointHeight": Int(rect.height),
          "pixelsPerPoint": pps0, "method": method, "screenLocked": screenLocked(),
          "note": "全局点坐标 x = originX + x_pixel / pixelsPerPoint，y = originY + y_pixel / pixelsPerPoint"]
+    if windowOnly {
+        o["coords"] = "window"; o["route"] = "sck-window"; o["verified"] = true
+        o["verification"] = "Captured pixels from the selected ScreenCaptureKit window filter; application content is not semantically verified"
+        o["windowFrame"] = ["x": rect.minX, "y": rect.minY, "w": rect.width, "h": rect.height]
+        o["note"] = "Window-relative points: x = originX + x_pixel / pixelsPerPoint, y = originY + y_pixel / pixelsPerPoint. windowFrame is in global points."
+    }
+    o.merge(extra) { a, _ in a }
     if let e = screenshotExtra { o.merge(e) { _, b in b }; o["captureMethod"] = method }
     var cg = cg0
     var px: Pixels? = nil
@@ -1769,7 +1937,7 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
             let r = diffRects(prev.px, cur)
             d["changedPercent"] = NSDecimalNumber(string: String(format: "%.1f", Double(r.changedTiles) / Double(max(1, r.totalTiles)) * 100))
             func pt(_ q: CGRect) -> [String: Any] {
-                ["x": Double(rect.minX) + Double(q.minX) / pps0, "y": Double(rect.minY) + Double(q.minY) / pps0,
+                ["x": Double(coordinateOrigin.x) + Double(q.minX) / pps0, "y": Double(coordinateOrigin.y) + Double(q.minY) / pps0,
                  "w": Double(q.width) / pps0, "h": Double(q.height) / pps0]
             }
             d["changed"] = !r.rects.isEmpty
@@ -1801,7 +1969,9 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
         if d["changed"] as? Bool == false {
             if timing { mark("total"); o["timingMs"] = marks }
             if toStdout {
-                let meta = (try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                let evidence = contentionEvidence(o)
+                if assertNoContention && observedContention { try fail("contention detected", code: 6) }
+                let meta = (try? JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
                 if outBuf != nil { binOut = nil; binMeta = meta } else { FileHandle.standardError.write((meta + "\n").data(using: .utf8)!) }
                 return
             }
@@ -1816,7 +1986,7 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
         do { try data.write(to: URL(fileURLWithPath: path)) } catch { try fail("写不了文件 \(path): \(error.localizedDescription)") }
         mark("written")
     }
-    if sckTimedOut {
+    if sckTimedOut && (method == "screencapture" || method == "screencapture+scaled") {
         o["warning"] = "ScreenCaptureKit 没有响应，已改用 screencapture（较慢）。守护进程在运行时用 XYZLCU_DAEMON=0 截图会这样，去掉它走守护进程即可"
     }
     o.merge(extra) { a, _ in a }
@@ -1824,7 +1994,9 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
     if let path = path { o["path"] = path }
     if timing { mark("total"); o["timingMs"] = marks }
     if toStdout {
-        let meta = (try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let evidence = contentionEvidence(o)
+        if assertNoContention && observedContention { try fail("contention detected", code: 6) }
+        let meta = (try? JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
         // 输出被收集时（守护进程 / MCP）随回复带回，否则直接写标准输出
         if outBuf != nil { binOut = data; binMeta = meta } else {
             FileHandle.standardOutput.write(data)
@@ -1841,27 +2013,43 @@ func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, wi
 // 路线：截图 = ScreenCaptureKit 只截这个窗口（被挡住也行）；点击 = 命中测试 + AXPress / AX 动作，
 // 不行再 CGEventPostToPid（坐标换成全局点）；输入 = AX 写值 / 选中文字，不行再 PostToPid；按键 = PostToPid（或 --via menu）。
 // 锁定状态存在 ~/.xyzlcu/lock.json（守护进程、CLI、MCP 共用），坐标在锁定模式下都是相对窗口左上角的点坐标。
-struct LockInfo { var pid: pid_t; var app: String; var bundleId: String; var windowId: CGWindowID; var title: String; var at: Double }
+struct LockInfo { var pid: pid_t; var app: String; var bundleId: String; var windowId: CGWindowID; var title: String; var at: Double; var unsafe: Bool = false }
 func lockPath() -> String { (socketPath() as NSString).deletingLastPathComponent + "/lock.json" }
 func readLock() -> LockInfo? {
     guard let d = FileManager.default.contents(atPath: lockPath()),
           let j = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
-          let pid = j["pid"] as? Int, let wid = j["windowId"] as? Int else { return nil }
+          let pid = j["pid"] as? Int, pid > 0, pid <= Int(Int32.max),
+          let wid = j["windowId"] as? Int, wid > 0, wid <= Int(UInt32.max) else { return nil }
     return LockInfo(pid: pid_t(pid), app: j["app"] as? String ?? "", bundleId: j["bundleId"] as? String ?? "", windowId: CGWindowID(wid),
-                    title: j["title"] as? String ?? "", at: j["at"] as? Double ?? 0)
+                    title: j["title"] as? String ?? "", at: j["at"] as? Double ?? 0, unsafe: j["unsafe"] as? Bool ?? false)
 }
 func writeLock(_ l: LockInfo?) throws {
     let p = lockPath()
     guard let l = l else { try? FileManager.default.removeItem(atPath: p); return }
     try? FileManager.default.createDirectory(atPath: (p as NSString).deletingLastPathComponent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-    let o: [String: Any] = ["pid": Int(l.pid), "app": l.app, "bundleId": l.bundleId, "windowId": Int(l.windowId), "title": l.title, "at": l.at]
+    let o: [String: Any] = ["pid": Int(l.pid), "app": l.app, "bundleId": l.bundleId, "windowId": Int(l.windowId), "title": l.title, "at": l.at, "unsafe": l.unsafe]
     guard let d = try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys]) else { try fail("写不了锁定文件") }
-    guard FileManager.default.createFile(atPath: p, contents: d, attributes: [.posixPermissions: 0o600]) else { try fail("写不了锁定文件 \(p)") }
+    do {
+        try d.write(to: URL(fileURLWithPath: p), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: p)
+    } catch { try fail("Cannot persist window lock: \(error)") }
 }
 /// 这一条命令是不是后台模式：--background / XYZLCU_BACKGROUND=1 / 有锁定（--no-lock 跳过锁定）
+// Shared policy: overrides are command-local; only an explicitly unsafe lock persists relaxation.
+struct InputPolicy {
+    var background = false
+    var unsafeLock = false
+    var allowGlobal = false
+    var allowForeground = false
+    var strict: Bool { background && !unsafeLock }
+    var permitsGlobal: Bool { !strict || allowGlobal || allowForeground }
+    var permitsForeground: Bool { !strict || allowForeground }
+}
+var inputPolicy = InputPolicy()
 var bgMode = false, allowForeground = false, noLock = false
 /// 本条命令解析出来的后台目标窗口
 struct BGTarget { let pid: pid_t; let app: NSRunningApplication?; let appName: String; let windowId: CGWindowID; let frame: CGRect; let title: String; let axApp: AXUIElement; let axWin: AXUIElement?; let locked: Bool }
+var bgCaptureOnly = false
 var bgCache: BGTarget? = nil
 typealias AXGetWindowFn = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
 let axGetWindow: AXGetWindowFn? = {
@@ -1892,7 +2080,8 @@ func axWindowFor(_ axApp: AXUIElement, _ wid: CGWindowID, frame r: CGRect, title
 }
 /// 选一个应用的窗口（layer 0，可以被挡住，不能是最小化的）
 func pickWindow(_ app: NSRunningApplication, title: String?, id: Int?) throws -> (CGWindowID, CGRect, String) {
-    let list = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+    let options: CGWindowListOption = bgCaptureOnly ? [.optionAll, .excludeDesktopElements] : [.optionOnScreenOnly, .excludeDesktopElements]
+    let list = (CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]) ?? []
     for w in list {
         let num = w[kCGWindowNumber as String] as? Int ?? 0
         if let id = id { if num != id { continue } }
@@ -1907,17 +2096,27 @@ func pickWindow(_ app: NSRunningApplication, title: String?, id: Int?) throws ->
     try fail("\(app.xName ?? "应用") 没有可见窗口" + (title.map { "（标题含「\($0)」）" } ?? "") + "；最小化的窗口截不到也点不到", code: 4)
 }
 /// 解析后台目标：锁定 > --app [--window-title]（只在后台模式下用）
-func bgTarget(appHint: String? = nil, titleHint: String? = nil) throws -> BGTarget {
-    if let c = bgCache { return c }
+func bgTarget(appHint: String? = nil, titleHint: String? = nil, windowIdHint: Int? = nil) throws -> BGTarget {
+    if let c = bgCache {
+        if let p = commandTargetPid, p != c.pid { try fail("PID conflicts with the target window", code: 4) }
+        if let hint = appHint { guard findApp(hint)?.processIdentifier == c.pid else { try fail("App conflicts with the target window", code: 4) } }
+        if let title = titleHint, !c.title.localizedCaseInsensitiveContains(title) { try fail("Title conflicts with the target window", code: 4) }
+        if let id = windowIdHint, id != Int(c.windowId) { try fail("Window ID conflicts with the target window", code: 4) }
+        return c
+    }
     if !noLock, let l = readLock() {
+        if let id = windowIdHint, id != Int(l.windowId) { try fail("Window ID conflicts with locked window", code: 4) }
         if let p = commandTargetPid, p != l.pid { try fail("--pid conflicts with locked window pid \(l.pid); unlock or use --no-lock", code: 4) }
-        if let hint = appHint, let a = findApp(hint), a.processIdentifier != l.pid { try fail("App target conflicts with locked window; unlock or use --no-lock", code: 4) }
-        guard kill(l.pid, 0) == 0 || errno == EPERM else { try? writeLock(nil); try fail("锁定的应用（\(l.app) pid \(l.pid)）已经退出，锁定已解除", code: 4) }
+        if let hint = appHint {
+            guard let a = findApp(hint), a.processIdentifier == l.pid else { try fail("App target conflicts with locked window; unlock before retargeting", code: 4) }
+        }
+        guard kill(l.pid, 0) == 0 || errno == EPERM else { try fail("Locked app \(l.app) (pid \(l.pid)) exited; lock remains active. Explicitly unlock before selecting another target.", code: 4) }
         guard let info = cgWindowInfo(l.windowId), (info[kCGWindowOwnerPID as String] as? Int) == Int(l.pid) else {
             try fail("锁定的窗口（\(l.app)「\(l.title)」id \(l.windowId)）已经关闭。xyzlcu unlock 后重新 lock", code: 4)
         }
-        if (info[kCGWindowIsOnscreen as String] as? Bool) != true { try fail("锁定的窗口现在不在屏幕上（最小化了，或在别的桌面空间）。后台模式截不到也点不到它", code: 4) }
+        if !bgCaptureOnly && (info[kCGWindowIsOnscreen as String] as? Bool) != true { try fail("锁定的窗口现在不在屏幕上（最小化了，或在别的桌面空间）。后台模式截不到也点不到它", code: 4) }
         let r = cgBounds(info), t = info[kCGWindowName as String] as? String ?? l.title
+        if let title = titleHint, !t.localizedCaseInsensitiveContains(title) { try fail("Title conflicts with locked window; unlock before retargeting", code: 4) }
         let ax = AXUIElementCreateApplication(l.pid); AXUIElementSetMessagingTimeout(ax, 3)
         let t2 = BGTarget(pid: l.pid, app: NSRunningApplication(processIdentifier: l.pid), appName: l.app, windowId: l.windowId, frame: r, title: t,
                           axApp: ax, axWin: axWindowFor(ax, l.windowId, frame: r, title: t), locked: true)
@@ -1925,7 +2124,7 @@ func bgTarget(appHint: String? = nil, titleHint: String? = nil) throws -> BGTarg
     }
     guard let a = commandTargetPid.map({ "pid:\($0)" }) ?? appHint, !a.isEmpty else { try fail("后台模式需要目标窗口：先 xyzlcu lock --app App [--window-title 标题]，或给这条命令加 --app App", code: 4) }
     guard let app = findApp(a) else { try fail("找不到应用: \(a)", code: 4) }
-    let (wid, r, t) = try pickWindow(app, title: titleHint, id: nil)
+    let (wid, r, t) = try pickWindow(app, title: titleHint, id: windowIdHint)
     let ax = AXUIElementCreateApplication(app.processIdentifier); AXUIElementSetMessagingTimeout(ax, 3)
     let t2 = BGTarget(pid: app.processIdentifier, app: app, appName: app.xName ?? a, windowId: wid, frame: r, title: t, axApp: ax,
                       axWin: axWindowFor(ax, wid, frame: r, title: t), locked: false)
@@ -1958,6 +2157,8 @@ func axActions(_ el: AXUIElement) -> [String] {
     return AXUIElementCopyActionNames(el, &names) == .success ? ((names as? [String]) ?? []) : []
 }
 func sameWindow(_ el: AXUIElement, _ t: BGTarget) -> Bool {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(el, &pid) == .success, pid == t.pid else { return false }
     guard let w = t.axWin else { return false }
     var current: AXUIElement? = el
     for _ in 0..<80 {
@@ -1970,9 +2171,44 @@ func sameWindow(_ el: AXUIElement, _ t: BGTarget) -> Bool {
 }
 /// 命中测试：全局点上是这个应用的哪个元素（问应用本身，窗口被挡住也能拿到）
 func bgHit(_ t: BGTarget, _ g: CGPoint) -> AXUIElement? {
-    var el: AXUIElement?
-    guard AXUIElementCopyElementAtPosition(t.axApp, Float(g.x), Float(g.y), &el) == .success, let e = el else { return nil }
-    return e
+    var hit: AXUIElement?
+    if AXUIElementCopyElementAtPosition(t.axApp, Float(g.x), Float(g.y), &hit) == .success,
+       let hit = hit, sameWindow(hit, t) { return hit }
+    // Some providers return the app's other window for a covered point. Search only
+    // the locked AX subtree, choosing its deepest / smallest containing element.
+    guard let root = t.axWin else { return nil }
+    var queue: [(AXUIElement, Int)] = [(root, 0)], best: (AXUIElement, Int, Int)? = nil, seen = 0
+    while !queue.isEmpty && seen < 1200 {
+        let (el, depth) = queue.removeFirst(); seen += 1
+        if let f = frame(el), let x = f["x"], let y = f["y"], let w = f["w"], let h = f["h"],
+           CGRect(x: x, y: y, width: w, height: h).contains(g), sameWindow(el, t) {
+            let area = max(0, w * h)
+            if best == nil || depth > best!.1 || (depth == best!.1 && area < best!.2) { best = (el, depth, area) }
+        }
+        if depth < 20 { queue += children(el).map { ($0, depth + 1) } }
+    }
+    return best?.0
+}
+/// A bounded, read-only AX fingerprint: change proves observable target state changed,
+/// while lack of change cannot establish whether an event was consumed.
+func bgAXFingerprint(_ t: BGTarget) -> String? {
+    guard let root = t.axWin else { return nil }
+    var queue = [root], values: [String] = [], seen = 0
+    while !queue.isEmpty && seen < 120 {
+        let e = queue.removeFirst(); seen += 1
+        values.append([str(e, kAXRoleAttribute) ?? "", str(e, kAXTitleAttribute) ?? "", axStringValue(e) ?? "",
+                       String(describing: attr(e, kAXSelectedAttribute)), String(describing: attr(e, kAXFocusedAttribute))].joined(separator: "\u{1f}"))
+        queue += children(e)
+    }
+    return values.joined(separator: "\u{1e}")
+}
+func bgAXVerification(_ t: BGTarget, before: String?) -> [String: Any] {
+    guard let before = before else { return ["verified": false, "reason": "Target AX state is unavailable; PID event delivery has no acknowledgement"] }
+    for _ in 0..<12 {
+        if let after = bgAXFingerprint(t), before != after { return ["verified": true, "verification": "target-ax-state-changed"] }
+        sleepMs(10)
+    }
+    return ["verified": false, "reason": "No observable target AX state change; event delivery / AX success alone does not prove the intended effect"]
 }
 func describe(_ el: AXUIElement) -> [String: Any] {
     var o: [String: Any] = ["role": str(el, kAXRoleAttribute) ?? ""]
@@ -2000,7 +2236,7 @@ let focusableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXSearchField",
 /// 后台点击：AX（按 / 聚焦 / 选中）→ PostToPid。返回 route 和命中的元素
 /// 后台滚动：找到点下方的 AXScrollArea，直接设它滚动条的 AXValue（0…1）。很多应用（如 Safari 网页）会忽略投递给后台进程的滚轮事件
 func bgAXScroll(_ t: BGTarget, _ g: CGPoint, dx: Double, dy: Double) -> [String: Any]? {
-    guard var e = bgHit(t, g) else { return nil }
+    guard var e = bgHit(t, g), sameWindow(e, t) else { return nil }
     let pts = 40.0  // 1 "行" ≈ 40pt
     for _ in 0..<40 {
         if str(e, kAXRoleAttribute) == "AXScrollArea" {
@@ -2008,7 +2244,7 @@ func bgAXScroll(_ t: BGTarget, _ g: CGPoint, dx: Double, dy: Double) -> [String:
             let kids = children(e).filter { str($0, kAXRoleAttribute) != "AXScrollBar" }
             let content = kids.compactMap { frame($0) }.max { ($0["w"]! * $0["h"]!) < ($1["w"]! * $1["h"]!) } ?? [:]
             var out: [String: Any] = ["scrollArea": describe(e)]
-            var moved = false
+            var moved = false, verified = true
             for (axis, d, sbName, cs, vs) in [("v", dy, kAXVerticalScrollBarAttribute, content["h"] ?? 0, vis["h"] ?? 0),
                                                ("h", dx, kAXHorizontalScrollBarAttribute, content["w"] ?? 0, vis["w"] ?? 0)] where d != 0 {
                 guard let sbo = attr(e, sbName), CFGetTypeID(sbo) == AXUIElementGetTypeID() else { continue }
@@ -2023,18 +2259,23 @@ func bgAXScroll(_ t: BGTarget, _ g: CGPoint, dx: Double, dy: Double) -> [String:
                     let r3 = { (x: Double) in (x * 1000).rounded() / 1000 }
                     out[axis] = ["from": r3(old), "to": r3(nv), "readBack": r3(after)]
                     moved = true
+                    verified = verified && abs(after - nv) < 0.01
                 }
             }
+            out["verified"] = verified && moved
+            if !verified { out["reason"] = "AX scrollbar write was accepted but its value did not match on readback" }
             return moved ? out : nil
         }
         guard let p = attr(e, kAXParentAttribute), CFGetTypeID(p) == AXUIElementGetTypeID() else { return nil }
         e = p as! AXUIElement
+        if !sameWindow(e, t) { return nil }
     }
     return nil
 }
 func bgClick(_ t: BGTarget, _ g: CGPoint, right: Bool, double: Bool, via: String) throws -> (String, [String: Any]) {
-    var info: [String: Any] = ["global": ["x": Int(g.x), "y": Int(g.y)]]
+    var info: [String: Any] = ["at": ["x": Int(g.x - t.frame.minX), "y": Int(g.y - t.frame.minY)]]
     var tried: [[String: Any]] = []
+    let before = bgAXFingerprint(t)
     if via == "auto" || via == "ax" {
         if double && via == "auto" { tried.append(["route": "ax", "result": "双击没有对应的 AX 动作"]) }
         else if let hit = bgHit(t, g) {
@@ -2043,11 +2284,11 @@ func bgClick(_ t: BGTarget, _ g: CGPoint, right: Bool, double: Bool, via: String
             let stopRoles: Set<String> = ["AXWindow", "AXApplication", "AXWebArea", "AXScrollArea", "AXSplitGroup", "AXToolbar"]
             /// 对一个元素试 AX 动作：右键 → AXShowMenu；输入框 → 聚焦；按钮类 → AXPress；行 / 单元格 → 选中
             func act(_ e: AXUIElement, first: Bool) -> String? {
+                guard sameWindow(e, t) else { return nil }
                 let role = str(e, kAXRoleAttribute) ?? ""
                 let acts = axActions(e)
                 if right { return acts.contains("AXShowMenu") && AXUIElementPerformAction(e, "AXShowMenu" as CFString) == .success ? "ax-showmenu" : nil }
-                if focusableRoles.contains(role), axSettable(e, kAXFocusedAttribute),
-                   AXUIElementSetAttributeValue(e, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success { return "ax-focus" }
+                if focusableRoles.contains(role), focusTextElement(e) { return "ax-focus" }
                 if acts.contains(kAXPressAction) && (pressableRoles.contains(role) || first) {
                     let r = AXUIElementPerformAction(e, kAXPressAction as CFString)
                     if r == .success { return "ax-press" }
@@ -2065,7 +2306,7 @@ func bgClick(_ t: BGTarget, _ g: CGPoint, right: Bool, double: Bool, via: String
                 roles.append(role)
                 if stopRoles.contains(role) { if role == "AXToolbar" { toolbar = e }; break }
                 chain.append(e)
-                if let r = act(e, first: chain.count == 1) { info["element"] = describe(e); return (r, info) }
+                if let r = act(e, first: chain.count == 1) { info["element"] = describe(e); info.merge(bgAXVerification(t, before: before)) { _, b in b }; return (r, info) }
                 el = axElement(attr(e, kAXParentAttribute))
             }
             // 2) 命中测试有时落在控件旁边的装饰元素上（比如 Safari 地址栏上显示网址的静态文字）：
@@ -2083,7 +2324,7 @@ func bgClick(_ t: BGTarget, _ g: CGPoint, right: Bool, double: Bool, via: String
                     if d < 4 { for c in (attr(e, kAXChildrenAttribute) as? [AXUIElement]) ?? [] { queue.append((c, d + 1)) } }
                 }
                 for (e, _) in found.sorted(by: { $0.1 < $1.1 }) {
-                    if let r = act(e, first: false) { info["element"] = describe(e); info["nearby"] = true; return (r, info) }
+                    if let r = act(e, first: false) { info["element"] = describe(e); info["nearby"] = true; info.merge(bgAXVerification(t, before: before)) { _, b in b }; return (r, info) }
                 }
             }
             tried.append(["route": "ax", "result": "命中的元素和它的上级都没有可用的 AX 动作", "chain": roles])
@@ -2091,9 +2332,10 @@ func bgClick(_ t: BGTarget, _ g: CGPoint, right: Bool, double: Bool, via: String
         if via == "ax" { try fail("AX 点不了这个位置：\(jsonText(tried))。可用 --via pid", code: 4) }
     }
     if via == "auto" || via == "pid" {
+        try bgEnsureKeyWindow(t)
         pidMouse(t, g, right: right, double: double)
         info["tried"] = tried
-        info["verified"] = "unknown"
+        info.merge(bgAXVerification(t, before: before)) { _, b in b }
         info["note"] = "鼠标事件已直接投递给应用进程（没有移动真实鼠标）；应用在后台时有的应用会忽略这种事件，请截图核对"
         return ("pid-mouse", info)
     }
@@ -2115,28 +2357,28 @@ func bgEnsureKeyWindow(_ t: BGTarget) throws {
 }
 func bgType(_ t: BGTarget, _ text: String, via: String) throws -> (String, [String: Any]) {
     guard ["auto", "ax", "pid", "paste", "events", "hid"].contains(via) else { try fail("后台模式下 --via 只能是 auto、ax、pid、paste、events、hid") }
+    // Refuse forbidden routes before changing AX focus or reading the pasteboard.
+    if via == "paste" || via == "events" || via == "hid" { try guardGlobalInput(targetPid: t.pid) }
     try bgEnsureKeyWindow(t)
     let (el, _) = try inputTarget("pid:\(t.pid)", role: nil, subrole: nil, title: nil, window: nil, index: 1)
+    guard sameWindow(el, t) else { try fail("Text target is outside the locked window", code: 4) }
     var info: [String: Any] = ["element": describe(el)]
     if via == "events" || via == "hid" {
-        try guardGlobalInput(targetPid: t.pid)
-        keyTargetPid = nil; typeTextBG(text)
-        info["verified"] = "unknown"; return ("events-hid", info)
+        let before = axStringValue(el)
+        keyTargetPid = nil; typeText(text)
+        let verified = waitValueChange(el, from: before, contains: text, ms: 600) == true
+        info["verified"] = verified
+        if !verified { info["reason"] = "HID was explicitly permitted but no matching AX text change was observed" }
+        return ("events-hid", info)
     }
-    if via == "auto" || via == "ax" || via == "paste" {
-        let r = try writeText("pid:\(t.pid)", el, text, replaceAll: false, via: via == "auto" ? "auto" : via)
-        info.merge(r) { _, b in b }
-        return (r["route"] as? String ?? "paste-menu", info)
-    }
-    let before = axStringValue(el)
-    keyTargetPid = t.pid; typeTextBG(text); keyTargetPid = nil
-    let verified = waitValueChange(el, from: before, contains: text, ms: 600)
-    info["verified"] = verified.map { $0 as Any } ?? "unknown"
-    if verified != true { info["note"] = "Posted to target pid; background WebViews may ignore keyboard events. Use set-text and verify AXValue." }
-    return ("pid-keys", info)
+    let result = try writeText("pid:\(t.pid)", el, text, replaceAll: false, via: via)
+    info.merge(result) { _, b in b }
+    return (result["route"] as? String ?? "pid-keys", info)
 }
 
-func typeTextBG(_ text: String) {
+/// Unicode typing only uses the public process-local CGEvent API. No HID fallback,
+/// no shared pasteboard, and no private SLEvent / legacy Carbon PSN route.
+func typeTextBG(_ text: String, pid: pid_t, windowId: CGWindowID? = nil) {
     let units = Array(text.utf16)
     var i = 0
     while i < units.count {
@@ -2147,7 +2389,11 @@ func typeTextBG(_ text: String) {
             let e = CGEvent(keyboardEventSource: bgSource, virtualKey: 0, keyDown: down)
             e?.flags = []
             e?.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
-            postKey(e)
+            if let wid = windowId {
+                e?.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(wid))
+                e?.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(wid))
+            }
+            lastInputAt = Date(); e?.postToPid(pid)
             if down { sleepMs(keyHoldMs) }
         }
         i = end; if i < units.count { sleepMs(stepDelay) }
@@ -2155,35 +2401,49 @@ func typeTextBG(_ text: String) {
 }
 func bgKeys(_ t: BGTarget, _ combos: [String], via: String) throws -> (String, [[String: Any]]) {
     guard ["auto", "pid", "menu"].contains(via) else { try fail("后台模式下 --via 只能是 auto、pid、menu") }
+    // Preflight the entire sequence so a later unsafe combo cannot partially apply it.
+    for c in combos { let (_, flags, key) = try parseCombo(c); try guardScopedKey(key: key, flags: flags) }
     try bgEnsureKeyWindow(t)
     var res: [[String: Any]] = []
     var route = via == "menu" ? "ax-menu" : "pid-keys"
     for (i, c) in combos.enumerated() {
         if i > 0 { sleepMs(stepDelay) }
+        try bgEnsureKeyWindow(t)
+        if let focused = axElement(attr(t.axApp, kAXFocusedUIElementAttribute)), !sameWindow(focused, t) {
+            try fail("Focused element is outside the locked window; refusing PID keys", code: 4)
+        }
         let (k, f, name) = try parseCombo(c)
-        // auto：带 ⌘ 的快捷键优先按菜单项（发给后台进程的 ⌘ 组合键多数不会触发菜单），没有对应菜单项再发事件
+        let before = bgAXFingerprint(t)
+        if inputPolicy.strict, f.contains(.maskCommand),
+           let (_, path, _) = menuItemForShortcut(t.axApp, keyName: name, keycode: k, flags: f), !scopedShortcutMenuAllowed(path) {
+            try fail("refused: resolved shortcut menu is not confined to the target document", code: 6)
+        }
         if via == "auto", f.contains(.maskCommand), let (el, path, enabled) = menuItemForShortcut(t.axApp, keyName: name, keycode: k, flags: f), enabled,
-           AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
+           scopedShortcutMenuAllowed(path), AXUIElementPerformAction(el, kAXPressAction as CFString) == .success {
             res.append(["key": c, "route": "ax-menu", "menuItem": path])
-        } else if via == "auto", let (btn, which) = dialogButtonFor(t, name: name, flags: f), case let bl = label(btn),
+        } else if via == "auto", let (btn, which) = dialogButtonFor(t, name: name, flags: f), sameWindow(btn, t), case let bl = label(btn),
                   AXUIElementPerformAction(btn, kAXPressAction as CFString) == .success {
-            // 对话框 / 面板 / 表单：Esc = 取消按钮，Return = 默认按钮（发给后台进程的按键面板常常不理）
             res.append(["key": c, "route": "ax-press-\(which)", "button": bl])
         } else if via == "menu" {
             guard let (el, path, enabled) = menuItemForShortcut(t.axApp, keyName: name, keycode: k, flags: f) else {
                 try fail("\(t.appName) 的菜单里没有快捷键为 \(c) 的菜单项（可用 --via pid）", code: 4)
             }
+            guard scopedShortcutMenuAllowed(path) else { try fail("Menu shortcut is not confined to the locked document", code: 6) }
+            guard enabled else { try fail("Menu shortcut \(path) is disabled", code: 4) }
             let r = AXUIElementPerformAction(el, kAXPressAction as CFString)
             guard r == .success else { try fail("按菜单项「\(path)」失败: AXError \(r.rawValue)", code: 4) }
             res.append(["key": c, "route": "ax-menu", "menuItem": path, "enabledBefore": enabled])
         } else {
             for down in [true, false] {
                 let e = CGEvent(keyboardEventSource: bgSource, virtualKey: k, keyDown: down); e?.flags = f
+                e?.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(t.windowId))
+                e?.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(t.windowId))
                 lastInputAt = Date(); e?.postToPid(t.pid)
                 if down { sleepMs(keyHoldMs) }
             }
-            res.append(["key": c, "route": "pid-keys", "verified": "unknown"])
+            res.append(["key": c, "route": "pid-keys"])
         }
+        res[res.count - 1].merge(bgAXVerification(t, before: before)) { _, b in b }
         route = res.last?["route"] as? String ?? route
     }
     return (route, res)
@@ -2221,8 +2481,8 @@ func dialogButtonFor(_ t: BGTarget, name: String, flags: CGEventFlags) -> (AXUIE
 }
 /// 后台模式下拒绝会动真实鼠标 / 激活应用的命令（--allow-foreground 才放行）
 func bgRefuse(_ what: String) throws {
-    if allowForeground { return }
-    try fail("后台模式（锁定窗口 / --background）下 \(what) 需要真实鼠标或把应用提到前台，已拒绝。确实需要时加 --allow-foreground（会激活应用、动鼠标），或先 xyzlcu unlock", code: 6)
+    if inputPolicy.permitsForeground { return }
+    try refuseGlobal("\(what) requires app activation, pointer movement, or app-wide state. Use --allow-foreground explicitly for this command, or create an --unsafe lock.")
 }
 /// --allow-foreground：把目标应用 / 窗口提到前面，再走原来的 HID 路线
 func bgForeground(_ t: BGTarget) {
@@ -2261,8 +2521,9 @@ func hostOfPanel(_ list: [[String: Any]], _ panel: [String: Any]) -> Int? {
 
 // MARK: - Permission-free selftest
 func runSelftest() throws {
-    let savedArgs = args
-    defer { args = savedArgs }
+    let savedArgs = args, savedPolicy = inputPolicy
+    let savedBefore = inputFrontmostBefore, savedPointer = inputPointerBefore
+    defer { args = savedArgs; inputPolicy = savedPolicy; inputFrontmostBefore = savedBefore; inputPointerBefore = savedPointer; forceProbe = false }
     var checks = 0
     func check(_ ok: Bool, _ name: String) throws {
         guard ok else { try fail("selftest failed: \(name)") }; checks += 1
@@ -2300,6 +2561,39 @@ func runSelftest() throws {
     let tools = mcpTools(), names = tools.compactMap { $0["name"] as? String }
     try check(["set_text", "press", "select_popup_item", "scroll_to", "wait_text", "observe"].allSatisfy { names.contains($0) }, "new MCP tools exposed")
     try check(Set(names).count == names.count, "MCP names unique")
+    inputPolicy = InputPolicy(background: true)
+    try check(inputPolicy.strict && !inputPolicy.permitsGlobal && !inputPolicy.permitsForeground, "strict background defaults")
+    inputPolicy.allowGlobal = true
+    try check(inputPolicy.permitsGlobal && !inputPolicy.permitsForeground, "global override does not allow activation")
+    inputPolicy.allowGlobal = false; inputPolicy.allowForeground = true
+    try check(inputPolicy.permitsGlobal && inputPolicy.permitsForeground, "foreground override is explicit")
+    inputPolicy = InputPolicy(background: true, unsafeLock: true)
+    try check(!inputPolicy.strict && inputPolicy.permitsGlobal, "unsafe lock relaxation")
+    inputPolicy = InputPolicy(background: true)
+    try guardScopedMenu([["Edit", "编辑"], ["Select All", "全选"]])
+    checks += 1
+    for path in [[["Edit", "File"], ["Select All", "Quit"]], [["Edit"], ["Select All", "Copy"]], [["File"], ["New"]]] {
+        var denied = false
+        do { try guardScopedMenu(path) } catch { denied = true }
+        try check(denied, "unsafe menu alternative denied")
+    }
+    for key in ["q", "n", "o", "c", "x", "v"] {
+        var denied = false
+        do { try guardScopedKey(key: key, flags: .maskCommand) } catch { denied = true }
+        try check(denied, "app-wide/clipboard shortcut denied: \(key)")
+    }
+    try guardScopedKey(key: "a", flags: .maskCommand); checks += 1
+    try check(scopedShortcutMenuAllowed("Edit>Select All") && scopedShortcutMenuAllowed("Edit>Undo Typing"), "document shortcut menus")
+    try check(!scopedShortcutMenuAllowed("File>Quit") && !scopedShortcutMenuAllowed("Edit>Copy"), "resolved shortcut menu scope")
+    let still = CGPoint(x: -100.25, y: 30.5)
+    try check(!contentionDetected(beforePid: 1, afterPid: 1, before: still, after: still), "unchanged input context")
+    try check(contentionDetected(beforePid: 1, afterPid: 2, before: still, after: still), "frontmost contention")
+    try check(contentionDetected(beforePid: 1, afterPid: 1, before: still, after: CGPoint(x: -100, y: 30.5)), "fractional pointer contention")
+    for tool in tools {
+        let props = (tool["inputSchema"] as? [String: Any])?["properties"] as? [String: Any] ?? [:]
+        try check(props["assert_no_contention"] != nil && props["allow_foreground"] != nil, "MCP contention/foreground policy exposed")
+    }
+
     out(["ok": true, "checks": checks, "version": version, "guiRequired": false])
 }
 
@@ -2345,12 +2639,13 @@ func deepAXChildText(_ el: AXUIElement) -> [String] {
 }
 func deepAXSearch(_ context: DeepAXContext, _ query: DeepAXQuery, pressableOnly: Bool = false,
                   popupMenus: Bool = false) -> (els: [AXUIElement], rows: [[String: Any]], visited: Int) {
-    // Open popup menus can be siblings of the locked window. Traverse application-owned
-    // menu roots as well, while pruning every other window and the global menu bar.
-    var queue = popupMenus ? [context.root] : context.roots
+    // Only explicit roots associated with the selected window/popup are traversed.
+    // App-wide sibling menus cannot be safely attributed to this window.
+    var queue = context.roots
     var head = 0, els: [AXUIElement] = [], rows: [[String: Any]] = []
     while head < queue.count && head < query.maxNodes {
         let el = queue[head]; head += 1
+        if let target = context.background, !sameWindow(el, target) { continue }
         guard let node = axNode(el) else { continue }
         if popupMenus, node.role == "AXMenuBar" { continue }
         if popupMenus, node.role == "AXWindow", let win = context.background?.axWin,
@@ -2392,6 +2687,9 @@ func deepAXParseQuery() throws -> DeepAXQuery {
     return q
 }
 func deepAXPress(_ context: DeepAXContext, _ query: DeepAXQuery, el: AXUIElement, asynchronous: Bool, worker: Bool = false) throws -> String {
+    if let target = context.background, !sameWindow(el, target) {
+        try fail("AX press target cannot be associated with the locked process/window", code: 4)
+    }
     if asynchronous && !worker {
         // A dispatch queue dies with a standalone CLI. An independent core process keeps
         // AXPress alive while its native menu tracks; it inherits no client/daemon pipes.
@@ -2405,7 +2703,7 @@ func deepAXPress(_ context: DeepAXContext, _ query: DeepAXQuery, el: AXUIElement
         }
         guard let path = path else { try fail("Cannot resolve a stable AX path for asynchronous press", code: 5) }
         let argv = ["__ax-press", "--pid", String(context.app.processIdentifier), "--path", path.map(String.init).joined(separator: ","),
-                    "--role", str(el, kAXRoleAttribute) ?? "", "--label", label(el), "--no-lock"]
+                    "--role", str(el, kAXRoleAttribute) ?? "", "--label", label(el)] + (context.background.map { ["--worker-window-id", String($0.windowId)] } ?? [])
         process.arguments = argv
         var environment = ProcessInfo.processInfo.environment; environment["XYZLCU_DAEMON"] = "0"; environment["XYZLCU_AX_PRESS_WORKER"] = "1"
         process.environment = environment // Never queue a blocking menu action behind the caller in the daemon.
@@ -2505,7 +2803,9 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
   click-el "App" --role AXButton --title 保存 [--click] [--right] [--double]
   click-el --ref N ["App"]   按上一次 ax --compact 的编号点（需要守护进程）
   wait "App" --title X [--role R] [--timeout 5] [--gone]   |   wait 毫秒 | sleep 毫秒
-  lock --app "App" [--window-title 标题 | --window-id N] | lock --status | unlock
+  --assert-no-contention  Fail if frontmost application or pointer changes during a command
+  --allow-global / --allow-foreground  Explicit per-command escape from strict background policy
+  lock --app "App" [--window-title 标题 | --window-id N | --pid P] [--unsafe] | lock --status | unlock
                  锁定一个窗口（后台模式）：之后 screenshot / click / type / key / scroll / ax / find / click-el 只作用于它，
                  坐标相对窗口左上角，不动真实鼠标、不激活应用；结果里 route = 实际走的路（ax-press / pid-mouse / pid-keys …）
                  drag / move / activate 等需要前台的命令会被拒绝，除非加 --allow-foreground；--no-lock 让单条命令忽略锁定
@@ -2522,7 +2822,6 @@ xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
             XYZLCU_PREWARM=0 守护进程启动时不预开主屏截图流；XYZLCU_PREWARM_SCALES 预开哪些缩放（默认 1,0.5）
             XYZLCU_PREWARM_IDLE 预开的流闲置多少秒关闭（默认 600）
             XYZLCU_STREAM=0 不用常驻截图流；XYZLCU_STREAM_IDLE 闲置多少秒关闭（默认 20）
-            XYZLCU_WINDOW_CROP=0 截窗口时不从主屏常驻流里裁（窗口没被挡住时默认裁，最快）
             XYZLCU_AUTO_RESTART=0 守护进程版本比客户端旧时不自动重启它
             XYZLCU_PNG=imageio 用系统 PNG 编码器；XYZLCU_PNG_LEVEL 压缩级别 1–9（默认 1）
             XYZLCU_CONNECT_WAIT_MS 守护进程正在启动时最多等多久（默认 3000）；XYZLCU_CORE 客户端调用的主程序路径
@@ -2532,6 +2831,21 @@ var inBatch = false
 let startedAt = Date()
 
 func execute(_ argv: [String]) throws {
+    inputFrontmostBefore = nil; inputPointerBefore = nil; inputResultEmitted = false
+    observedContention = false; assertNoContention = false; actionProducesVerification = false
+    try executeCommand(argv)
+    if inputFrontmostBefore != nil {
+        let evidence = contentionEvidence([:])
+        if var meta = binMeta.flatMap({ $0.data(using: .utf8) }).flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] {
+            meta.merge(evidence) { _, new in new }; binMeta = jsonText(meta)
+        }
+        if assertNoContention && observedContention {
+            binOut = nil
+            try fail("contention detected", code: 6)
+        }
+    }
+}
+func executeCommand(_ argv: [String]) throws {
 inputFrontmostBefore = nil; inputResultEmitted = false
 forceProbe = false
 args = argv
@@ -2539,13 +2853,16 @@ try configureHold(option("--hold"))
 if let d = option("--delay") { stepDelay = Int(try dbl(d)) }
 guard !args.isEmpty else { return }
 let cmd = args.removeFirst()
-commandTargetPid = nil
+commandTargetPid = nil; keyTargetPid = nil
 if argumentOptionIndex("--pid") != nil {
     guard let raw = option("--pid"), let p = Int32(raw), p > 0 else { try fail("--pid requires a positive integer") }
     commandTargetPid = p
 }
 allowGlobalInput = flag("--allow-global"); expectedFrontName = option("--expect-front")
-inputFrontmostBefore = nil
+if let pid = commandTargetPid, let index = argumentOptionIndex("--app"), index + 1 < args.count {
+    let explicit = args[index + 1]
+    guard findApp(explicit)?.processIdentifier == pid else { try fail("--app conflicts with --pid; selectors must identify the same process", code: 4) }
+}
 let positionalTargets: Set<String> = ["ax", "find", "press", "click-el", "set-text", "settext", "insert", "value", "menu", "wait", "wait-text", "select", "scroll-to", "observe"]
 if positionalTargets.contains(cmd), let p = commandTargetPid { args.insert("pid:\(p)", at: 0) }
 else if positionalTargets.contains(cmd), let a = option("--app") { args.insert(a, at: 0) }
@@ -2554,13 +2871,43 @@ if ["type", "key", "click", "lock"].contains(cmd), let p = commandTargetPid { _ 
 bgCache = nil; coordOrigin = nil; screenshotExtra = nil
 allowForeground = flag("--allow-foreground"); noLock = flag("--no-lock")
 let bgFlag = flag("--background")
-let bgCommands: Set<String> = ["screenshot", "click", "move", "drag", "scroll", "type", "key", "find", "click-el", "ax", "press", "activate", "open", "hide",
-                               "movewin", "replay", "menu", "set-text", "settext", "insert", "value", "wait", "wait-text", "select", "scroll-to", "observe"]
-bgMode = bgCommands.contains(cmd) && (bgFlag || envv("XYZLCU_BACKGROUND") == "1" || (!noLock && readLock() != nil))
-if ["click", "click-el", "move", "drag", "scroll", "type", "key", "set-text", "settext", "insert", "menu", "press", "select", "scroll-to"].contains(cmd) { inputFrontmostBefore = frontmostInfo() }
+let heldLock = readLock()
+bgMode = bgFlag || envv("XYZLCU_BACKGROUND") == "1" || (!noLock && heldLock != nil)
+inputPolicy = InputPolicy(background: bgMode, unsafeLock: !noLock && (heldLock?.unsafe ?? false),
+                          allowGlobal: allowGlobalInput, allowForeground: allowForeground)
+bgCaptureOnly = false
+assertNoContention = flag("--assert-no-contention")
+let actionCommands: Set<String> = ["click", "click-el", "move", "drag", "scroll", "type", "key", "set-text", "settext", "insert", "menu", "press", "select", "scroll-to", "activate", "open", "hide", "movewin", "replay", "request"]
+actionProducesVerification = actionCommands.contains(cmd)
+// Capture evidence for every JSON command, including diagnostics and refused actions.
+if !["selftest", "version", "--version", "-v", "help", "--help", "-h", "mcp", "serve"].contains(cmd) {
+    inputFrontmostBefore = frontmostInfo(); inputPointerBefore = cursorPos()
+}
+if noLock, let held = heldLock, !held.unsafe, !allowForeground && !allowGlobalInput {
+    try refuseGlobal("--no-lock would bypass the strict window lock. Unlock first, or explicitly use --allow-foreground / --allow-global with this command.")
+}
+if FileManager.default.fileExists(atPath: lockPath()), heldLock == nil,
+   !["unlock", "lock", "help", "--help", "version", "--version", "selftest"].contains(cmd) {
+    try fail("refused: invalid lock file; explicitly unlock or replace the lock before continuing", code: 6)
+}
+// Reject explicit global routes before TCC checks or AX focus changes.
+if inputPolicy.strict && !inputPolicy.permitsGlobal {
+    let viaIndex = argumentOptionIndex("--via")
+    let via = viaIndex.flatMap { $0 + 1 < args.count ? args[$0 + 1].lowercased() : nil }
+        ?? envv(cmd == "type" ? "XYZLCU_TYPE_VIA" : "XYZLCU_KEY_VIA")?.lowercased()
+    if ["click", "type", "key", "insert", "set-text", "settext"].contains(cmd),
+       let route = via, ["hid", "events", "paste"].contains(route) {
+        try refuseGlobal("The requested \(route) route uses global HID input or the shared pasteboard. Use AX/pid, or explicitly --allow-global for this command.")
+    }
+}
 let front0 = bgMode ? frontPid() : 0, cur0 = bgMode ? cursorPos() : .zero, bt0 = Date()
 func bgOut(_ t: BGTarget, _ route: String, _ extra: [String: Any] = [:]) { out(bgResult(t, route: route, front0: front0, cur0: cur0, t0: bt0, extra)) }
-if bgMode && ["activate", "open", "hide", "movewin", "replay"].contains(cmd) { try bgRefuse(cmd) }
+if bgMode && ["activate", "open", "hide", "movewin", "replay", "request", "record", "move", "drag"].contains(cmd) { try bgRefuse(cmd) }
+if bgMode && cmd == "menu" && argumentOptionIndex("--activate") != nil { try bgRefuse("menu --activate") }
+if bgMode && ["activate", "hide", "movewin"].contains(cmd) {
+    let t = try bgTarget(appHint: args.first)
+    if !args.isEmpty { args[0] = "pid:\(t.pid)" }
+}
 
 switch cmd {
 case "selftest": try runSelftest()
@@ -2582,8 +2929,12 @@ case "observe":
 case "lock":
     // xyzlcu lock --app Safari [--window-title 标题 | --window-id N]   |   lock --status   |   unlock
     if flag("--status") {
-        guard let l = readLock() else { out(["locked": false]); break }
-        var o: [String: Any] = ["locked": true, "app": l.app, "pid": Int(l.pid), "windowId": Int(l.windowId), "window": l.title, "since": Int(l.at)]
+        guard let l = readLock() else {
+            if FileManager.default.fileExists(atPath: lockPath()) { out(["locked": true, "valid": false, "strict": true, "error": "invalid lock file", "hint": "Explicitly unlock or replace the lock."]) }
+            else { out(["locked": false]) }
+            break
+        }
+        var o: [String: Any] = ["locked": true, "app": l.app, "pid": Int(l.pid), "windowId": Int(l.windowId), "window": l.title, "since": Int(l.at), "unsafe": l.unsafe, "strict": !l.unsafe]
         if let info = cgWindowInfo(l.windowId) {
             let r = cgBounds(info)
             o["windowFrame"] = ["x": Int(r.minX), "y": Int(r.minY), "w": Int(r.width), "h": Int(r.height)]
@@ -2593,14 +2944,24 @@ case "lock":
     }
     guard axTrusted() else { try fail("没有辅助功能权限，先运行 xyzlcu check / xyzlcu request", code: 2) }
     let appName = option("--app") ?? args.first
-    let title = option("--window-title") ?? option("--title"), wid = try option("--window-id").map { Int(try dbl($0)) }
+    let unsafe = flag("--unsafe")
+    let title = option("--window-title") ?? option("--title")
+    let wid: Int?
+    if let raw = option("--window-id") {
+        guard let n = UInt32(raw), n > 0 else { try fail("--window-id requires a positive window number") }; wid = Int(n)
+    } else { wid = nil }
+    if title != nil && wid != nil { try fail("Choose --window-title or --window-id") }
     try rejectUnknownOptions("lock")
     guard let a = appName else { try fail("用法: xyzlcu lock --app App [--window-title 标题 | --window-id N]  |  lock --status  |  unlock") }
     guard let app = findApp(a) else { try fail("找不到应用: \(a)", code: 4) }
     let (w, r, t) = try pickWindow(app, title: title, id: wid)
-    try writeLock(LockInfo(pid: app.processIdentifier, app: app.xName ?? a, bundleId: app.bundleIdentifier ?? "", windowId: w, title: t, at: Date().timeIntervalSince1970))
+    try writeLock(LockInfo(pid: app.processIdentifier, app: app.xName ?? a, bundleId: app.bundleIdentifier ?? "", windowId: w, title: t, at: Date().timeIntervalSince1970, unsafe: unsafe))
+    if !unsafe {
+        if #available(macOS 14.0, *) { for value in liveStreams.values { (value as? LiveStream)?.stop() } }
+        liveStreams.removeAll(); prewarmKeys.removeAll()
+    }
     let ax = AXUIElementCreateApplication(app.processIdentifier); AXUIElementSetMessagingTimeout(ax, 3)
-    out(["locked": true, "app": app.xName ?? a, "pid": Int(app.processIdentifier), "windowId": Int(w), "window": t,
+    out(["locked": true, "strict": !unsafe, "unsafe": unsafe, "app": app.xName ?? a, "pid": Int(app.processIdentifier), "windowId": Int(w), "window": t,
          "windowFrame": ["x": Int(r.minX), "y": Int(r.minY), "w": Int(r.width), "h": Int(r.height)], "axWindow": axWindowFor(ax, w, frame: r, title: t) != nil,
          "note": "之后的 screenshot / click / type / key / scroll / ax / find / click-el 只作用于这个窗口，坐标相对窗口左上角，不动鼠标、不激活应用；xyzlcu unlock 解除"])
 case "unlock":
@@ -2613,6 +2974,7 @@ case "check":
     forceProbe = flag("--probe")
     defer { forceProbe = false }
     try rejectUnknownOptions("check")
+    if forceProbe { try guardGlobalInput() }
     cachedHealth = nil  // check 总是重新检测
     let h = inputHealth(), ax = axTrusted()
     forceProbe = false
@@ -2669,11 +3031,18 @@ case "screenshot":
     let maxSide = try option("--max-side").map { raw -> Int in
         guard let n = Int(raw), n > 0 else { try fail("--max-side requires a positive integer") }; return n
     }
-    let display = Int(option("--display") ?? "1") ?? 1
+    let displayOption = option("--display")
+    let display = Int(displayOption ?? "1") ?? 1
     let fmtOpt = try option("--format").map(ImgFormat.parse)
     let quality = try option("--quality").map(dbl) ?? (fast ? 0.6 : 0.7)
     let forceCLI = flag("--cli")
-    let winApp = option("--window") ?? option("--window-id").map { "#" + $0 }, winTitle = option("--title")
+    let windowAppOption = option("--window"), windowIdOption = option("--window-id")
+    if windowAppOption != nil && windowIdOption != nil { try fail("screenshot: choose --window or --window-id, not both", code: 4) }
+    let windowId = try windowIdOption.map { raw -> Int in
+        guard let n = UInt32(raw), n > 0 else { try fail("--window-id requires a positive window number", code: 4) }; return Int(n)
+    }
+    let winApp = windowAppOption ?? windowId.map { "#" + String($0) }, winTitle = option("--title")
+    let targetTitle = option("--window-title") ?? winTitle
     var region: CGRect? = nil
     if let r = option("--region") {
         let v = try r.split(separator: ",").map { try dbl(String($0).trimmingCharacters(in: .whitespaces)) }
@@ -2683,14 +3052,36 @@ case "screenshot":
     // --base64：图像放进 JSON；--stdout：原始字节写到标准输出（元数据到标准错误）。两者都不落盘，除非另给路径
     let b64 = flag("--base64"), toStdout = flag("--stdout"), timing = flag("--timing"), diff = flag("--diff")
     var winApp2 = winApp
-    let targetApp = option("--app") ?? commandTargetPid.map { "pid:\($0)" }
+    var targetApp = option("--app") ?? commandTargetPid.map { "pid:\($0)" }
+    if let explicit = targetApp, let pid = commandTargetPid {
+        guard let a = findApp(explicit), a.processIdentifier == pid else { try fail("screenshot: --app conflicts with --pid", code: 4) }
+    }
+    if let explicit = winApp, let app = targetApp {
+        guard let a = findApp(app) else { try fail("找不到应用: \(app)", code: 4) }
+        let (wid, _, _) = try appWindow(explicit, title: targetTitle)
+        guard let info = cgWindowInfo(wid), (info[kCGWindowOwnerPID as String] as? Int) == Int(a.processIdentifier) else { try fail("screenshot: window selector conflicts with --app/--pid", code: 4) }
+    }
     if !bgMode && winApp2 == nil { winApp2 = targetApp }
-    if bgMode && winApp == nil && region == nil {
-        // 锁定 / 后台模式：只截目标窗口（ScreenCaptureKit 的单窗口截图，被别的窗口挡住也能截）
-        let t = try bgTarget(appHint: targetApp, titleHint: option("--window-title"))
+    if region != nil && (winApp2 != nil || targetApp != nil) { try fail("screenshot: --region cannot be combined with a window/app/pid target", code: 4) }
+    if displayOption != nil && (bgMode || winApp2 != nil || region != nil) { try fail("screenshot: --display cannot be combined with a window/background/region target", code: 4) }
+    if bgMode {
+        if region != nil { try fail("Window-only background capture refuses --region; unlock for a desktop-region capture", code: 4) }
+        bgCaptureOnly = true
+        if let name = windowAppOption {
+            guard let a = findApp(name) else { try fail("找不到应用: \(name)", code: 4) }
+            if let explicit = targetApp {
+                guard let b = findApp(explicit), a.processIdentifier == b.processIdentifier else { try fail("screenshot: --window conflicts with --app/--pid", code: 4) }
+            }
+            targetApp = "pid:\(a.processIdentifier)"
+        }
+        if targetApp == nil, let id = windowId, let info = cgWindowInfo(CGWindowID(id)), let pid = info[kCGWindowOwnerPID as String] as? Int { targetApp = "pid:\(pid)" }
+        let t = try bgTarget(appHint: targetApp, titleHint: targetTitle, windowIdHint: windowId)
+        if let title = targetTitle, !t.title.localizedCaseInsensitiveContains(title) { try fail("screenshot: title selector conflicts with the locked/target window", code: 4) }
         winApp2 = "#\(t.windowId)"
-        screenshotExtra = ["route": "sck-window", "background": true, "coords": "window", "app": t.appName, "locked": t.locked,
-                           "note": "锁定模式：窗口内坐标 x = x_pixel / pixelsPerPoint，y = y_pixel / pixelsPerPoint（click x y 直接用这个）"]
+        screenshotExtra = ["route": "sck-window", "background": true, "coords": "window", "app": t.appName, "pid": Int(t.pid), "locked": t.locked]
+    } else if let explicit = winApp2, let pid = commandTargetPid {
+        let (wid, _, _) = try appWindow(explicit, title: targetTitle)
+        guard let info = cgWindowInfo(wid), (info[kCGWindowOwnerPID as String] as? Int) == Int(pid) else { try fail("screenshot: window selector conflicts with --pid", code: 4) }
     }
     let given = try pathOption("--out", "-o") ?? args.first
     if let g = given, g.hasPrefix("-") { try fail("screenshot: 未知选项 \(g)（输出路径用 --out / -o 给出；以 - 开头的文件名写成 ./\(g)）") }
@@ -2698,7 +3089,8 @@ case "screenshot":
     // 格式：--format > 文件扩展名 > --fast / 内存出图用 jpg > png（无损，多线程编码）
     let format = fmtOpt ?? given.flatMap(ImgFormat.fromPath) ?? ((fast || ((b64 || toStdout) && given == nil)) ? .jpeg : .png)
     let path = given ?? ((b64 || toStdout) ? nil : NSTemporaryDirectory() + "xyzlcu-\(Int(Date().timeIntervalSince1970 * 1000)).\(format.ext)")
-    try screenshot(path: path, scale: scale, display: display, region: region, window: winApp2.map { ($0, winApp == nil ? nil : winTitle) },
+    try rejectUnknownOptions("screenshot")
+    try screenshot(path: path, scale: scale, display: display, region: region, window: winApp2.map { ($0, bgMode ? nil : targetTitle) },
                    format: format, quality: quality, forceCLI: forceCLI, base64: b64, toStdout: toStdout, timing: timing, diff: diff, maxSide: maxSide)
 case "click":
     try guardUnlocked(); let right = flag("--right"), double = flag("--double")
@@ -2735,6 +3127,7 @@ case "move":
     try need(2, "move x y")
     var p = CGPoint(x: try dbl(args[0]), y: try dbl(args[1]))
     if let t = bgT { p = try bgGlobal(t, p.x, p.y); bgForeground(t) }
+    try guardGlobalInput(targetPid: bgT?.pid)
     CGWarpMouseCursorPosition(p); CGAssociateMouseAndMouseCursorPosition(1)
     mouse(.mouseMoved, p)
     if let t = bgT { bgOut(t, "events-hid-foreground") } else { emit("ok") }
@@ -2746,6 +3139,7 @@ case "drag":
     try need(4, "drag x1 y1 x2 y2")
     var a = CGPoint(x: try dbl(args[0]), y: try dbl(args[1])), b = CGPoint(x: try dbl(args[2]), y: try dbl(args[3]))
     if let t = bgT { a = try bgGlobal(t, a.x, a.y); b = try bgGlobal(t, b.x, b.y); bgForeground(t) }
+    try guardGlobalInput(targetPid: bgT?.pid)
     let dd = max(stepDelay, 8)  // 拖拽需要一点时间让应用识别
     mouse(.mouseMoved, a); sleepMs(dd); mouse(.leftMouseDown, a); sleepMs(dd)
     for i in 1...12 { let t = CGFloat(i) / 12; mouse(.leftMouseDragged, CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)); sleepMs(dd) }
@@ -2816,6 +3210,8 @@ case "scroll":
         }
         let g = try bgGlobal(t, lx, ly)
         let sdx = try dbl(args[0]), sdy = try dbl(args[1])
+        guard sdx.isFinite, sdy.isFinite, sdx >= Double(Int32.min), sdx <= Double(Int32.max),
+              sdy >= Double(Int32.min), sdy <= Double(Int32.max) else { try fail("Scroll deltas must be finite 32-bit values") }
         if via != "pid" {
             if var r = bgAXScroll(t, g, dx: sdx, dy: sdy) {
                 r["at"] = ["x": Int(lx), "y": Int(ly)]
@@ -2823,12 +3219,13 @@ case "scroll":
             }
             if via == "ax" { try fail("这个位置下面没有可设置的 AX 滚动条（试 --via pid）", code: 5) }
         }
+        try bgEnsureKeyWindow(t)
         let e = CGEvent(scrollWheelEvent2Source: bgSource, units: .line, wheelCount: 2, wheel1: Int32(try dbl(args[1])), wheel2: Int32(try dbl(args[0])), wheel3: 0)
         e?.location = g
         e?.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(t.windowId))
         e?.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(t.windowId))
         lastInputAt = Date(); e?.postToPid(t.pid)
-        bgOut(t, "pid-scroll", ["at": ["x": Int(lx), "y": Int(ly)], "verified": "unknown"]); break
+        bgOut(t, "pid-scroll", ["at": ["x": Int(lx), "y": Int(ly)], "verified": false, "reason": "Event/action dispatched; no target state change was verified"]); break
     }
     try rejectUnknownOptions("scroll")
     try need(2, "scroll dx dy  （正 dy 向上滚，单位：行）")
@@ -2853,7 +3250,7 @@ case "type", "key":
                 bgOut(t, "events-hid", ["keys": keys])
             } else {
                 let (route, keys) = try bgKeys(t, args, via: via)
-                bgOut(t, route, ["keys": keys])
+                bgOut(t, route, ["keys": keys, "verified": keys.allSatisfy { $0["verified"] as? Bool == true }, "verification": "See per-key AX state evidence; semantic outcome is application-defined"])
             }
         }
         break
@@ -2875,7 +3272,8 @@ case "insert", "settext", "set-text":
     try guardUnlocked()
     let replaceAll = cmd != "insert"
     let via = (option("--via") ?? "auto").lowercased()
-    guard ["auto", "ax", "paste"].contains(via) else { try fail("--via 只能是 auto、ax、paste") }
+    guard ["auto", "ax", "paste", "pid"].contains(via) else { try fail("--via requires auto, ax, pid, paste") }
+    if via == "paste" { try guardGlobalInput() }
     let role = option("--role"), subrole = option("--subrole"), title = option("--title") ?? option("--id"), win = option("--window")
     let idx = Int(try option("--index").map(dbl) ?? 1)
     let contains = flag("--contains"), ref = option("--ref")
@@ -2929,12 +3327,16 @@ case "menu":
         activated = NSWorkspace.shared.frontmostApplication?.processIdentifier == a.processIdentifier
     }
     var mainWin: String? = nil
-    if let w = winOpt { mainWin = try setMainWindow(args[0], w) }
+    if let w = winOpt, !bgMode { mainWin = try setMainWindow(args[0], w) }
     let path = parseMenuPath(args.dropFirst().joined(separator: " "))
     guard !path.isEmpty else { try fail("菜单路径为空，例如 \"文件>存储\" 或 \"File>Save\"") }
+    try guardScopedMenu(path)
+    let scopedMenuTarget = bgMode ? try bgTarget(appHint: args[0]) : nil
+    let menuBefore = scopedMenuTarget.flatMap(bgAXFingerprint)
     let picked = try pressMenu(args[0], path)
     var o: [String: Any] = ["app": findApp(args[0])?.xName ?? args[0], "pressed": picked.joined(separator: ">"), "ms": Int(Date().timeIntervalSince(t0) * 1000),
                             "path": "ax-menu", "route": "ax-menu", "pid": Int(findApp(args[0])?.processIdentifier ?? -1), "activated": activated, "appWasActive": wasActive]
+    if let t = scopedMenuTarget { o.merge(bgAXVerification(t, before: menuBefore)) { _, new in new } }
     if let w = mainWin { o["window"] = w }
     if lastMenuWasDisabled {
         o["note"] = (wasActive || activated) ? "按下前该菜单项显示为不可用（可能是旧状态），请确认效果"
@@ -3007,7 +3409,7 @@ case "click-el":
         if forceClick || right || double || AXUIElementPerformAction(el, kAXPressAction as CFString) != .success {
             guard let f = n.frame else { try fail("元素没有位置信息，无法点击") }
             let c = CGPoint(x: f["x"]! + f["w"]! / 2, y: f["y"]! + f["h"]! / 2)
-            if bgMode { let t = try bgTarget(); pidMouse(t, c, right: right, double: double); how = "pid-mouse" }
+            if bgMode { let t = try bgTarget(); try bgEnsureKeyWindow(t); pidMouse(t, c, right: right, double: double); how = "pid-mouse" }
             else { try guardGlobalInput(targetPid: axRefsPid); click(c, right: right, double: double); how = "click" }
         }
         if bgMode {
@@ -3031,10 +3433,11 @@ case "click-el":
     }
     let r = try axFind(appArg, q)
     guard let el = r.els.first else { try fail("找不到元素（搜索了 \(r.visited) 个节点）", code: 4) }
+    if let t = bgT, !sameWindow(el, t) { try fail("AX target is outside the locked process/window", code: 4) }
     var how = "AXPress"
     if forceClick || right || double || AXUIElementPerformAction(el, kAXPressAction as CFString) != .success {
         guard let c = r.matches[0]["center"] as? [String: Int] else { try fail("元素没有位置信息，无法点击") }
-        if let t = bgT { pidMouse(t, CGPoint(x: c["x"]!, y: c["y"]!), right: right, double: double); how = "pid-mouse" }
+        if let t = bgT { try bgEnsureKeyWindow(t); pidMouse(t, CGPoint(x: c["x"]!, y: c["y"]!), right: right, double: double); how = "pid-mouse" }
         else { try guardGlobalInput(targetPid: r.app.processIdentifier); click(CGPoint(x: c["x"]!, y: c["y"]!), right: right, double: double); how = "click" }
     }
     if let t = bgT {
@@ -3053,15 +3456,15 @@ case "open":
     try need(1, "open \"App\"")
     let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/open"); p.arguments = ["-a", args[0]]
     try? p.run(); p.waitUntilExit()
-    if p.terminationStatus != 0 { try fail("打开失败: \(args[0])") }; emit("ok")
+    if p.terminationStatus != 0 { try fail("打开失败: \(args[0])") }; out(["ok": true, "route": "open-foreground"])
 case "activate":
     try need(1, "activate \"App\"")
     guard let a = findApp(args[0]) else { try fail("没在运行: \(args[0])，可先 xyzlcu open") }
-    a.unhide(); a.activate(options: [.activateAllWindows]); emit("ok")
+    a.unhide(); a.activate(options: [.activateAllWindows]); out(["ok": true, "route": "activate-foreground"])
 case "hide":
     try need(1, "hide \"App\"")
     guard let a = findApp(args[0]) else { try fail("没在运行: \(args[0])") }
-    a.hide(); emit("ok")
+    a.hide(); out(["ok": true, "route": "hide-app"])
 case "displays":
     out(activeDisplays().enumerated().map { (i, d) -> [String: Any] in
         let b = CGDisplayBounds(d)
@@ -3123,7 +3526,7 @@ case "ax":
         let content = (focus == "window" || win == nil) ? [] : contentRoots(w0, webOnly: focus == "web")
         if focus == "web" && content.isEmpty { try fail("这个窗口里没有网页区域（AXWebArea）", code: 4) }
         var roots = content + (focus == "web" ? [] : [w0])
-        if withMenu, let mb = axElement(attr(root, kAXMenuBarAttribute)) { roots.append(mb) }
+        if withMenu && bgT == nil, let mb = axElement(attr(root, kAXMenuBarAttribute)) { roots.append(mb) }
         let r = compactDump(roots, maxDepth: depth, maxItems: maxItems, withText: flag("--text"), skip: content)
         let wt = win.flatMap { str($0, kAXTitleAttribute) } ?? ""
         let cdesc = content.isEmpty ? "" : " content-first=\(content.compactMap { str($0, kAXRoleAttribute) }.joined(separator: ","))"
@@ -3137,7 +3540,7 @@ case "ax":
     emit("# \(app.xName ?? "?") pid=\(app.processIdentifier)")
     var n = 0
     if let w = win { dump(w, depth: 0, max: depth, count: &n) } else { dump(root, depth: 0, max: depth, count: &n) }
-    if let mb = attr(root, kAXMenuBarAttribute), withMenu { dump(mb as! AXUIElement, depth: 0, max: 3, count: &n) }
+    if let mb = attr(root, kAXMenuBarAttribute), withMenu && bgT == nil { dump(mb as! AXUIElement, depth: 0, max: 3, count: &n) }
 case "__ax-press":
     guard !daemonMode && !inBatch && ProcessInfo.processInfo.environment["XYZLCU_AX_PRESS_WORKER"] == "1" else {
         try fail("Private AX worker is only available to an asynchronous press child", code: 4)
@@ -3145,6 +3548,7 @@ case "__ax-press":
     try guardUnlocked()
     // Private standalone worker: validate the resolved identity before a potentially
     // blocking native menu action. No activation, event fallback, or daemon sockets.
+    let workerWindowId = option("--worker-window-id").flatMap(UInt32.init)
     let path = option("--path") ?? "", role = option("--role") ?? "", expectedLabel = option("--label") ?? ""
     let (root, _) = try axRoot(nil)
     var el = root
@@ -3156,6 +3560,17 @@ case "__ax-press":
         }
     }
     guard str(el, kAXRoleAttribute) == role, label(el) == expectedLabel else { try fail("Asynchronous AX target changed; action refused", code: 4) }
+    if let wid = workerWindowId {
+        if let current = readLock(), current.windowId != wid || current.pid != commandTargetPid {
+            try fail("Lock changed before asynchronous AX action", code: 4)
+        }
+        guard let info = cgWindowInfo(wid), let pid = commandTargetPid,
+              info[kCGWindowOwnerPID as String] as? Int == Int(pid) else { try fail("Asynchronous target window disappeared", code: 4) }
+        let axApp = AXUIElementCreateApplication(pid), bounds = cgBounds(info)
+        let target = BGTarget(pid: pid, app: nil, appName: "", windowId: wid, frame: bounds, title: "", axApp: axApp,
+                              axWin: axWindowFor(axApp, wid, frame: bounds, title: ""), locked: true)
+        guard sameWindow(el, target) else { try fail("Asynchronous AX target is outside its original window", code: 4) }
+    }
     let result = AXUIElementPerformAction(el, kAXPressAction as CFString)
     guard result == .success else { try fail("AXPress failed: \(result.rawValue)", code: 5) }
 case "press":
@@ -3172,11 +3587,15 @@ case "press":
     }
     guard result.els.indices.contains(query.nth - 1) else { try fail("No AX press candidate at index \(query.nth) (\(result.els.count) matches)", code: 4) }
     let el = result.els[query.nth - 1], role = str(el, kAXRoleAttribute) ?? ""
+    let pressBefore = context.background.flatMap(bgAXFingerprint)
     let route = try deepAXPress(context, query, el: el, asynchronous: asynchronous || ["AXPopUpButton", "AXMenuButton"].contains(role))
     var row = result.rows[query.nth - 1]
     row["app"] = context.app.xName ?? ""; row["pid"] = Int(context.app.processIdentifier)
-    row["route"] = route; row["action"] = "AXPress"; row["async"] = route == "ax-press-async"; row["verified"] = "unknown"
-    if let t = context.background { bgOut(t, route, row) } else { out(row) }
+    row["route"] = route; row["action"] = "AXPress"; row["async"] = route == "ax-press-async"; row["verified"] = false; row["reason"] = route == "ax-press-async" ? "Asynchronous AX worker dispatched; completion and later contention are not observed by this result" : "AXPress dispatched; no target state change was verified"
+    if let t = context.background {
+        if route != "ax-press-async" { row.merge(bgAXVerification(t, before: pressBefore)) { _, new in new } }
+        bgOut(t, route, row)
+    } else { out(row) }
 case "select":
     try guardUnlocked()
     guard let popup = option("--popup"), let item = option("--item") else { try fail("select requires --popup and --item") }
@@ -3190,16 +3609,27 @@ case "select":
     let popupCandidates = zip(candidates.els, candidates.rows).filter { ["AXPopUpButton", "AXMenuButton", "AXComboBox"].contains(str($0.0, kAXRoleAttribute) ?? "") }
     guard popupCandidates.indices.contains(query.nth - 1) else { try fail("Cannot find popup: \(popup)", code: 4) }
     let selected = popupCandidates[query.nth - 1]
+    let popupBefore = axStringValue(selected.0)
     _ = try deepAXPress(context, query, el: selected.0, asynchronous: true)
     var itemQuery = DeepAXQuery(); itemQuery.role = "AXMenuItem"; itemQuery.title = item
     let start = Date()
     while true {
-        let result = deepAXSearch(context, itemQuery, popupMenus: true)
+        let shownMenu = axElement(attr(selected.0, "AXShownMenuUIElement"))
+        let popupRoots = [selected.0] + (shownMenu.map { [$0] } ?? [])
+        let popupContext = DeepAXContext(root: context.root, app: context.app, roots: popupRoots, window: context.window, background: context.background)
+        let result = deepAXSearch(popupContext, itemQuery)
         if let el = result.els.first {
             guard (attr(el, kAXEnabledAttribute) as? NSNumber)?.boolValue != false else { try fail("Popup menu item is disabled: \(item)", code: 5) }
             _ = try deepAXPress(context, itemQuery, el: el, asynchronous: false)
-            out(["app": context.app.xName ?? "", "pid": Int(context.app.processIdentifier), "popup": popup, "item": item,
-                 "route": "ax-popup-menu", "action": "AXPress", "verified": "unknown", "ms": Int(Date().timeIntervalSince(start) * 1000)]); break
+            var verified = false
+            for _ in 0..<20 {
+                if let value = axStringValue(selected.0), value != popupBefore, value.localizedCaseInsensitiveContains(item) { verified = true; break }
+                sleepMs(10)
+            }
+            var output: [String: Any] = ["app": context.app.xName ?? "", "pid": Int(context.app.processIdentifier), "popup": popup, "item": item,
+                 "route": "ax-popup-menu", "action": "AXPress", "verified": verified, "ms": Int(Date().timeIntervalSince(start) * 1000)]
+            if !verified { output["reason"] = "Popup item AXPress succeeded, but a matching popup value change could not be verified" }
+            out(output); break
         }
         if Date().timeIntervalSince(start) >= timeout { try fail("Timed out waiting for popup menu item: \(item)", code: 4) }
         sleepMs(50)
@@ -3355,8 +3785,12 @@ let readOnlyCommands: Set<String> = ["help", "-h", "--help", "version", "--versi
                                      "selftest", "observe", "wait-text", "sleep", "wait", "find", "apps", "displays", "windows", "ax", "taps", "__status", "serve"]
 func markIfMutating(_ argv: [String]) { if let c = argv.first, !readOnlyCommands.contains(c) { lastInputAt = Date() } }
 func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) -> Int32 {
-    func inputError(_ message: String, _ code: Int32) {
-        if inputFrontmostBefore != nil && !inputResultEmitted { out(["ok": false, "error": message, "code": Int(code)]) }
+    func inputError(_ message: String, _ code: Int32, hint: String? = nil) {
+        if !inputResultEmitted {
+            var result: [String: Any] = ["ok": false, "error": message, "code": Int(code)]
+            if let hint = hint { result["hint"] = hint }
+            out(result)
+        }
     }
     if top.isEmpty { emit(usage); return 0 }
     do {
@@ -3373,7 +3807,7 @@ func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) ->
                 defer { markIfMutating(c) }
                 do { try execute(c) } catch let e as XErr {
                     err("error: 第 \(n + 1) 步（\(c.joined(separator: " "))）: \(e.msg)")
-                    inputError(e.msg, e.code)
+                    inputError(e.msg, e.code, hint: e.hint)
                     if !coe { return e.code }
                     worst = e.code
                 }
@@ -3382,7 +3816,7 @@ func runMain(_ top: [String], stdinText: () -> String, err: (String) -> Void) ->
         }
         defer { markIfMutating(top) }
         try execute(top); return 0
-    } catch let e as XErr { err("error: " + e.msg); inputError(e.msg, e.code); return e.code }
+    } catch let e as XErr { err("error: " + e.msg); inputError(e.msg, e.code, hint: e.hint); return e.code }
     catch { err("error: \(error)"); inputError("\(error)", 1); return 1 }
 }
 
@@ -3544,7 +3978,7 @@ func runCaptured(_ argv: [String], stdin: String = "") -> RunResult {
     let code = runMain(argv, stdinText: { stdin }, err: { errText += $0 + "\n" })
     if code == 2, let diagnostic = permissionDiagnostic() { errText += diagnostic + "\n" }
     if code != 0, let before = inputFrontmostBefore {
-        errText += jsonText(["frontmostBefore": before, "frontmostAfter": frontmostInfo()]) + "\n"
+        errText += jsonText(contentionEvidence(["frontmostBefore": before])) + "\n"
     }
     if let m = binMeta { errText = m + "\n" + errText }
     let r = RunResult(code: code, out: outBuf ?? "", err: errText, bin: binOut)
@@ -3709,9 +4143,9 @@ func mcpTools() -> [[String: Any]] {
         if !["check", "apps", "windows", "cursor", "batch", "xyzlcu", "activate"].contains(name) {
             p["pid"] = integer; p["app"] = s; p["background"] = b
         }
-        if !readOnly {
-            p["allow_global"] = b; p["expect_front"] = s
-        }
+        p["assert_no_contention"] = b
+        p["allow_foreground"] = b; p["allow_global"] = b
+        if !readOnly { p["expect_front"] = s }
         var schema: [String: Any] = ["type": "object", "properties": p]
         if !req.isEmpty { schema["required"] = req }
         return ["name": name, "description": desc, "inputSchema": schema,
@@ -3719,7 +4153,7 @@ func mcpTools() -> [[String: Any]] {
     }
     let selectors: [String: Any] = ["role": s, "title": s, "contains": b, "index": integer, "window": s, "ref": integer]
     return [
-        t("lock", "Lock one window for background AX actions. unlock releases; status inspects.", ["window_title": s, "window_id": integer, "unlock": b, "status": b]),
+        t("lock", "Lock one window for background AX actions. unlock releases; status inspects.", ["window_title": s, "window_id": integer, "unsafe": b, "unlock": b, "status": b]),
         t("check", "Read permissions and the host app that needs TCC access.", readOnly: true),
         t("screenshot", "Capture JPEG at half scale by default. max_side caps pixels. Metadata maps pixels to points.",
           ["window": s, "title": s, "window_id": integer, "region": s, "display": integer, "scale": n, "quality": n, "max_side": integer, "diff": b], readOnly: true),
@@ -3816,6 +4250,7 @@ func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
             argv = ["lock"] + target(positional: false)
             if let t = str("window_title") { argv += ["--window-title", t] }
             if let w = str("window_id") { argv += ["--window-id", w] }
+            if on("unsafe") { argv.append("--unsafe") }
         }
     case "screenshot":
         argv = ["screenshot", "--stdout", "--fast", "--quality", str("quality") ?? "0.6"]
@@ -3870,6 +4305,8 @@ func mcpCall(_ name: String, _ a: [String: Any]) -> [String: Any] {
     var common: [String] = []
     if on("background") { common.append("--background") }
     if on("allow_global") { common.append("--allow-global") }
+    if on("allow_foreground") { common.append("--allow-foreground") }
+    if on("assert_no_contention") { common.append("--assert-no-contention") }
     if let v = str("expect_front") { common += ["--expect-front", v] }
     for k in ["hold", "via"] { if let v = str(k) { common += ["--\(k)", v] } }
     argv.insert(contentsOf: common, at: argv.firstIndex(of: "--") ?? argv.endIndex)
@@ -3905,7 +4342,7 @@ func mcpServe() -> Never {
             send(["jsonrpc": "2.0", "id": id, "result": [
                 "protocolVersion": pv, "capabilities": ["tools": ["listChanged": false]],
                 "serverInfo": ["name": "xyzlcu", "version": version],
-                "instructions": "macOS GUI control. Call check first; errors name the host app needing TCC access. Prefer pid targeting plus lock and AX routes: observe/ax, set_text, press, select_popup_item, scroll_to, wait_text. Background actions must never type through global HID unless allow_global is explicit; a global route also requires the intended target to be frontmost. Inspect verified and frontmostBefore/frontmostAfter; posted pid events may be ignored. Use screenshot only when needed (half-scale JPEG; max_side caps size). Ask before irreversible actions; stop at captchas."]])
+                "instructions": "macOS GUI control. Call check first; errors name the host app needing TCC access. Prefer pid targeting plus lock and AX routes: observe/ax, set_text, press, select_popup_item, scroll_to, wait_text. Locks are strict by default: one process/window, no activation, global HID or pasteboard fallback. allow_global/allow_foreground are command-local escapes; unsafe relaxes a lock. Use assert_no_contention to fail on observed frontmost/pointer changes; a global route also requires the intended target to be frontmost. Inspect verified and frontmostBefore/frontmostAfter; posted pid events may be ignored. Use screenshot only when needed (half-scale JPEG; max_side caps size). Ask before irreversible actions; stop at captchas."]])
         case "ping": send(["jsonrpc": "2.0", "id": id, "result": [:]])
         case "tools/list": send(["jsonrpc": "2.0", "id": id, "result": ["tools": mcpTools()]])
         case "tools/call":
