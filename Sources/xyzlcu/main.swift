@@ -266,11 +266,13 @@ func findAppOnce(_ name: String, force: Bool = false) -> NSRunningApplication? {
     let candidates = exact.isEmpty ? es.filter { $0.regular && $0.meta.lname.contains(l) } : exact
     if candidates.count <= 1 { return candidates.first?.app }
     let windows = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
-    let owners = Set(windows.filter { ($0[kCGWindowLayer as String] as? Int ?? 0) == 0 }.compactMap { $0[kCGWindowOwnerPID as String] as? Int })
+    let ownerRanks = captureOwnerRanks(windows)
     return candidates.sorted {
-        let a = owners.contains(Int($0.pid)), b = owners.contains(Int($1.pid))
+        let a = ownerRanks[Int($0.pid)] != nil, b = ownerRanks[Int($1.pid)] != nil
         if a != b { return a }
         if $0.regular != $1.regular { return $0.regular }
+        let ar = ownerRanks[Int($0.pid)] ?? Int.max, br = ownerRanks[Int($1.pid)] ?? Int.max
+        if ar != br { return ar < br }
         return $0.order < $1.order
     }.first?.app
 }
@@ -791,7 +793,7 @@ func menuNorm(_ s: String) -> String {
 }
 var lastMenuWasDisabled = false
 func pressMenu(_ appName: String?, _ path: [[String]]) throws -> [String] {
-    let (root, _) = try axRoot(appName)
+    let (root, app) = try axRoot(appName)
     guard let bar = axElement(attr(root, kAXMenuBarAttribute)) else { try fail("这个应用没有菜单栏") }
     var level: [AXUIElement] = children(bar)
     var picked: [String] = []
@@ -808,7 +810,10 @@ func pressMenu(_ appName: String?, _ path: [[String]]) throws -> [String] {
         if i == path.count - 1 {
             // AXEnabled 可能是上次打开菜单时的旧状态（应用不在前台时尤其如此），所以只记录、仍然尝试按下
             if let en = attr(hit, kAXEnabledAttribute) as? Bool, !en { lastMenuWasDisabled = true } else { lastMenuWasDisabled = false }
-            if inputPolicy.strict && lastMenuWasDisabled { try fail("Scoped background menu item is disabled; no action sent", code: 4) }
+            if inputPolicy.strict && lastMenuWasDisabled {
+                let hint = app.isActive ? "" : "; the app is inactive, so NSMenu validation may disable this item only in the background. Use a scoped AX operation (for Select All, AXSelectedTextRange) instead"
+                try fail("Scoped background menu item is disabled; no action sent" + hint, code: 4)
+            }
             let r = AXUIElementPerformAction(hit, kAXPressAction as CFString)
             guard r == .success else { try fail("按下菜单项失败: AXError \(r.rawValue)") }
         } else {
@@ -1836,33 +1841,59 @@ func captureCLI(_ extra: [String], tmp: String) -> CGImage? {
 /// 找应用最前面的普通窗口（可按标题过滤）。appName 是 "#窗口号" 时按 windows 列出的 id 找。
 /// 锁定 / 后台模式下截图结果里额外带的字段（route、窗口坐标说明）
 var screenshotExtra: [String: Any]? = nil
+/// Pure selection seam: automatic targeting never chooses helper/off-screen windows.
+func rankedCaptureWindows(_ windows: [[String: Any]], pid: Int? = nil, title: String? = nil) -> [[String: Any]] {
+    windows.filter { w in
+        let r = cgBounds(w)
+        return (pid == nil || w[kCGWindowOwnerPID as String] as? Int == pid)
+            && (w[kCGWindowLayer as String] as? Int ?? 0) == 0
+            && (w[kCGWindowIsOnscreen as String] as? Bool) == true
+            && (w[kCGWindowAlpha as String] as? Double ?? 1) > 0
+            && r.width >= 40 && r.height >= 40
+            && (title == nil || (w[kCGWindowName as String] as? String ?? "").localizedCaseInsensitiveContains(title!))
+    }.sorted { a, b in
+        let at = !(a[kCGWindowName as String] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let bt = !(b[kCGWindowName as String] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if at != bt { return at }
+        let ar = cgBounds(a), br = cgBounds(b)
+        let aa = ar.width * ar.height, ba = br.width * br.height
+        if aa != ba { return aa > ba }
+        return (a[kCGWindowNumber as String] as? Int ?? 0) < (b[kCGWindowNumber as String] as? Int ?? 0)
+    }
+}
+func captureOwnerRanks(_ windows: [[String: Any]]) -> [Int: Int] {
+    var ranks: [Int: Int] = [:]
+    for (index, w) in rankedCaptureWindows(windows).enumerated() {
+        if let pid = w[kCGWindowOwnerPID as String] as? Int, ranks[pid] == nil { ranks[pid] = index }
+    }
+    return ranks
+}
+func screenshotSelectorConflicts(explicitWindow: Bool, ownerPid: Int?, targetPid: Int?) -> Bool {
+    guard explicitWindow, let pid = targetPid else { return false }
+    return ownerPid != pid
+}
 func appWindow(_ appName: String, title: String?) throws -> (CGWindowID, CGRect, String) {
     let byId: Int? = appName.hasPrefix("#") ? Int(appName.dropFirst()) : nil
-    var pid: Int = -1, label = appName
-    if byId == nil {
+    let selected: [String: Any]?
+    if let id = byId {
+        // Explicit IDs retain support for other Spaces/minimized windows where SCK permits it.
+        selected = cgWindowInfo(CGWindowID(id))
+    } else {
         guard let app = findApp(appName) else { try fail("找不到应用: \(appName)") }
-        pid = Int(app.processIdentifier); label = app.xName ?? appName
+        let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        selected = rankedCaptureWindows(list, pid: Int(app.processIdentifier), title: title).first
     }
-    let list = (CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
-    func bounds(_ w: [String: Any]) -> CGRect {
-        let b = w[kCGWindowBounds as String] as? [String: Any] ?? [:]
-        return CGRect(x: b["X"] as? Double ?? 0, y: b["Y"] as? Double ?? 0, width: b["Width"] as? Double ?? 0, height: b["Height"] as? Double ?? 0)
-    }
-    for w in list {
-        let num = w[kCGWindowNumber as String] as? Int ?? 0
-        if let id = byId { if num != id { continue } }
-        else {
-            guard (w[kCGWindowOwnerPID as String] as? Int) == pid && (w[kCGWindowLayer as String] as? Int ?? 0) == 0 else { continue }
+    if let w = selected {
+        let r = cgBounds(w), t = w[kCGWindowName as String] as? String ?? ""
+        if r.width >= 2 && r.height >= 2 && (title == nil || t.localizedCaseInsensitiveContains(title!)),
+           let num = w[kCGWindowNumber as String] as? Int {
+            return (CGWindowID(num), r, t)
         }
-        if let want = title, !(w[kCGWindowName as String] as? String ?? "").localizedCaseInsensitiveContains(want) { continue }
-        let t = w[kCGWindowName as String] as? String ?? ""
-        let r = bounds(w)
-        if r.width < 2 || r.height < 2 { if byId != nil { break }; continue }
-        return (CGWindowID(num), r, t)
     }
-    if let id = byId { try fail("没有 id 为 \(id) 的窗口（见 xyzlcu windows）") }
-    try fail("\(label) 没有可截图窗口" + (title.map { "（标题含 \($0)）" } ?? ""))
+    if let id = byId { try fail("没有 id 为 \(id) 的匹配窗口（见 xyzlcu windows）") }
+    try fail("\(appName) 没有可截图窗口" + (title.map { "（标题含 \($0)）" } ?? ""))
 }
+
 func screenshot(path: String?, scale: Double?, display: Int, region: CGRect?, window: (String, String?)?, format: ImgFormat, quality: Double, forceCLI: Bool,
                 base64: Bool = false, toStdout: Bool = false, timing: Bool = false, diff: Bool = false, maxSide: Int? = nil) throws {
     // 一次回复只有一段二进制：run / batch 里第二张 --stdout 图会把第一张覆盖掉，明确报错
@@ -2082,9 +2113,10 @@ func axWindowFor(_ axApp: AXUIElement, _ wid: CGWindowID, frame r: CGRect, title
 func pickWindow(_ app: NSRunningApplication, title: String?, id: Int?) throws -> (CGWindowID, CGRect, String) {
     let options: CGWindowListOption = bgCaptureOnly ? [.optionAll, .excludeDesktopElements] : [.optionOnScreenOnly, .excludeDesktopElements]
     let list = (CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]) ?? []
-    for w in list {
+    let candidates = id == nil ? rankedCaptureWindows(list, pid: Int(app.processIdentifier), title: title) : list
+    for w in candidates {
         let num = w[kCGWindowNumber as String] as? Int ?? 0
-        if let id = id { if num != id { continue } }
+        if let id = id, num != id { continue }
         guard (w[kCGWindowOwnerPID as String] as? Int) == Int(app.processIdentifier), (w[kCGWindowLayer as String] as? Int ?? 0) == 0 else { continue }
         let t = w[kCGWindowName as String] as? String ?? ""
         if let want = title, !t.localizedCaseInsensitiveContains(want) { continue }
@@ -2558,6 +2590,29 @@ func runSelftest() throws {
     var probeArgumentRejected = false
     do { try execute(["check", "--probe", "--selftest-invalid-option"]) } catch { probeArgumentRejected = true }
     try check(probeArgumentRejected && !forceProbe, "failed check cannot leak HID probe state")
+    // Synthetic CG metadata only: no window server query, app launch or capture.
+    func fixture(_ id: Int, pid: Int = 42, title: String = "XYZStudio", width: Double = 1320,
+                 height: Double = 860, layer: Int = 0, onscreen: Bool = true, alpha: Double = 1) -> [String: Any] {
+        [kCGWindowNumber as String: id, kCGWindowOwnerPID as String: pid,
+         kCGWindowName as String: title, kCGWindowLayer as String: layer,
+         kCGWindowIsOnscreen as String: onscreen, kCGWindowAlpha as String: alpha,
+         kCGWindowBounds as String: ["X": 0.0, "Y": 0.0, "Width": width, "Height": height]]
+    }
+    let windowFixtures = [fixture(1, pid: 99, width: 1, height: 1), fixture(2, onscreen: false),
+                          fixture(3, alpha: 0), fixture(4, layer: 5), fixture(5, title: "", width: 2000),
+                          fixture(6, width: 300), fixture(2586), fixture(7, pid: 77)]
+    let owners = captureOwnerRanks([fixture(10, pid: 99, width: 100), fixture(2586), fixture(11, pid: 88, width: 1)])
+    try check(owners[42] == 0 && owners[99] == 1 && owners[88] == nil, "screenshot app owner preferred over same-named helper")
+    let ranked = rankedCaptureWindows(windowFixtures, pid: 42)
+    try check(ranked.compactMap { $0[kCGWindowNumber as String] as? Int } == [2586, 6, 5], "screenshot helper filtering and ranking")
+    try check(rankedCaptureWindows(windowFixtures, pid: 99).isEmpty, "screenshot helper process has no usable windows")
+    try check(rankedCaptureWindows(windowFixtures, pid: 42, title: "studio").count == 2, "screenshot title filtering")
+    try check(rankedCaptureWindows([fixture(9), fixture(8)]).first?[kCGWindowNumber as String] as? Int == 8, "screenshot deterministic ranking")
+    try check(!screenshotSelectorConflicts(explicitWindow: false, ownerPid: nil, targetPid: 42), "screenshot pid alone has no selector conflict")
+    try check(!screenshotSelectorConflicts(explicitWindow: true, ownerPid: 42, targetPid: 42), "screenshot matching owner accepted")
+    try check(screenshotSelectorConflicts(explicitWindow: true, ownerPid: 7, targetPid: 42), "screenshot mismatching owner rejected")
+    try check(screenshotSelectorConflicts(explicitWindow: true, ownerPid: nil, targetPid: 42), "screenshot missing explicit owner rejected")
+    try check(!screenshotSelectorConflicts(explicitWindow: true, ownerPid: 42, targetPid: nil), "screenshot window alone has no pid conflict")
     let tools = mcpTools(), names = tools.compactMap { $0["name"] as? String }
     try check(["set_text", "press", "select_popup_item", "scroll_to", "wait_text", "observe"].allSatisfy { names.contains($0) }, "new MCP tools exposed")
     try check(Set(names).count == names.count, "MCP names unique")
@@ -2594,7 +2649,7 @@ func runSelftest() throws {
         try check(props["assert_no_contention"] != nil && props["allow_foreground"] != nil, "MCP contention/foreground policy exposed")
     }
 
-    out(["ok": true, "checks": checks, "version": version, "guiRequired": false])
+    out(["ok": true, "checks": checks, "version": version, "guiRequired": false, "screenshotRegressionChecks": 10])
 }
 
 // MARK: - 主命令
@@ -3059,7 +3114,11 @@ case "screenshot":
     if let explicit = winApp, let app = targetApp {
         guard let a = findApp(app) else { try fail("找不到应用: \(app)", code: 4) }
         let (wid, _, _) = try appWindow(explicit, title: targetTitle)
-        guard let info = cgWindowInfo(wid), (info[kCGWindowOwnerPID as String] as? Int) == Int(a.processIdentifier) else { try fail("screenshot: window selector conflicts with --app/--pid", code: 4) }
+        let owner = cgWindowInfo(wid)?[kCGWindowOwnerPID as String] as? Int
+        if screenshotSelectorConflicts(explicitWindow: true, ownerPid: owner, targetPid: Int(a.processIdentifier)) {
+            try fail("screenshot: window selector conflicts with --app/--pid", code: 4)
+        }
+        winApp2 = "#\(wid)"
     }
     if !bgMode && winApp2 == nil { winApp2 = targetApp }
     if region != nil && (winApp2 != nil || targetApp != nil) { try fail("screenshot: --region cannot be combined with a window/app/pid target", code: 4) }
@@ -3079,9 +3138,6 @@ case "screenshot":
         if let title = targetTitle, !t.title.localizedCaseInsensitiveContains(title) { try fail("screenshot: title selector conflicts with the locked/target window", code: 4) }
         winApp2 = "#\(t.windowId)"
         screenshotExtra = ["route": "sck-window", "background": true, "coords": "window", "app": t.appName, "pid": Int(t.pid), "locked": t.locked]
-    } else if let explicit = winApp2, let pid = commandTargetPid {
-        let (wid, _, _) = try appWindow(explicit, title: targetTitle)
-        guard let info = cgWindowInfo(wid), (info[kCGWindowOwnerPID as String] as? Int) == Int(pid) else { try fail("screenshot: window selector conflicts with --pid", code: 4) }
     }
     let given = try pathOption("--out", "-o") ?? args.first
     if let g = given, g.hasPrefix("-") { try fail("screenshot: 未知选项 \(g)（输出路径用 --out / -o 给出；以 - 开头的文件名写成 ./\(g)）") }

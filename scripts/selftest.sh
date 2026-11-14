@@ -4,7 +4,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export XYZLCU_DAEMON=0
 CORE="$PWD/build/xyzlcu-core"
-"$CORE" selftest
+# Core selftest exercises the production ranking/conflict helpers with synthetic
+# metadata (including XYZStudio helper windows and --pid without a selector).
+"$CORE" selftest | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["ok"] and r["screenshotRegressionChecks"] >= 10; print(json.dumps(r))'
 [[ "$("$CORE" version)" == "xyzlcu 0.7.0" ]]
 [[ "$(build/xyzlcu version)" == "xyzlcu 0.7.0" ]]
 python3 - "$CORE" <<'PY'

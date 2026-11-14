@@ -76,7 +76,7 @@ pid 鼠标投递把窗口点换成事件所需全局位置，填入窗口号并�
 
 ScreenCaptureKit 可以截被覆盖窗口，以及系统仍提供背板内容的部分屏外窗口。最小化或其他 Space 的窗口可能不在列表里、内容旧、空白或无法捕获，取决于 macOS/应用；工具不会为截图取消最小化、切 Space 或激活应用。指定窗口截图支持 macOS 13+（macOS 13 用单帧 SCStream，macOS 14+ 用 SCScreenshotManager/实时窗口流），窗口路线不可用就失败；窗口目标拒绝 `--cli`，不回退整屏。`windowFrame` 单独提供全局窗口范围；`originX/originY` 和 `diff.rects` 为窗口相对坐标。检查 `route`、`method` 及图像。TCC 权限属于**负责启动它的宿主应用**（终端、智能体宿主或守护进程启动者），用 `whoami` / `check` 确认，在那里授予辅助功能和录屏并重启宿主。
 
-在已授权 Mac 手工验收：`./scripts/bg_selftest.sh`。保持另一个应用（如终端）在前台，鼠标静止。脚本用 `open -g` 打开临时 TextEdit 文稿，隔离 socket/锁，直接调用已构建 core，核对 AX 写值、pid Unicode 输入、AX 编辑 > 全选、单窗口截图、文稿内容和前台/鼠标不变。它不发送全局输入，输出 PASS/FAIL 表并保留产物；后台编辑菜单被禁用就如实 FAIL。编译与无权限自测通过不代表真实应用已验收。
+在已授权 Mac 手工验收：`./scripts/bg_selftest.sh`。保持另一个应用（如终端）在前台，鼠标静止。脚本用 `open -g` 打开临时 TextEdit 文稿，隔离 socket/锁，直接调用已构建 core，核对 AX 写值、pid Unicode 输入、AXSelectedTextRange 全选及 AXSelectedText 读回、单窗口截图、文稿内容和前台/鼠标不变。它以唯一文件名轮询约 10 秒定位文稿，结束时仅通过该窗口的 AX 关闭按钮清理，不退出 TextEdit。它不发送全局输入，输出 PASS/FAIL/SKIP 表并保留产物；后台编辑菜单被禁用属于预期限制，记为 SKIP，全选由独立 AX 操作验证。编译与无权限自测通过不代表真实应用已验收。
 
 ## 为什么选 XYZLCU（核心优势）
 
