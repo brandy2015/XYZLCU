@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p build
 SRC=Sources/xyzlcu/main.swift
-FW=(-wmo -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit -framework CoreMedia -framework VideoToolbox -lz)
+FW=(-module-cache-path "$PWD/build/module-cache" -wmo -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit -framework CoreMedia -framework VideoToolbox -lz)
 swiftc -O -target arm64-apple-macos13 "$SRC" "${FW[@]}" -o build/xyzlcu-core-arm64
 if swiftc -O -target x86_64-apple-macos13 "$SRC" "${FW[@]}" -o build/xyzlcu-core-x86_64 2>/dev/null; then
   lipo -create build/xyzlcu-core-arm64 build/xyzlcu-core-x86_64 -output build/xyzlcu-core

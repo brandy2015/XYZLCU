@@ -16,10 +16,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.6.1"
+#define VERSION "0.7.0"
 // 和 main.swift 里的 forwardedEnv 保持一致
 static const char *FORWARDED_ENV[] = {"XYZLCU_EVENTS_HEALTH", "XYZLCU_TAP_THRESHOLD_MS", "XYZLCU_TYPE_VIA", "XYZLCU_KEY_VIA",
-                                      "XYZLCU_PROBE", "XYZLCU_PNG", "XYZLCU_PNG_LEVEL", "XYZLCU_BACKGROUND", NULL};
+                                      "XYZLCU_PROBE", "XYZLCU_PNG", "XYZLCU_PNG_LEVEL", "XYZLCU_BACKGROUND", "XYZLCU_CLICK_HOLD", NULL};
 
 static char **g_argv;
 
@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
     if (argc < 2 || (d && strcmp(d, "0") == 0)) exec_core();
     const char *cmd = argv[1];
     // 帮助、长时间运行的录制 / 回放、守护进程本身和 MCP 服务器总是由主程序执行
-    static const char *local[] = {"help", "-h", "--help", "record", "replay", "serve", "mcp", NULL};
+    static const char *local[] = {"help", "-h", "--help", "record", "replay", "serve", "mcp", "selftest", NULL};
     for (int i = 0; local[i]; i++) if (strcmp(cmd, local[i]) == 0) exec_core();
 
     char path[PATH_MAX];
