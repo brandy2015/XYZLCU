@@ -16,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.8.0"
+#define VERSION "0.8.1"
 // 和 main.swift 里的 forwardedEnv 保持一致
 static const char *FORWARDED_ENV[] = {"XYZLCU_EVENTS_HEALTH", "XYZLCU_TAP_THRESHOLD_MS", "XYZLCU_TYPE_VIA", "XYZLCU_KEY_VIA",
                                       "XYZLCU_PROBE", "XYZLCU_PNG", "XYZLCU_PNG_LEVEL", "XYZLCU_BACKGROUND", "XYZLCU_CLICK_HOLD", NULL};
@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     // Proof/session descriptors are process local. Protocol 2 cannot transfer
     // or authenticate them. Never forward them, retry, or consult an override.
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--consumer") == 0 || strcmp(argv[i], "--request-fd") == 0 ||
+        if (strcmp(argv[i], "--assurance") == 0 || strcmp(argv[i], "--consumer") == 0 || strcmp(argv[i], "--request-fd") == 0 ||
             strcmp(argv[i], "--proof-protocol") == 0 || strcmp(argv[i], "--hmac-key-fd") == 0) {
             unsetenv("XYZLCU_CORE"); exec_core();
         }

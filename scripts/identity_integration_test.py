@@ -85,7 +85,7 @@ def fixture_command(operation):
 
 
 def daemon_request(argv):
-    payload = {"v": "0.8.0", "proto": 1, "argv": argv, "cwd": str(ROOT), "env": {}}
+    payload = {"v": "0.8.1", "proto": 1, "argv": argv, "cwd": str(ROOT), "env": {}}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(20)
         connection.connect(ENV["XYZLCU_SOCKET"])

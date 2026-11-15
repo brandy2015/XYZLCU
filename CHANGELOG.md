@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.1 — 2026-11-15
+
+- Add an explicit owner-selected `screenshot --assurance practical --request-fd N --output-dir DIR --json` route on macOS 14.2+. Strict remains the default with unchanged v0.8.0 refusals; AX, input/actions, open-app, daemon/batch/MCP capture and consumer admission remain unavailable.
+- Compare the complete caller lock binding before and after fresh exact-window SCK capture, including PID/start time, signing/cdhash/executable hash, bundle ID, window ID/owner/layer/frame/on-screen state. Retain protected-app denial and fail closed without publishing pixels on mismatch.
+- Publish schema-versioned practical proof with nonce, pre/post observations, timing, encoded-byte SHA-256, normalized raw-pixel SHA-256 and a private output path. Require an existing real 0700 directory with no extended ACL, no-follow path traversal, and an exclusive 0600 ACL-free output file.
+- Document the residual millisecond-scale same-process window-reuse risk, embedded sensitive-content/family attribution gaps, lack of authenticated/replay-protected consumer authority and caller-owned lock/consent/nonce lifecycle in [the practical contract](docs/IDENTITY_PROOF_PRACTICAL.md).
+- Add deterministic mismatch/policy/hash/strict-separation tests and extend the owned background fixture for practical capture with explicit TCC SKIP behavior. Install versioned 0.8.1 and historical 0.7.1 pairs side by side while preserving unversioned 0.8.0 binaries; no Actions/CI.
+
 ## 0.8.0 — 2026-11-15
 
 - Add strict identity protocol/schema, duplicate-key rejecting bounded JSON parser, canonical hashing, injectable guarded coordinator, single-use request nonce ledger, and atomic host pending-response consumption. Real Swift tests cover process/signature/window/AX replacement, policy, publication, nonce and schema failures with zero-dispatch assertions.

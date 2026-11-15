@@ -41,7 +41,7 @@ private func identityNow() -> UInt64 {
     let (result, overflow2) = whole.addingReportingOverflow(remainder * UInt64(timebase.numer) / UInt64(timebase.denom))
     return overflow || overflow2 ? 0 : result
 }
-private func identityInstant() -> [String: Any] { ["continuous_ns": String(identityNow()), "wall_utc": ISO8601DateFormatter().string(from: Date())] }
+func identityInstant() -> [String: Any] { ["continuous_ns": String(identityNow()), "wall_utc": ISO8601DateFormatter().string(from: Date())] }
 
 struct NativeProcessIdentity {
     static func start(_ pid: pid_t) throws -> (UInt64, UInt64, UInt32) {
@@ -145,7 +145,7 @@ struct NativeProcessIdentity {
     }
 }
 
-private func identityExecutor() throws -> [String: Any] {
+func identityExecutor() throws -> [String: Any] {
     let pid = getpid(), start = try NativeProcessIdentity.start(pid), path = try NativeProcessIdentity.executable(pid)
     let (seconds, overflow) = start.0.multipliedReportingOverflow(by: 1_000_000)
     let (combined, overflow2) = seconds.addingReportingOverflow(start.1)
@@ -153,7 +153,7 @@ private func identityExecutor() throws -> [String: Any] {
     return ["pid": Int(pid), "start_time": String(combined), "boot_id": try identityBoot(),
             "build_sha256": try NativeProcessIdentity.file(path)["sha256"]!, "execution_mode": daemonMode ? "daemon" : "direct", "client_build_sha256": NSNull()]
 }
-private func identityEmit(_ object: Any) throws {
+func identityEmit(_ object: Any) throws {
     let data = try identityJSON(object)
     guard data.count <= 8 * 1024 * 1024, let string = String(data: data, encoding: .utf8) else { throw IdentityFailure(code: "RESPONSE_TOO_LARGE") }
     inputResultEmitted = true
@@ -166,7 +166,7 @@ private func identityFail(_ code: String, nonce: String? = nil, phase: String = 
     throw XErr(msg: code, code: Int32(response["exit_code"]!.number!), policyCode: code)
 }
 
-private func identityReadRequest(_ raw: String) throws -> JSONValue {
+func identityReadRequest(_ raw: String) throws -> JSONValue {
     guard let fd = Int32(raw), fd >= 3 else { throw IdentityFailure(code: "INVALID_REQUEST") }
     guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else { throw IdentityFailure(code: "INVALID_REQUEST") }
     defer { Darwin.close(fd) }
@@ -184,7 +184,7 @@ private func identityReadRequest(_ raw: String) throws -> JSONValue {
     }
     return try JSONValue.parse(output)
 }
-private func identityArgumentOptions(_ argv: [String], values: Set<String>, flags: Set<String>) throws -> [String: String] {
+func identityArgumentOptions(_ argv: [String], values: Set<String>, flags: Set<String>) throws -> [String: String] {
     var result: [String: String] = [:], index = 1
     while index < argv.count {
         let arg = argv[index]
@@ -208,6 +208,7 @@ private func identitySameProcess(_ expected: JSONValue, _ observed: JSONValue) t
 /// Hook before legacy command parsing; handles all structured/identity paths.
 func handleIdentityCLI(_ argv: [String]) throws -> Bool {
     guard let command = argv.first else { return false }
+    if argv.contains("--assurance") { return try handlePracticalCLI(argv) }
     let structured = argv.contains("--consumer") || argv.contains("--proof-protocol") || argv.contains("--request-fd") || argv.contains("--hmac-key-fd")
     let handles = ["capabilities", "identity-observe", "identity-check", "open-app", "bind-window"].contains(command)
         || (command == "windows" && (argv.contains("--thumbnails") || argv.contains("--show-all"))) || structured
@@ -220,6 +221,8 @@ func handleIdentityCLI(_ argv: [String]) throws -> Bool {
             try identityEmit(["schema_version": 1, "version": version, "executor": try identityExecutor(),
                               "proof_protocols": [1], "consumer_transports": [String](), "consumer_available": false,
                               "diagnostic_operations": ["identity-observe", "identity-check"],
+                              "default_assurance": "strict",
+                              "practical_window_capture": ["explicit_only": true, "available": practicalCaptureSupported() && CGPreflightScreenCaptureAccess(), "minimum_macos": "14.2", "command": "screenshot --assurance practical --request-fd N --output-dir DIR --json", "consumer_admission": false],
                               "tcc": ["accessibility": AXIsProcessTrusted(), "screen_recording": CGPreflightScreenCaptureAccess()],
                               "routes": ["sck-window-screenshot": ["available": false, "reason": "SURFACE_CLASSIFICATION_UNPROVABLE"],
                                          "ax-read": ["available": false, "reason": "AX_INSTANCE_UNPROVABLE"],
@@ -366,6 +369,13 @@ struct GuardedSCKWindowCapture {
     }
     func capture(maximumPixelEdge: Int) throws -> CGImage {
         guard reviewedContinuity else { throw IdentityFailure(code: "IDENTITY_UNPROVABLE") }
+        return try captureImage(maximumPixelEdge: maximumPixelEdge)
+    }
+    // Explicit practical adapter only: this does not establish reviewed continuity.
+    func capturePractical(maximumPixelEdge: Int) throws -> CGImage {
+        return try captureImage(maximumPixelEdge: maximumPixelEdge)
+    }
+    private func captureImage(maximumPixelEdge: Int) throws -> CGImage {
         guard CGPreflightScreenCaptureAccess() else { throw IdentityFailure(code: "TCC_SCREEN_RECORDING_REQUIRED") }
         guard maximumPixelEdge > 0, maximumPixelEdge <= 8192, window.frame.width > 0, window.frame.height > 0 else { throw IdentityFailure(code: "INVALID_REQUEST") }
         // macOS 13/14.0 cannot explicitly exclude composed child windows. No

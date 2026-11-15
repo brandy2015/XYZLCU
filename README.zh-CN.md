@@ -1,13 +1,14 @@
-# XYZLCU 0.8.0
+# XYZLCU 0.8.1
 
-[English](README.md) · [更新记录](CHANGELOG.md) · [验证报告](docs/IDENTITY_PROOF_VERIFICATION.md)
+[English](README.md) · [更新记录](CHANGELOG.md) · [Practical 契约](docs/IDENTITY_PROOF_PRACTICAL.md) · [Strict 验证报告](docs/IDENTITY_PROOF_VERIFICATION.md)
 
 本地 macOS CLI，提供执行时身份观察、结构化协议和保守的目标检查。要求 macOS 13+，支持 Apple Silicon / Intel，无需云服务或 CI。
 
-**0.8.0 主动关闭旧输入和截图路径。** CG/AX 公共元数据无法证明窗口、控件在检查期间从未被替换，也无法证明当前组合表面始终安全。要求这些保证的请求在读取内容或执行动作前拒绝。全局/前台覆盖、PID 投递、旧锁、MCP 通用入口均不能解除限制。XYZStudio 的电脑操作继续不可用。
+**Strict 仍为默认，保留 0.8.0 的输入和截图拒绝。** CG/AX 公共元数据无法证明窗口、控件在检查期间从未被替换，也无法证明当前组合表面始终安全。要求这些保证的请求在读取内容或执行动作前拒绝。全局/前台覆盖、PID 投递、旧锁、MCP 通用入口均不能解除限制。XYZStudio 的电脑操作继续不可用。0.8.1 仅增加用户明确选择的 practical 单窗口截图，残余风险见下文。
 
 | 已交付入口 | 行为 |
 | --- | --- |
+| `screenshot --assurance practical --request-fd N --output-dir DIR --json` | macOS 14.2+ 明确选择的 practical 单窗口截图；输出私有文件和身份观察 proof |
 | `capabilities --json` | 实际执行器身份、被动 TCC 状态、能力和限制 |
 | `identity-observe --pid N --nonce TOKEN --json` | 前后重新读取内核启动时间、可执行文件、静态/动态签名；仅诊断元数据 |
 | `identity-check --request-fd N --json` | 执行时验证完整预期进程对象，回显规范 nonce；任何不匹配均拒绝 |
@@ -16,7 +17,17 @@
 | 结构化内容 proof | 严格 schema、可注入执行协调器和真实单元测试；生产 consumer 会话接入未启用 |
 | `apps/windows/displays/cursor/check/whoami` | 被动元数据/诊断；普通 `windows` 保持数组输出 |
 
-原生 SCK 服务使用同一个已验证 `SCWindow`，交叉检查 CG/SC 所有者和几何，一次性截图，不回退到桌面或 CLI。原生 AppKit 启动器固定无参数、URL、文档，不激活、不替换、不请求提示。二者都没有可用的生产接入 adapter。窗口/控件/表面连续性、认证 consumer 传输、系统启动信任及精确启动明确延期，不能从相同描述符推断成功。新截图服务在 macOS 13/14.0 无法建立子表面排除时提前拒绝，不宣称已验证这些系统上的截图功能。
+原生 SCK 服务使用同一个已验证 `SCWindow`，交叉检查 CG/SC 所有者和几何，一次性截图，不回退到桌面或 CLI。原生 AppKit 启动器固定无参数、URL、文档，不激活、不替换、不请求提示。仅 SCK 增加明确选择的 practical 截图 adapter；strict/consumer 与 AppKit 启动仍未接入。窗口/控件/表面连续性、认证 consumer 传输、系统启动信任及精确启动明确延期，不能从相同描述符推断成功。Practical 截图在 macOS 13/14.0/14.1 无法建立子表面排除时提前拒绝，不宣称已验证这些系统上的截图功能。
+
+## 用户选择 practical 截图
+
+```text
+xyzlcu-0.8.1 screenshot --assurance practical --request-fd N --output-dir DIR --json
+```
+
+四个选项均必需。继承私有 FD 输入封闭请求 `{schema_version:1,nonce,expected:{process,window},format,max_pixel_edge}`，完整 expected 必须来自用户可信锁。截图前后核对进程、启动时间、签名/cdhash、文件 SHA-256、bundle ID 和窗口 ID/owner/layer/frame/on-screen；继续执行受保护应用 denylist，任何不匹配均不发布图片。只用新鲜 SCK 精确窗口，在已有真实 0700、无扩展 ACL 目录生成随机 0600、无 ACL 文件。Stdout JSON 返回 proof、nonce、前后观察、时间、编码文件/原始像素 hash 和 `result.path`，不输出图片/base64。
+
+毫秒级间隔内，同进程窗口 ID 被复用且检查端点完全一致仍可能漏检；无法分类允许应用内部显示的秘密。该模式没有认证 consumer 会话或防重放，调用方负责用户选择、锁和 nonce 生命周期，模型不能自行降级选择。AX、输入/动作、激活及 open-app 全部仍拒绝。完整[CLI/JSON、错误码和 FD 示例](docs/IDENTITY_PROOF_PRACTICAL.md)见契约；capabilities 单列此明确选择的能力，strict 默认和 XYZStudio 禁用状态保持。
 
 ## 构建、测试、安装
 
@@ -25,13 +36,13 @@
 ./scripts/unit_test.sh
 ./scripts/selftest.sh
 ./scripts/identity_integration_test.sh
-./build.sh --install
-xyzlcu --version  # xyzlcu 0.8.0
+./scripts/practical_integration_test.sh  # only its own background fixture
+~/.local/bin/xyzlcu-0.8.1 --version  # xyzlcu 0.8.1
 ```
 
 单元测试为真实 Swift XCTest target，使用可注入 provider。集成测试只构建并后台启动自己的双窗口 fixture，不激活其他 app，不发送全局事件，不使用全局覆盖，不申请 TCC；缺少录屏/辅助功能权限时明确 SKIP。`scripts/bg_selftest.sh` 已转向此 fixture，旧 TextEdit 流程退役。历史 benchmark 不代表本版本验收。
 
-构建通常输出 arm64+x86_64 universal；Intel 编译失败会明确报告。两个二进制使用本地 ad-hoc 签名并验证，原子安装至 `~/.local/bin`。这不是 Developer ID 分发信任或公证。发布 ZIP 含两个二进制及 SHA-256 清单。
+构建通常输出 arm64+x86_64 universal；Intel 编译失败会明确报告。两个二进制使用本地 ad-hoc 签名并验证。本次并排安装至 `~/.local/lib/xyzlcu/{0.8.1,0.7.1}/`，`~/.local/bin/xyzlcu-0.8.1` 和 `xyzlcu-0.7.1` wrapper 设置 `XYZLCU_DAEMON=0`、`XYZLCU_AUTO_RESTART=0`，以绝对版本路径启动 client 并查找同目录 core；未版本化的 `~/.local/bin/{xyzlcu,xyzlcu-core}` 保持 0.8.0。保留默认安装时不要执行 `build.sh --install`。这不是 Developer ID 分发信任或公证。发布 ZIP 含两个二进制及 SHA-256 清单。
 
 TCC 归属取决于实际执行路径及负责宿主。替换 ad-hoc 二进制后旧授权可能失效；旧 XYZStudio 授权不能证明新 core/daemon 有权限。本版本仅被动检查，不弹权限请求、不点击对话框。安装后应重启驻留执行器；现有 MCP 宿主需重连才能加载新文件。
 
@@ -47,7 +58,7 @@ Consumer 模式在认证会话接入缺失时，读取敏感请求/key FD 前拒
 
 内置种子覆盖密码管理器、Passwords/钥匙串、系统设置、终端、微信及支付客户端。缺少经审查 signer pin 的已知种子按可疑身份拒绝，重命名 app 不改变其 bundle 身份。基础策略报告 unknown；XYZStudio 对未知表面继续拒绝。辅助进程归属、宿主扩展、浏览器内敏感页面仍需可信 provider，不能靠平面 denylist 推断安全。
 
-固定读取用户账户 home 下 `Library/Application Support/XYZLCU/protected-apps.v1.json`，无模型/CLI 路径或环境覆盖。使用目录 FD、no-follow 打开；XYZLCU 目录须用户拥有且 0700，文件须普通单链接、用户拥有、0600、最大 256 KiB。Owner 同时维护 `protected-apps.state.v1.json`，精确字段为 `{"schema_version":1,"revision":"N","overlay_sha256":"<overlay 原始字节 SHA-256>"}`。缺失/不匹配 continuity、回退、同 revision 改内容、已接受 overlay 消失均拒绝。两者都不存在时仅用内置诊断策略，不能初始化 consumer 会话。本版本无策略写入命令。
+固定读取用户账户 home 下 `Library/Application Support/XYZLCU/protected-apps.v1.json`，无模型/CLI 路径或环境覆盖。使用目录 FD、no-follow 打开；XYZLCU 目录须用户拥有且 0700，文件须普通单链接、用户拥有、0600、最大 256 KiB。Owner 同时维护 `protected-apps.state.v1.json`，精确字段为 `{"schema_version":1,"revision":"N","overlay_sha256":"<overlay 原始字节 SHA-256>"}`。缺失/不匹配 continuity、回退、同 revision 改内容、已接受 overlay 消失均拒绝。两者都不存在时使用内置策略进行元数据/practical 检查，不能初始化 consumer 会话。本版本无策略写入命令。
 
 Overlay 使用设计 §7.2 的封闭 schema，支持精确 ID 或末尾 `.*`、publisher requirement、signing IDs，不执行脚本/正则。移除内置项要求 `allow_builtin_removals:true` 及精确列表；本实现 rule ID 等于 bundle-ID 种子。XYZStudio 必须另行保持不可移除类别和可信 owner 高水位。0600 文件不能隔离恶意同 UID 进程。
 
@@ -55,6 +66,6 @@ Overlay 使用设计 §7.2 的封闭 schema，支持精确 ID 或末尾 `.*`、p
 
 旧截图、AX 读写、键鼠/PID 事件、激活/open、创建 lock、菜单、回放及权限请求统一在动作前返回 `IDENTITY_UNPROVABLE`，覆盖别名和批处理/MCP 每个成员。禁用桌面预热和旧截图流获取。元数据和 daemon 生命周期仍可用。
 
-旧说明与 benchmark 可在 [0.7.1 快照](https://github.com/brandy2015/XYZLCU/tree/cdcae1879cfda9c7a46aed161ee0412ba210d500)查阅，不适用于本版本。
+旧说明与 benchmark 可在 [0.7.1 快照](https://github.com/brandy2015/XYZLCU/tree/cdcae1879cfda9c7a46aed161ee0412ba210d500)查阅，不适用于本版本；0.7.1 不得作为 strict/practical 拒绝后的自动回退。
 
 受 [LCU](https://github.com/amontlabs/lcu) 启发，独立实现；见 [LICENSE](LICENSE)。

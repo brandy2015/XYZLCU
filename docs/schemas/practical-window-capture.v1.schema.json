@@ -1,0 +1,534 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:xyzlcu:practical-window-capture:1",
+  "$ref": "#/$defs/Request",
+  "$defs": {
+    "Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "Counter": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "Frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "width": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "height": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "FileIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device",
+        "inode",
+        "sha256"
+      ],
+      "properties": {
+        "device": {
+          "$ref": "#/$defs/Counter"
+        },
+        "inode": {
+          "$ref": "#/$defs/Counter"
+        },
+        "sha256": {
+          "$ref": "#/$defs/Digest"
+        }
+      }
+    },
+    "Signing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "valid",
+        "team_id",
+        "signing_identifier",
+        "cdhash",
+        "cdhash_algorithm",
+        "architecture",
+        "designated_requirement",
+        "requirement_sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "developer_id",
+            "app_store",
+            "apple_platform",
+            "adhoc_fixture",
+            "adhoc_diagnostic"
+          ]
+        },
+        "valid": {
+          "const": true
+        },
+        "team_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "signing_identifier": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "cdhash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        },
+        "cdhash_algorithm": {
+          "enum": [
+            "sha1",
+            "sha256",
+            "sha256_truncated"
+          ]
+        },
+        "architecture": {
+          "enum": [
+            "arm64",
+            "arm64e",
+            "x86_64"
+          ]
+        },
+        "designated_requirement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "requirement_sha256": {
+          "$ref": "#/$defs/Digest"
+        }
+      }
+    },
+    "App": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bundle_id",
+        "bundle_path",
+        "executable_path",
+        "executable_file",
+        "signing"
+      ],
+      "properties": {
+        "bundle_id": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255
+        },
+        "bundle_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "executable_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "executable_file": {
+          "$ref": "#/$defs/FileIdentity"
+        },
+        "signing": {
+          "$ref": "#/$defs/Signing"
+        }
+      }
+    },
+    "Process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "boot_id",
+        "pid",
+        "uid",
+        "start_time",
+        "app"
+      ],
+      "properties": {
+        "boot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start_time": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seconds",
+            "microseconds"
+          ],
+          "properties": {
+            "seconds": {
+              "$ref": "#/$defs/Counter"
+            },
+            "microseconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 999999
+            }
+          }
+        },
+        "app": {
+          "$ref": "#/$defs/App"
+        }
+      }
+    },
+    "Instant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "continuous_ns",
+        "wall_utc"
+      ],
+      "properties": {
+        "continuous_ns": {
+          "$ref": "#/$defs/Counter"
+        },
+        "wall_utc": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "Executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "start_time",
+        "boot_id",
+        "build_sha256",
+        "execution_mode",
+        "client_build_sha256"
+      ],
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_time": {
+          "$ref": "#/$defs/Counter"
+        },
+        "boot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "build_sha256": {
+          "$ref": "#/$defs/Digest"
+        },
+        "execution_mode": {
+          "enum": [
+            "daemon",
+            "direct",
+            "mcp_core",
+            "worker"
+          ]
+        },
+        "client_build_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "PracticalWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "window_id",
+        "owner_pid",
+        "layer",
+        "frame",
+        "on_screen"
+      ],
+      "properties": {
+        "window_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "owner_pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "layer": {
+          "const": 0
+        },
+        "frame": {
+          "$ref": "#/$defs/Frame"
+        },
+        "on_screen": {
+          "const": true
+        }
+      }
+    },
+    "PracticalBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "process",
+        "window"
+      ],
+      "properties": {
+        "process": {
+          "$ref": "#/$defs/Process"
+        },
+        "window": {
+          "$ref": "#/$defs/PracticalWindow"
+        }
+      }
+    },
+    "Request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "nonce",
+        "expected",
+        "format",
+        "max_pixel_edge"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "nonce": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "expected": {
+          "$ref": "#/$defs/PracticalBinding"
+        },
+        "format": {
+          "enum": [
+            "png",
+            "jpeg"
+          ]
+        },
+        "max_pixel_edge": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        }
+      }
+    },
+    "Image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "media_type",
+        "sha256",
+        "raw_pixel_sha256",
+        "raw_pixel_format",
+        "pixel_width",
+        "pixel_height",
+        "byte_length",
+        "path"
+      ],
+      "properties": {
+        "format": {
+          "enum": [
+            "png",
+            "jpeg"
+          ]
+        },
+        "media_type": {
+          "enum": [
+            "image/png",
+            "image/jpeg"
+          ]
+        },
+        "sha256": {
+          "$ref": "#/$defs/Digest"
+        },
+        "raw_pixel_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "raw_pixel_format": {
+          "enum": [
+            "rgba8-srgb-top-left-tight-v1",
+            null
+          ]
+        },
+        "pixel_width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "pixel_height": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 67108864
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "Proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "operation",
+        "assurance",
+        "nonce",
+        "observed_pre",
+        "observed_post",
+        "timing",
+        "image",
+        "limitations",
+        "executor",
+        "policy_sha256"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "kind": {
+          "const": "window-capture"
+        },
+        "operation": {
+          "const": "screenshot"
+        },
+        "assurance": {
+          "const": "practical"
+        },
+        "nonce": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "observed_pre": {
+          "$ref": "#/$defs/PracticalBinding"
+        },
+        "observed_post": {
+          "$ref": "#/$defs/PracticalBinding"
+        },
+        "timing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "precheck_start",
+            "capture_start",
+            "capture_end",
+            "postcheck_end"
+          ],
+          "properties": {
+            "precheck_start": {
+              "$ref": "#/$defs/Instant"
+            },
+            "capture_start": {
+              "$ref": "#/$defs/Instant"
+            },
+            "capture_end": {
+              "$ref": "#/$defs/Instant"
+            },
+            "postcheck_end": {
+              "$ref": "#/$defs/Instant"
+            }
+          }
+        },
+        "image": {
+          "$ref": "#/$defs/Image"
+        },
+        "limitations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "executor": {
+          "$ref": "#/$defs/Executor"
+        },
+        "policy_sha256": {
+          "$ref": "#/$defs/Digest"
+        }
+      }
+    },
+    "Success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "proof",
+        "result"
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        },
+        "proof": {
+          "$ref": "#/$defs/Proof"
+        },
+        "result": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    }
+  }
+}

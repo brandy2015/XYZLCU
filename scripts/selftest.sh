@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix='xyzlcu-safe-regression-') as work:
         count += 1
     for binary in (core, str(Path(core).with_name('xyzlcu'))):
         result = subprocess.run([binary, '--version'], capture_output=True, text=True, env=env, timeout=20)
-        checked(result.returncode == 0 and result.stdout.strip() == 'xyzlcu 0.8.0', (binary, result))
+        checked(result.returncode == 0 and result.stdout.strip() == 'xyzlcu 0.8.1', (binary, result))
     result = invoke(['selftest'])
     data = json.loads(result.stdout)
     checked(result.returncode == 0 and data['ok'] and data['screenshotRegressionChecks'] >= 10, data)
@@ -143,7 +143,7 @@ with tempfile.TemporaryDirectory(prefix='xyzlcu-safe-regression-') as work:
     result = invoke(['mcp'], ''.join(json.dumps(call) + '\n' for call in calls))
     checked(result.returncode == 0, result)
     replies = {reply['id']: reply['result'] for reply in map(json.loads, result.stdout.splitlines())}
-    checked(replies[1]['serverInfo']['version'] == '0.8.0', replies[1])
+    checked(replies[1]['serverInfo']['version'] == '0.8.1', replies[1])
     checked({'xyzlcu', 'batch', 'set_text', 'press'} <= {tool['name'] for tool in replies[2]['tools']}, replies[2])
     for ident in range(10, 10 + len(tool_cases)):
         reply = replies[ident]

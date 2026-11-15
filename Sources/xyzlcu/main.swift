@@ -2908,14 +2908,17 @@ Consumer admission, window/element/surface continuity and exact no-prompt launch
 are unavailable. open-app refuses APP_TRUST_UNPROVABLE; catalog entries are
 nonselectable with null thumbnails. Generic capture and AX/input/action routes,
 legacy PID events, activation, permission requests and lock creation fail closed.
-No override enables them. No display prewarm or global input is admitted.
+Only explicit screenshot --assurance practical --request-fd N --output-dir DIR
+--json enables observed window capture (macOS 14.2+); strict remains default.
+Practical cannot prove window incarnation or classify embedded secrets.
+No display prewarm or global input is admitted.
 
 Policy: ~/Library/Application Support/XYZLCU/protected-apps.v1.json, user-only,
 with owner continuity state; no policy path or executable environment override.
 XYZStudio must keep computer tools disabled. See README and
  docs/IDENTITY_PROOF_VERIFICATION.md for built versus deferred behavior.
 """
-let version = "0.8.0"
+let version = "0.8.1"
 var inBatch = false
 let startedAt = Date()
 
@@ -4534,7 +4537,7 @@ func mcpServe() -> Never {
 let top = Array(CommandLine.arguments.dropFirst())
 let errOut: (String) -> Void = { FileHandle.standardError.write(($0 + "\n").data(using: .utf8)!) }
 // Structured flags cannot enter a lifecycle/MCP path before profile enforcement.
-if top.contains(where: { ["--consumer", "--request-fd", "--proof-protocol", "--hmac-key-fd"].contains($0) }) {
+if top.contains(where: { ["--assurance", "--consumer", "--request-fd", "--proof-protocol", "--hmac-key-fd"].contains($0) }) {
     exit(runMain(top, stdinText: { "" }, err: errOut))
 }
 if top.first == "serve" {
@@ -4553,7 +4556,7 @@ let daemonEnv = ProcessInfo.processInfo.environment["XYZLCU_DAEMON"]
 // record / replay 运行时间长，总在当前进程里执行，不占用守护进程
 let localMetadataCommands: Set<String> = ["apps", "windows", "displays", "cursor", "whoami", "__status", "sleep", "version", "--version", "-v"]
 if daemonEnv != "0", let verb = top.first, localMetadataCommands.contains(verb),
-   !top.contains(where: { ["--consumer", "--request-fd", "--proof-protocol", "--hmac-key-fd", "--thumbnails", "--show-all"].contains($0) }) {
+   !top.contains(where: { ["--assurance", "--consumer", "--request-fd", "--proof-protocol", "--hmac-key-fd", "--thumbnails", "--show-all"].contains($0) }) {
     if let code = forward(top) { exit(code) }
     if daemonEnv == "1" { errOut("error: 守护进程没有运行（先执行 xyzlcu serve --background）"); exit(5) }
 }
