@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:xyzlcu:protected-policy:1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "revision",
+    "additions",
+    "allow_builtin_removals",
+    "removed_builtin_rule_ids"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "revision": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,19}$"
+    },
+    "additions": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "$ref": "#/$defs/Rule"
+      }
+    },
+    "allow_builtin_removals": {
+      "type": "boolean"
+    },
+    "removed_builtin_rule_ids": {
+      "type": "array",
+      "maxItems": 256,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "allow_builtin_removals": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "removed_builtin_rule_ids": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "category",
+        "bundle_id_pattern",
+        "team_id",
+        "designated_requirement",
+        "signing_identifiers"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "category": {
+          "enum": [
+            "password_manager",
+            "apple_secrets",
+            "system_security",
+            "terminal",
+            "banking_payment",
+            "owner_addition"
+          ]
+        },
+        "bundle_id_pattern": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255
+        },
+        "team_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "designated_requirement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "signing_identifiers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      }
+    }
+  }
+}

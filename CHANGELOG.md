@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0 — 2026-11-15
+
+- Add strict identity protocol/schema, duplicate-key rejecting bounded JSON parser, canonical hashing, injectable guarded coordinator, single-use request nonce ledger, and atomic host pending-response consumption. Real Swift tests cover process/signature/window/AX replacement, policy, publication, nonce and schema failures with zero-dispatch assertions.
+- Add native execution-time process observation and complete expected-process revalidation, including kernel seconds/microseconds, boot, executable file/digest, runtime/static signing and nonce echo. Diagnostic process observations remain separate from content Success proofs.
+- Add fixed-path user-only protected policy loading with descriptor-relative no-follow opens, owner/mode/link/size checks and explicit overlay continuity. Built-in protected seeds remain denied when publisher pins are unverified.
+- Add bounded owner window catalog with redacted protected entries and explicit thumbnail unavailability. Implement one-shot exact-window SCK and no-argument background NSWorkspace dispatch services behind unavailable reviewed-provider gates.
+- Intentionally refuse legacy input, AX content, capture, activation, unsafe/PID/global routes and aliases across CLI, daemon, batches and MCP. Disable legacy display prewarm; no global flag bypass exists. Proof descriptors are never relayed to protocol 2 or an overridden core.
+- Generic window/element/surface continuity, authenticated consumer bootstrap/transport, launch trust/exact launch and positive thumbnail/content/launch acceptance remain deferred. XYZStudio operations stay disabled; this release is not consumer acceptance.
+- Add only-owned-background-fixture integration with named TCC/provider SKIPs, replace the old TextEdit recipe, verify local ad-hoc signatures, and release built binaries without Actions/CI.
+
 ## 0.7.1 — 2026-11-14
 
 - Add an unlocked global input safety gate across CLI, daemon and MCP: HID/session keyboard events, HID mouse click/move/drag/scroll, and activation (including implicit/open-to-front) require explicit `--allow-global` or an intended `--app` / `--pid` already frontmost. Recheck immediately before each event batch and stop if the frontmost target changes. Refuse before creating a global CGEvent with non-zero status, `ok:false`, `GLOBAL_INPUT_REFUSED`, and the actual frontmost app. AX-only and `postToPid` routes are unchanged; auto routing cannot bypass the gate.

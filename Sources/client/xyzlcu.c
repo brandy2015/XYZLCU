@@ -16,7 +16,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.7.1"
+#define VERSION "0.8.0"
 // 和 main.swift 里的 forwardedEnv 保持一致
 static const char *FORWARDED_ENV[] = {"XYZLCU_EVENTS_HEALTH", "XYZLCU_TAP_THRESHOLD_MS", "XYZLCU_TYPE_VIA", "XYZLCU_KEY_VIA",
                                       "XYZLCU_PROBE", "XYZLCU_PNG", "XYZLCU_PNG_LEVEL", "XYZLCU_BACKGROUND", "XYZLCU_CLICK_HOLD", NULL};
@@ -25,15 +25,12 @@ static char **g_argv;
 
 static void exec_core(void) {
     char core[PATH_MAX];
-    const char *o = getenv("XYZLCU_CORE");
-    if (o && *o) {
-        snprintf(core, sizeof core, "%s", o);
-    } else {
-        char exe[PATH_MAX], real[PATH_MAX];
-        uint32_t n = sizeof exe;
-        if (_NSGetExecutablePath(exe, &n) != 0 || !realpath(exe, real)) { fprintf(stderr, "error: 找不到自身路径\n"); exit(1); }
-        snprintf(core, sizeof core, "%s/xyzlcu-core", dirname(real));
-    }
+    // Only the adjacent installed core can enforce this client's contract.
+    // Environment overrides are intentionally retired, including daemon=0.
+    char exe[PATH_MAX], real[PATH_MAX];
+    uint32_t n = sizeof exe;
+    if (_NSGetExecutablePath(exe, &n) != 0 || !realpath(exe, real)) { fprintf(stderr, "error: 找不到自身路径\n"); exit(1); }
+    snprintf(core, sizeof core, "%s/xyzlcu-core", dirname(real));
     g_argv[0] = core;
     execv(core, g_argv);
     fprintf(stderr, "error: 无法执行 %s: %s\n", core, strerror(errno));
@@ -110,12 +107,27 @@ static uint32_t be32(const unsigned char *p) { return (uint32_t)p[0] << 24 | (ui
 
 int main(int argc, char **argv) {
     g_argv = argv;
+    // Proof/session descriptors are process local. Protocol 2 cannot transfer
+    // or authenticate them. Never forward them, retry, or consult an override.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--consumer") == 0 || strcmp(argv[i], "--request-fd") == 0 ||
+            strcmp(argv[i], "--proof-protocol") == 0 || strcmp(argv[i], "--hmac-key-fd") == 0) {
+            unsetenv("XYZLCU_CORE"); exec_core();
+        }
+    }
     const char *d = getenv("XYZLCU_DAEMON");
     if (argc < 2 || (d && strcmp(d, "0") == 0)) exec_core();
     const char *cmd = argv[1];
     // 帮助、长时间运行的录制 / 回放、守护进程本身和 MCP 服务器总是由主程序执行
-    static const char *local[] = {"help", "-h", "--help", "record", "replay", "serve", "mcp", "selftest", NULL};
-    for (int i = 0; local[i]; i++) if (strcmp(cmd, local[i]) == 0) exec_core();
+    static const char *local[] = {"help", "-h", "--help", "record", "replay", "serve", "mcp", "selftest", "capabilities", "identity-observe", "open-app", "bind-window", "screenshot", "observe", "ax", "find", "value", "wait", "wait-text", "taps", "click", "click-el", "move", "drag", "scroll", "type", "key", "insert", "settext", "set-text", "menu", "press", "select", "scroll-to", "activate", "open", "hide", "movewin", "request", "__ax-press", "lock", "batch", "run", NULL};
+    for (int i = 0; local[i]; i++) if (strcmp(cmd, local[i]) == 0) { unsetenv("XYZLCU_CORE"); exec_core(); }
+    if (strcmp(cmd, "windows") == 0) {
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--thumbnails") == 0 || strcmp(argv[i], "--show-all") == 0) {
+                unsetenv("XYZLCU_CORE"); exec_core();
+            }
+        }
+    }
 
     char path[PATH_MAX];
     const char *sp = getenv("XYZLCU_SOCKET");

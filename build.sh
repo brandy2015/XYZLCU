@@ -6,10 +6,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p build
-SRC=Sources/xyzlcu/main.swift
+SRC=(Sources/xyzlcu/*.swift Sources/IdentityProof/*.swift)
 FW=(-module-cache-path "$PWD/build/module-cache" -wmo -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit -framework CoreMedia -framework VideoToolbox -lz)
-swiftc -O -target arm64-apple-macos13 "$SRC" "${FW[@]}" -o build/xyzlcu-core-arm64
-if swiftc -O -target x86_64-apple-macos13 "$SRC" "${FW[@]}" -o build/xyzlcu-core-x86_64 2>/dev/null; then
+swiftc -O -target arm64-apple-macos13 "${SRC[@]}" "${FW[@]}" -o build/xyzlcu-core-arm64
+if swiftc -O -target x86_64-apple-macos13 "${SRC[@]}" "${FW[@]}" -o build/xyzlcu-core-x86_64; then
   lipo -create build/xyzlcu-core-arm64 build/xyzlcu-core-x86_64 -output build/xyzlcu-core
 else
   echo "warning: x86_64 编译失败，只生成 arm64" >&2
@@ -17,8 +17,10 @@ else
 fi
 rm -f build/xyzlcu-core-arm64 build/xyzlcu-core-x86_64
 clang -O2 -Wall -arch arm64 -arch x86_64 -mmacosx-version-min=13 Sources/client/xyzlcu.c -o build/xyzlcu
-codesign -s - -f -i com.xyztech.xyzlcu build/xyzlcu-core >/dev/null 2>&1 || true
-codesign -s - -f -i com.xyztech.xyzlcu.client build/xyzlcu >/dev/null 2>&1 || true
+codesign -s - -f -i com.xyztech.xyzlcu build/xyzlcu-core
+codesign -s - -f -i com.xyztech.xyzlcu.client build/xyzlcu
+codesign --verify --strict build/xyzlcu-core
+codesign --verify --strict build/xyzlcu
 lipo -info build/xyzlcu-core build/xyzlcu
 if [[ "${1:-}" == "--install" ]]; then
   B="$HOME/.local/bin"

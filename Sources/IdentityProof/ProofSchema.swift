@@ -1,0 +1,185 @@
+import Foundation
+
+public enum ProofSchema {
+    static let schema = try! JSONValue.parse(Data(#"""
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:xyzlcu:identity-proof:1",
+  "$ref": "#/$defs/Request",
+  "$defs": {
+    "Digest": {"type":"string","pattern":"^[0-9a-f]{64}$"},
+    "Token": {"type":"string","minLength":22,"maxLength":128,"pattern":"^[A-Za-z0-9_-]+$"},
+    "Counter": {"type":"string","pattern":"^(0|[1-9][0-9]{0,19})$"},
+    "Frame": {
+      "type":"object","additionalProperties":false,
+      "required":["x","y","width","height"],
+      "properties":{"x":{"type":"number"},"y":{"type":"number"},"width":{"type":"number","exclusiveMinimum":0},"height":{"type":"number","exclusiveMinimum":0}}
+    },
+    "FileIdentity": {
+      "type":"object","additionalProperties":false,"required":["device","inode","sha256"],
+      "properties":{"device":{"$ref":"#/$defs/Counter"},"inode":{"$ref":"#/$defs/Counter"},"sha256":{"$ref":"#/$defs/Digest"}}
+    },
+    "Signing": {
+      "type":"object","additionalProperties":false,
+      "required":["kind","valid","team_id","signing_identifier","cdhash","cdhash_algorithm","architecture","designated_requirement","requirement_sha256"],
+      "properties":{
+        "kind":{"enum":["developer_id","app_store","apple_platform","adhoc_fixture"]},
+        "valid":{"const":true},"team_id":{"type":["string","null"],"minLength":1,"maxLength":128},
+        "signing_identifier":{"type":"string","minLength":1,"maxLength":512},
+        "cdhash":{"type":"string","pattern":"^[0-9a-f]{40,64}$"},
+        "cdhash_algorithm":{"enum":["sha1","sha256","sha256_truncated"]},
+        "architecture":{"enum":["arm64","arm64e","x86_64"]},
+        "designated_requirement":{"type":"string","minLength":1,"maxLength":8192},
+        "requirement_sha256":{"$ref":"#/$defs/Digest"}
+      }
+    },
+    "App": {
+      "type":"object","additionalProperties":false,
+      "required":["bundle_id","bundle_path","executable_path","executable_file","signing"],
+      "properties":{
+        "bundle_id":{"type":"string","minLength":3,"maxLength":255},
+        "bundle_path":{"type":"string","minLength":1,"maxLength":4096},
+        "executable_path":{"type":"string","minLength":1,"maxLength":4096},
+        "executable_file":{"$ref":"#/$defs/FileIdentity"},"signing":{"$ref":"#/$defs/Signing"}
+      }
+    },
+    "Process": {
+      "type":"object","additionalProperties":false,
+      "required":["boot_id","pid","uid","start_time","app"],
+      "properties":{
+        "boot_id":{"type":"string","format":"uuid"},"pid":{"type":"integer","minimum":1,"maximum":2147483647},
+        "uid":{"type":"integer","minimum":0},
+        "start_time":{
+          "type":"object","additionalProperties":false,"required":["seconds","microseconds"],
+          "properties":{"seconds":{"$ref":"#/$defs/Counter"},"microseconds":{"type":"integer","minimum":0,"maximum":999999}}
+        },
+        "app":{"$ref":"#/$defs/App"}
+      }
+    },
+    "Display": {
+      "type":"object","additionalProperties":false,"required":["id","uuid","frame","scale","rotation"],
+      "properties":{"id":{"type":"integer","minimum":1},"uuid":{"type":"string","format":"uuid"},"frame":{"$ref":"#/$defs/Frame"},"scale":{"type":"number","exclusiveMinimum":0},"rotation":{"type":"number"}}
+    },
+    "Window": {
+      "type":"object","additionalProperties":false,
+      "required":["id","owner_pid","layer","frame","onscreen","displays","coordinate_space","content_transform_sha256","instance_token","instance_provider"],
+      "properties":{
+        "id":{"type":"integer","minimum":1,"maximum":4294967295},"owner_pid":{"type":"integer","minimum":1},"layer":{"type":"integer"},
+        "frame":{"$ref":"#/$defs/Frame"},"onscreen":{"type":"boolean"},
+        "displays":{"type":"array","minItems":1,"maxItems":32,"items":{"$ref":"#/$defs/Display"}},
+        "coordinate_space":{"const":"desktop-top-left-points-v1"},
+        "content_transform_sha256":{"$ref":"#/$defs/Digest"},
+        "instance_token":{"type":["string","null"],"maxLength":128},"instance_provider":{"type":["string","null"],"maxLength":256}
+      }
+    },
+    "AXSegment": {
+      "type":"object","additionalProperties":false,"required":["child_index","role","subrole","identifier"],
+      "properties":{"child_index":{"type":"integer","minimum":0},"role":{"type":"string","minLength":1,"maxLength":256},"subrole":{"type":["string","null"],"maxLength":256},"identifier":{"type":["string","null"],"maxLength":4096}}
+    },
+    "Element": {
+      "type":"object","additionalProperties":false,
+      "required":["token","path","role","subrole","identifier","title_sha256","frame","actions","state_sha256","context_sha256","observation_id","observation_revision","instance_provider"],
+      "properties":{
+        "token":{"$ref":"#/$defs/Token"},"path":{"type":"array","minItems":1,"maxItems":64,"items":{"$ref":"#/$defs/AXSegment"}},
+        "role":{"type":"string","minLength":1,"maxLength":256},"subrole":{"type":["string","null"],"maxLength":256},"identifier":{"type":["string","null"],"maxLength":4096},
+        "title_sha256":{"$ref":"#/$defs/Digest"},"frame":{"$ref":"#/$defs/Frame"},
+        "actions":{"type":"array","maxItems":32,"uniqueItems":true,"items":{"type":"string","maxLength":256}},
+        "state_sha256":{"$ref":"#/$defs/Digest"},"context_sha256":{"$ref":"#/$defs/Digest"},
+        "observation_id":{"$ref":"#/$defs/Token"},"observation_revision":{"$ref":"#/$defs/Counter"},
+        "instance_provider":{"type":["string","null"],"maxLength":256}
+      }
+    },
+    "Binding": {
+      "type":"object","additionalProperties":false,
+      "required":["binding_token","process","window","element","context_sha256"],
+      "properties":{"binding_token":{"$ref":"#/$defs/Token"},"process":{"$ref":"#/$defs/Process"},"window":{"$ref":"#/$defs/Window"},"element":{"oneOf":[{"$ref":"#/$defs/Element"},{"type":"null"}]},"context_sha256":{"$ref":"#/$defs/Digest"}}
+    },
+    "LaunchBinding": {
+      "type":"object","additionalProperties":false,"required":["app","existing_process","allowlist_revision"],
+      "properties":{"app":{"$ref":"#/$defs/App"},"existing_process":{"oneOf":[{"$ref":"#/$defs/Process"},{"type":"null"}]},"allowlist_revision":{"$ref":"#/$defs/Counter"}}
+    },
+    "Assurance": {"enum":["process-instance","window-observed","window-instance","element-observed","element-instance","surface-continuity","launch-observed","launch-exact"]},
+    "MAC": {
+      "oneOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["algorithm","key_id","tag"],"properties":{"algorithm":{"const":"hmac-sha256"},"key_id":{"$ref":"#/$defs/Token"},"tag":{"$ref":"#/$defs/Digest"}}}]
+    },
+    "Request": {
+      "type":"object","additionalProperties":false,
+      "required":["schema_version","profile","session_id","controller_id","lock_revision","policy_sha256","nonce","sequence","deadline","operation","expected","required_assurance","frame_tolerance_pt","catalog_context","arguments","mac"],
+      "properties":{
+        "schema_version":{"const":1},"profile":{"enum":["xyzstudio","owner_diagnostic"]},
+        "session_id":{"$ref":"#/$defs/Token"},"controller_id":{"$ref":"#/$defs/Token"},
+        "lock_revision":{"$ref":"#/$defs/Counter"},"policy_sha256":{"$ref":"#/$defs/Digest"},
+        "nonce":{"type":"string","pattern":"^[A-Za-z0-9_-]{43}$"},"sequence":{"$ref":"#/$defs/Counter"},
+        "deadline":{"type":"object","additionalProperties":false,"required":["boot_id","continuous_ns"],"properties":{"boot_id":{"type":"string","format":"uuid"},"continuous_ns":{"$ref":"#/$defs/Counter"}}},
+        "operation":{"enum":["screenshot","ax","press","set-text","click","open-app"]},
+        "expected":{"oneOf":[{"$ref":"#/$defs/Binding"},{"$ref":"#/$defs/LaunchBinding"}]},
+        "required_assurance":{"type":"array","minItems":1,"uniqueItems":true,"items":{"$ref":"#/$defs/Assurance"}},
+        "frame_tolerance_pt":{"type":"number","minimum":0,"maximum":1},
+        "catalog_context":{"oneOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["catalog_revision","target_id"],"properties":{"catalog_revision":{"$ref":"#/$defs/Token"},"target_id":{"$ref":"#/$defs/Token"}}}]},
+        "arguments":{
+          "oneOf":[
+            {"type":"object","additionalProperties":false,"required":["format","max_pixel_edge"],"properties":{"format":{"enum":["png","jpeg"]},"max_pixel_edge":{"type":"integer","minimum":1,"maximum":8192}}},
+            {"type":"object","additionalProperties":false,"required":["max_depth","max_nodes"],"properties":{"max_depth":{"type":"integer","minimum":1,"maximum":64},"max_nodes":{"type":"integer","minimum":1,"maximum":10000}}},
+            {"type":"object","additionalProperties":false,"required":["action"],"properties":{"action":{"const":"AXPress"}}},
+            {"type":"object","additionalProperties":false,"required":["text","precondition_sha256","postcondition_sha256"],"properties":{"text":{"type":"string","maxLength":65536},"precondition_sha256":{"$ref":"#/$defs/Digest"},"postcondition_sha256":{"$ref":"#/$defs/Digest"}}},
+            {"type":"object","additionalProperties":false,"required":["x","y","action"],"properties":{"x":{"type":"number"},"y":{"type":"number"},"action":{"const":"AXPress"}}},
+            {"type":"object","additionalProperties":false,"required":["bundle_id","activates"],"properties":{"bundle_id":{"type":"string","minLength":3,"maxLength":255},"activates":{"const":false}}}
+          ]
+        },
+        "mac":{"$ref":"#/$defs/MAC"}
+      }
+    },
+    "Instant": {
+      "type":"object","additionalProperties":false,"required":["continuous_ns","wall_utc"],
+      "properties":{"continuous_ns":{"$ref":"#/$defs/Counter"},"wall_utc":{"type":"string","format":"date-time"}}
+    },
+    "Interval": {
+      "type":"object","additionalProperties":false,"required":["start","end"],
+      "properties":{"start":{"$ref":"#/$defs/Instant"},"end":{"$ref":"#/$defs/Instant"}}
+    },
+    "Payload": {
+      "type":"object","additionalProperties":false,
+      "required":["kind","sha256","byte_length","media_type","pixel_sha256","pixel_width","pixel_height"],
+      "properties":{
+        "kind":{"enum":["image","ax_json","action_receipt","launch_receipt"]},"sha256":{"$ref":"#/$defs/Digest"},"byte_length":{"type":"integer","minimum":0},
+        "media_type":{"enum":["image/png","image/jpeg","application/json"]},"pixel_sha256":{"oneOf":[{"$ref":"#/$defs/Digest"},{"type":"null"}]},
+        "pixel_width":{"type":["integer","null"],"minimum":1},"pixel_height":{"type":["integer","null"],"minimum":1}
+      }
+    },
+    "Policy": {
+      "type":"object","additionalProperties":false,"required":["sha256","catalog_revision","classification","decision","matched_rule_ids","surface_classification","surface_evidence"],
+      "properties":{"sha256":{"$ref":"#/$defs/Digest"},"catalog_revision":{"type":"string","maxLength":128},"classification":{"enum":["known_unprotected","unknown"]},"decision":{"const":"allow"},"matched_rule_ids":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":128}},"surface_classification":{"enum":["allowed","unknown"]},"surface_evidence":{"oneOf":[{"type":"null"},{"$ref":"#/$defs/SurfaceEvidence"}]}}
+    },
+    "SurfaceEvidence": {
+      "type":"object","additionalProperties":false,"required":["provider","provider_version","evidence_revision","subject_binding_sha256","context_sha256","attribution_sha256","composition_sha256","continuity_token","observed_at","evidence_sha256"],
+      "properties":{"provider":{"type":"string","minLength":1,"maxLength":256},"provider_version":{"type":"string","minLength":1,"maxLength":128},"evidence_revision":{"$ref":"#/$defs/Counter"},"subject_binding_sha256":{"$ref":"#/$defs/Digest"},"context_sha256":{"$ref":"#/$defs/Digest"},"attribution_sha256":{"$ref":"#/$defs/Digest"},"composition_sha256":{"$ref":"#/$defs/Digest"},"continuity_token":{"$ref":"#/$defs/Token"},"observed_at":{"$ref":"#/$defs/Instant"},"evidence_sha256":{"$ref":"#/$defs/Digest"}}
+    },
+    "Proof": {
+      "type":"object","additionalProperties":false,
+      "required":["schema_version","session_id","controller_id","lock_revision","nonce","sequence","operation","request_sha256","expected_binding_sha256","executor","observed_pre","observed_post","timing","assurance","identity_check","effect_verification","policy","payload","route","limitations","mac"],
+      "properties":{
+        "schema_version":{"const":1},"session_id":{"$ref":"#/$defs/Token"},"controller_id":{"$ref":"#/$defs/Token"},"lock_revision":{"$ref":"#/$defs/Counter"},
+        "nonce":{"type":"string","pattern":"^[A-Za-z0-9_-]{43}$"},"sequence":{"$ref":"#/$defs/Counter"},"operation":{"enum":["screenshot","ax","press","set-text","click","open-app"]},
+        "request_sha256":{"$ref":"#/$defs/Digest"},"expected_binding_sha256":{"$ref":"#/$defs/Digest"},
+        "executor":{"type":"object","additionalProperties":false,"required":["pid","start_time","boot_id","build_sha256","execution_mode","client_build_sha256"],"properties":{"pid":{"type":"integer","minimum":1},"start_time":{"$ref":"#/$defs/Counter"},"boot_id":{"type":"string","format":"uuid"},"build_sha256":{"$ref":"#/$defs/Digest"},"execution_mode":{"enum":["daemon","direct","mcp_core","worker"]},"client_build_sha256":{"oneOf":[{"$ref":"#/$defs/Digest"},{"type":"null"}]}}},
+        "observed_pre":{"oneOf":[{"$ref":"#/$defs/Binding"},{"$ref":"#/$defs/LaunchBinding"}]},
+        "observed_post":{"oneOf":[{"$ref":"#/$defs/Binding"},{"$ref":"#/$defs/Process"}]},
+        "timing":{"type":"object","additionalProperties":false,"required":["precheck","operation","postcheck","release","source_frame_continuous_ns"],"properties":{"precheck":{"$ref":"#/$defs/Interval"},"operation":{"$ref":"#/$defs/Interval"},"postcheck":{"$ref":"#/$defs/Interval"},"release":{"$ref":"#/$defs/Instant"},"source_frame_continuous_ns":{"oneOf":[{"$ref":"#/$defs/Counter"},{"type":"null"}]}}},
+        "assurance":{"type":"array","minItems":1,"uniqueItems":true,"items":{"$ref":"#/$defs/Assurance"}},
+        "identity_check":{"const":"matched"},"effect_verification":{"enum":["verified","unverified","not_applicable"]},
+        "policy":{"$ref":"#/$defs/Policy"},"payload":{"$ref":"#/$defs/Payload"},
+        "route":{"enum":["sck-window-screenshot","sck-window-stream-once","ax-read","ax-press","ax-set-value","appkit-background-launch"]},
+        "limitations":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":128}},"mac":{"$ref":"#/$defs/MAC"}
+      }
+    },
+    "Success": {
+      "type":"object","additionalProperties":false,"required":["ok","proof","result"],
+      "properties":{"ok":{"const":true},"proof":{"$ref":"#/$defs/Proof"},"result":{"type":"object","additionalProperties":false,"required":["encoding","data"],"properties":{"encoding":{"enum":["base64","jcs-json"]},"data":{"type":"string"}}}}
+    }
+  }
+}
+"""#.utf8), maximumBytes: 100_000, maximumDepth: 64)
+    public static func validate(_ value: JSONValue, definition: String) throws {
+        try JSONSchemaValidator.validate(value, schema: schema["$defs"]![definition]!, root: schema, path: "")
+    }
+}

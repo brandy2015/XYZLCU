@@ -2887,64 +2887,35 @@ func deepAXVisible(_ el: AXUIElement, context: DeepAXContext) -> Bool {
 }
 
 let usage = """
-xyzlcu — XYZ Local Computer Use：macOS 图形界面控制
-  check [--probe] | request [--open] [--permission accessibility|screen-recording|input-monitoring] | whoami
-  set-text "App" [--role R] [--title T] [--contains] [--index N | --ref N] "text"  （settext 的别名；AX 聚焦后写值并核对）
-  press "App" ["title substring"] [--role R] [--nth N] [--list] [--async]  （弹出菜单自动异步）
-  select "App" --popup "title" --item "menu text" [--nth N] [--timeout 5]
-  scroll-to "App" --role R --title T [--contains] | scroll dx dy --ax [--app App] [--role R] [--title T]
-  wait-text "App" "substring" [--timeout 5] [--gone]
-  observe ["App"] [--max 80]  只返回文字：前台应用、目标窗口、AX 控件摘要
-  selftest  无 GUI / 权限的纯逻辑自测
-  AX 目标可用 --pid N 替代应用名；输入结果带 frontmostBefore / frontmostAfter
-  输入安全: 无锁全局输入须 --allow-global 或 --app/--pid 已在前台；每次事件前复核，失败 lock 后须 unlock/重新 lock
-  输入时序: --hold ms（点击默认 60，按键默认 30）；XYZLCU_CLICK_HOLD；移动后 hover 等待 75 ms
-  截图大小: screenshot --max-side N（限制最长像素边）
-  screenshot [path] [--scale 0.5] [--display N] [--format png|jpg|heic] [--quality 0.7] [--fast] [--cli]
-             [--window "App" [--title 标题] | --window-id N] [--region x,y,w,h]   （N 来自 windows 的 id）      （--fast = jpg、质量 0.6、缩放 0.5，给智能体用最快）
-             [--base64 | --stdout] [--out path] [--timing]   --base64/--stdout 在内存里出图（默认 jpg），不写文件
-             [--diff]  只返回和上一次 --diff 截图相比变了的区域（没变就不出图；需要守护进程）
-  click x y [--right] [--double] | move x y | drag x1 y1 x2 y2 | scroll dx dy
-  type "文字" [--app "App"] [--window 标题] [--via auto|ax|events|pid|paste]   （输出 JSON，path = 实际走的路）
-  key cmd+shift+4 [--app "App"] [--via auto|events|menu|pid]    （auto：事件流卡住时改按对应菜单项 / 直接投递给进程）
-  insert "App" "文字" | settext "App" [--role R] [--title T|--id I] [--window 窗口] "文字" | value "App" [...]
-                        （辅助功能直接写值，不经过键盘事件；--via paste = 剪贴板 + 菜单「粘贴」，会恢复剪贴板）
-  menu "App" "文件>存储" [--window 标题] [--activate]   按菜单项（AXPress，按 pid，默认不激活应用；每级可写 文件|File）
-  record [--out f.jsonl] [--duration 60] [--no-moves]   只监听地录制键鼠（不拦截输入，Ctrl-C 结束）
-  replay f.jsonl [--speed 2] [--no-keys] [--force]       回放录制（事件流卡住时默认拒绝）
-  apps | open "App" | activate "App" | hide "App" | windows [--all]
-  displays | movewin "App" x y [--w W --h H] [--title 标题]
-  ax ["App"] [--depth N] [--menu] | press "App" "按钮标题"
-  ax ["App"] --compact [--menu] [--text] [--max 300]   只列可操作控件：[编号] 角色 "标题" ="值" @中心x,y（给智能体，省 token）
-  find "App" [--role AXButton] [--title 保存] [--contains] [--index N|--all] [--window 标题] [--menu]
-  click-el "App" --role AXButton --title 保存 [--click] [--right] [--double]
-  click-el --ref N ["App"]   按上一次 ax --compact 的编号点（需要守护进程）
-  wait "App" --title X [--role R] [--timeout 5] [--gone]   |   wait 毫秒 | sleep 毫秒
-  --assert-no-contention  Fail if frontmost application or pointer changes during a command
-  --allow-global  Explicit global-input opt-in (no environment bypass)
-  --allow-foreground  Per-command escape from strict locked foreground policy
-  lock --app "App" [--window-title 标题 | --window-id N | --pid P] [--unsafe] | lock --status | unlock
-                 锁定一个窗口（后台模式）：之后 screenshot / click / type / key / scroll / ax / find / click-el 只作用于它，
-                 坐标相对窗口左上角，不动真实鼠标、不激活应用；结果里 route = 实际走的路（ax-press / pid-mouse / pid-keys …）
-                 drag / move / activate 等需要前台的命令会被拒绝，除非加 --allow-foreground；--no-lock 让单条命令忽略锁定
-  --background / XYZLCU_BACKGROUND=1   不锁定也走后台路线（目标：--app App [--window-title 标题]）
-  cursor | version | taps（诊断输入卡顿） | check（权限 + 各输入路径健康状态）
-  batch [--continue-on-error] [脚本文件]  （从 stdin 或文件逐行读取命令，一次启动执行多步）
-  run [--continue-on-error] 'click 10 20; type 你好; key return'
-  serve [--background | --status | --stop]  常驻守护进程（~/.xyzlcu/sock），之后的命令自动转发给它，更快
-                             （已经在运行时直接返回 0；--background 在后台启动并等它就绪）
-  mcp                        以 stdio MCP 服务器运行（给只支持 MCP 的客户端，如 Claude Desktop）
-  通用选项: --delay N  事件间隔毫秒（默认 2，也可用环境变量 XYZLCU_DELAY）
-  环境变量: XYZLCU_DAEMON=0 不用守护进程；=1 必须用守护进程
-            XYZLCU_EVENTS_HEALTH=bad 模拟事件流卡住（测试备用路径）；XYZLCU_TAP_THRESHOLD_MS 卡住阈值（默认 1000）
-            XYZLCU_PREWARM=0 守护进程启动时不预开主屏截图流；XYZLCU_PREWARM_SCALES 预开哪些缩放（默认 1,0.5）
-            XYZLCU_PREWARM_IDLE 预开的流闲置多少秒关闭（默认 600）
-            XYZLCU_STREAM=0 不用常驻截图流；XYZLCU_STREAM_IDLE 闲置多少秒关闭（默认 20）
-            XYZLCU_AUTO_RESTART=0 守护进程版本比客户端旧时不自动重启它
-            XYZLCU_PNG=imageio 用系统 PNG 编码器；XYZLCU_PNG_LEVEL 压缩级别 1–9（默认 1）
-            XYZLCU_CONNECT_WAIT_MS 守护进程正在启动时最多等多久（默认 3000）；XYZLCU_CORE 客户端调用的主程序路径
+xyzlcu 0.8.0 — execution-time identity diagnostics (macOS 13+)
+
+  capabilities --json
+  identity-observe --pid N [--nonce TOKEN] --json
+  identity-check --request-fd N --json
+  windows [--all]
+  windows --thumbnails --json [--show-all]
+  open-app --bundle-id ID --json
+  apps | displays | cursor | check | whoami
+  serve [--background | --status | --stop]
+  mcp | selftest | version
+
+identity-check reads exactly {schema_version:1,nonce,expected} from an inherited
+private FD >= 3 (256 KiB max). expected is the full observed_pre process object;
+nonce is canonical unpadded base64url of 32 random bytes. Diagnostic metadata
+is not an identity-proof:1 content Success or permission to control a target.
+
+Consumer admission, window/element/surface continuity and exact no-prompt launch
+are unavailable. open-app refuses APP_TRUST_UNPROVABLE; catalog entries are
+nonselectable with null thumbnails. Generic capture and AX/input/action routes,
+legacy PID events, activation, permission requests and lock creation fail closed.
+No override enables them. No display prewarm or global input is admitted.
+
+Policy: ~/Library/Application Support/XYZLCU/protected-apps.v1.json, user-only,
+with owner continuity state; no policy path or executable environment override.
+XYZStudio must keep computer tools disabled. See README and
+ docs/IDENTITY_PROOF_VERIFICATION.md for built versus deferred behavior.
 """
-let version = "0.7.1"
+let version = "0.8.0"
 var inBatch = false
 let startedAt = Date()
 
@@ -2978,6 +2949,14 @@ func execute(_ argv: [String]) throws {
     }
 }
 func executeCommand(_ argv: [String]) throws {
+if try handleIdentityCLI(argv) { return }
+// v0.8 never lets legacy selectors substitute for an execution binding. This
+// gate covers direct, daemon, MCP, aliases and every batch member before AX,
+// capture, focus, pasteboard or event APIs can run.
+let legacySensitive: Set<String> = ["screenshot", "observe", "ax", "find", "value", "wait", "wait-text", "taps", "click", "click-el", "move", "drag", "scroll", "type", "key", "insert", "settext", "set-text", "menu", "press", "select", "scroll-to", "activate", "open", "hide", "movewin", "record", "replay", "request", "__ax-press", "lock"]
+if let verb = commandVerb(argv), legacySensitive.contains(verb) {
+    throw XErr(msg: "This legacy route cannot prove protected-recipient and target continuity; use capabilities --json for supported routes.", code: 4, policyCode: "IDENTITY_UNPROVABLE")
+}
 inputFrontmostBefore = nil; inputResultEmitted = false
 forceProbe = false
 args = argv
@@ -3155,6 +3134,16 @@ case "check":
     ] as [String: Any]
     o["typeOrder"] = h.keyboardOK ? ["ax（标准文本框）", "events"] : ["ax", "pid", "paste"]
     o["keyOrder"] = h.keyboardOK ? ["events"] : ["menu", "pid"]
+    // TCC availability and event-tap health are observations, not route grants.
+    // Preserve the diagnostic shape while reporting the v0.8 execution gate.
+    if var paths = o["paths"] as? [String: [String: Any]] {
+        for name in Array(paths.keys) { paths[name]?["available"] = false }
+        o["paths"] = paths
+    }
+    o["typeOrder"] = [String](); o["keyOrder"] = [String]()
+    o["computerOperationsAvailable"] = false
+    o["consumerAvailable"] = false
+    o["routeUnavailableCode"] = "IDENTITY_UNPROVABLE"
     if let ov = h.override { o["healthOverride"] = ov }
     if !h.suspectedTapStats.isEmpty { o["suspectedTapStats"] = h.suspectedTapStats; o["note"] = "Historical tap latency is not proof of blocked input; health checks are passive and never post input." }
     if let diagnostic = permissionDiagnostic() { o["permissionDiagnostic"] = diagnostic }
@@ -4244,11 +4233,8 @@ func serve() throws -> Never {
             if stop { unlink(path); exit(0) }
         }
     }.start()
-    // 预热（在主运行循环里做，不耽误接受连接）：权限检查、屏幕内容列表、主屏常驻流
-    DispatchQueue.main.async {
-        if #available(macOS 14.0, *), screenTrusted() { _ = shareableContent(maxAge: 0) }
-        prewarmMainDisplay()
-    }
+    // No legacy capture producer is admitted in v0.8. Metadata service only;
+    // display prewarm would acquire protected surfaces before a request guard.
     RunLoop.main.run()
     exit(0)
 }
@@ -4310,7 +4296,7 @@ func stopDaemon(quiet: Bool = false) -> Int32 {
 /// 执行一条 xyzlcu 命令并拿回输出：守护进程在就直接发给它（不起新进程），不在就在本进程里执行
 var mcpUseDaemon = true
 func mcpRunSelf(_ argv: [String]) -> RunResult {
-    if mcpUseDaemon, ProcessInfo.processInfo.environment["XYZLCU_DAEMON"] != "0", let r = requestRestartingStale(argv, stdin: nil) { return r }
+    // Never hand sensitive legacy traffic to an older resident executor.
     return runCaptured(argv)
 }
 
@@ -4547,6 +4533,10 @@ func mcpServe() -> Never {
 // MARK: - 入口
 let top = Array(CommandLine.arguments.dropFirst())
 let errOut: (String) -> Void = { FileHandle.standardError.write(($0 + "\n").data(using: .utf8)!) }
+// Structured flags cannot enter a lifecycle/MCP path before profile enforcement.
+if top.contains(where: { ["--consumer", "--request-fd", "--proof-protocol", "--hmac-key-fd"].contains($0) }) {
+    exit(runMain(top, stdinText: { "" }, err: errOut))
+}
 if top.first == "serve" {
     let rest = Array(top.dropFirst())
     if rest.contains("--stop") { exit(stopDaemon()) }
@@ -4561,7 +4551,9 @@ if top.first == "serve" {
 if top.first == "mcp" { mcpServe() }
 let daemonEnv = ProcessInfo.processInfo.environment["XYZLCU_DAEMON"]
 // record / replay 运行时间长，总在当前进程里执行，不占用守护进程
-if daemonEnv != "0", !top.isEmpty, !["help", "-h", "--help", "record", "replay", "selftest"].contains(top[0]) {
+let localMetadataCommands: Set<String> = ["apps", "windows", "displays", "cursor", "whoami", "__status", "sleep", "version", "--version", "-v"]
+if daemonEnv != "0", let verb = top.first, localMetadataCommands.contains(verb),
+   !top.contains(where: { ["--consumer", "--request-fd", "--proof-protocol", "--hmac-key-fd", "--thumbnails", "--show-all"].contains($0) }) {
     if let code = forward(top) { exit(code) }
     if daemonEnv == "1" { errOut("error: 守护进程没有运行（先执行 xyzlcu serve --background）"); exit(5) }
 }

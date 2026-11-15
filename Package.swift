@@ -7,8 +7,11 @@ let package = Package(
     name: "xyzlcu",
     platforms: [.macOS(.v13)],
     targets: [
+        .target(name: "IdentityProof", path: "Sources/IdentityProof"),
+        .testTarget(name: "IdentityProofTests", dependencies: ["IdentityProof"], path: "Tests/IdentityProofTests"),
         .executableTarget(
             name: "xyzlcu-core",
+            dependencies: ["IdentityProof"],
             path: "Sources/xyzlcu",
             linkerSettings: [.linkedFramework("AppKit"), .linkedFramework("ApplicationServices"), .linkedFramework("ScreenCaptureKit"),
                              .linkedFramework("CoreMedia"), .linkedFramework("VideoToolbox"), .linkedLibrary("z")]
